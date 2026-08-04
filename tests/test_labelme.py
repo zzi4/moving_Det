@@ -90,6 +90,39 @@ def test_loader_rejects_non_labelme_document(tmp_sequence, payload):
         load_sequence(tmp_sequence)
 
 
+def test_loader_wraps_malformed_json_with_source_path(tmp_sequence):
+    path = tmp_sequence / "000001.json"
+    path.write_text('{"shapes":', encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        load_sequence(tmp_sequence)
+
+    assert str(path) in str(caught.value)
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
+def test_loader_wraps_invalid_json_encoding_with_source_path(tmp_sequence):
+    path = tmp_sequence / "000001.json"
+    path.write_bytes(b'{"shapes": "' + bytes([0xFF]) + b'"}')
+
+    with pytest.raises(ValueError) as caught:
+        load_sequence(tmp_sequence)
+
+    assert str(path) in str(caught.value)
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+def test_loader_wraps_corrupt_jpg_with_source_path(tmp_sequence):
+    path = tmp_sequence / "000001.jpg"
+    path.write_bytes(b"not a JPEG")
+
+    with pytest.raises(ValueError) as caught:
+        load_sequence(tmp_sequence)
+
+    assert str(path) in str(caught.value)
+    assert isinstance(caught.value.__cause__, OSError)
+
+
 @pytest.mark.parametrize("description", ["", "7", "tid=7"])
 def test_loader_accepts_supported_track_descriptions(tmp_sequence, description):
     payload = _read_frame_payload(tmp_sequence)
@@ -119,7 +152,11 @@ def test_loader_rejects_non_integer_target_group_id(tmp_sequence, group_id):
         load_sequence(tmp_sequence)
 
 
-@pytest.mark.parametrize("direction", [None, True, "0", float("inf")])
+@pytest.mark.parametrize(
+    "direction",
+    [None, True, "0", float("nan"), float("inf"), 10**400],
+    ids=["none", "bool", "string", "nan", "inf", "overflowing-int"],
+)
 def test_loader_rejects_non_numeric_or_non_finite_direction(
     tmp_sequence,
     direction,
@@ -128,8 +165,43 @@ def test_loader_rejects_non_numeric_or_non_finite_direction(
     payload["shapes"][0]["direction"] = direction
     path = tmp_sequence / "000001.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="direction"):
+    with pytest.raises(ValueError) as caught:
         load_sequence(tmp_sequence)
+
+    message = str(caught.value)
+    assert str(path) in message
+    assert "shape[0]" in message
+    assert "label='car'" in message
+    assert "direction" in message
+
+
+@pytest.mark.parametrize(
+    "coordinate",
+    [True, "10", float("nan"), float("inf"), 10**400],
+    ids=["bool", "string", "nan", "inf", "overflowing-int"],
+)
+def test_loader_rejects_non_numeric_non_finite_or_unsafe_coordinates(
+    tmp_sequence,
+    coordinate,
+):
+    payload = _read_frame_payload(tmp_sequence)
+    payload["shapes"][0]["points"] = [
+        [coordinate, 10],
+        [20, 10],
+        [20, 20],
+        [coordinate, 20],
+    ]
+    path = tmp_sequence / "000001.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        load_sequence(tmp_sequence)
+
+    message = str(caught.value)
+    assert str(path) in message
+    assert "shape[0]" in message
+    assert "label='car'" in message
+    assert "finite coordinate pairs" in message
 
 
 @pytest.mark.parametrize(
@@ -247,6 +319,37 @@ def test_loader_preserves_class_difficult_and_point_derived_direction(tmp_sequen
     assert annotation.class_name == "truck"
     assert annotation.difficult is True
     assert annotation.obb == OBB(20.0, 20.0, 12.0, 6.0, -np.pi / 2)
+
+
+def test_loader_defaults_missing_difficult_to_false(tmp_sequence):
+    payload = _read_frame_payload(tmp_sequence)
+    del payload["shapes"][0]["difficult"]
+    _write_frame_payload(tmp_sequence, payload)
+
+    annotation = load_sequence(tmp_sequence).frames[0].annotations[0]
+
+    assert annotation.difficult is False
+
+
+@pytest.mark.parametrize(
+    "difficult",
+    [None, 0, 1, "false", []],
+    ids=["none", "zero", "one", "string", "list"],
+)
+def test_loader_rejects_non_boolean_difficult(tmp_sequence, difficult):
+    payload = _read_frame_payload(tmp_sequence)
+    payload["shapes"][0]["difficult"] = difficult
+    path = tmp_sequence / "000001.json"
+    _write_frame_payload(tmp_sequence, payload)
+
+    with pytest.raises(ValueError) as caught:
+        load_sequence(tmp_sequence)
+
+    message = str(caught.value)
+    assert str(path) in message
+    assert "shape[0]" in message
+    assert "label='car'" in message
+    assert "difficult" in message
 
 
 @pytest.mark.parametrize("fps", [0, -1, True, 29.97])

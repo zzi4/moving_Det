@@ -13,6 +13,18 @@ from moving_det.models import Annotation, FrameSample, SequenceData
 _PERCENTILES = (0, 25, 50, 75, 100)
 
 
+def _finite_number(value: object, message: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(message)
+    try:
+        converted = float(value)
+    except OverflowError as exc:
+        raise ValueError(message) from exc
+    if not math.isfinite(converted):
+        raise ValueError(message)
+    return converted
+
+
 def _collect_files(path: Path, suffix: str) -> dict[str, Path]:
     files: dict[str, Path] = {}
     for candidate in path.iterdir():
@@ -50,19 +62,23 @@ def _points_array(
     exact_count: int | None = None,
     minimum_count: int | None = None,
 ) -> np.ndarray:
-    try:
-        array = np.asarray(points, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("shape points must be finite coordinate pairs") from exc
-    if array.ndim != 2 or array.shape[1:] != (2,):
+    if not isinstance(points, list):
         raise ValueError("shape points must be finite coordinate pairs")
-    if exact_count is not None and len(array) != exact_count:
+    if exact_count is not None and len(points) != exact_count:
         raise ValueError("rotation target must contain exactly four points")
-    if minimum_count is not None and len(array) < minimum_count:
+    if minimum_count is not None and len(points) < minimum_count:
         raise ValueError("ignored polygon must contain at least three points")
-    if not np.isfinite(array).all():
+    if any(not isinstance(point, list) or len(point) != 2 for point in points):
         raise ValueError("shape points must be finite coordinate pairs")
-    return array
+
+    message = "shape points must be finite coordinate pairs"
+    return np.asarray(
+        [
+            [_finite_number(coordinate, message) for coordinate in point]
+            for point in points
+        ],
+        dtype=np.float64,
+    )
 
 
 def _parse_ignored_shape(shape: dict[str, object]) -> tuple[tuple[float, float], ...]:
@@ -95,13 +111,10 @@ def _parse_target_shape(
             f"target description conflicts with group_id {group_id}"
         )
 
-    direction = shape.get("direction")
-    if (
-        isinstance(direction, bool)
-        or not isinstance(direction, (int, float))
-        or not math.isfinite(direction)
-    ):
-        raise ValueError("target direction must be a finite numeric value")
+    _finite_number(
+        shape.get("direction"),
+        "target direction must be a finite numeric value",
+    )
 
     points = _points_array(shape.get("points"), exact_count=4)
     if (
@@ -112,11 +125,15 @@ def _parse_target_shape(
     ):
         raise ValueError("target points must lie inside image bounds")
 
+    difficult = shape.get("difficult", False)
+    if not isinstance(difficult, bool):
+        raise ValueError("target difficult must be a boolean")
+
     return Annotation(
         obb=points_to_obb(points),
         class_name=label,
         track_id=group_id,
-        difficult=bool(shape.get("difficult", False)),
+        difficult=difficult,
     )
 
 
@@ -129,8 +146,11 @@ def _load_shapes(
     tuple[Annotation, ...],
     tuple[tuple[tuple[float, float], ...], ...],
 ]:
-    with json_path.open(encoding="utf-8") as stream:
-        payload = json.load(stream)
+    try:
+        with json_path.open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"failed to read Labelme JSON {json_path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"Labelme document must be an object: {json_path}")
     shapes = payload.get("shapes")
@@ -167,8 +187,13 @@ def load_sequence(path: Path, fps: int = 30) -> SequenceData:
     sequence_height: int | None = None
     frames = []
     for frame_index, image_path, json_path in paired_frames:
-        with Image.open(image_path) as image:
-            width, height = image.size
+        try:
+            with Image.open(image_path) as image:
+                width, height = image.size
+        except OSError as exc:
+            raise ValueError(
+                f"failed to read image metadata {image_path}: {exc}"
+            ) from exc
         if sequence_width is None:
             sequence_width, sequence_height = width, height
         elif (width, height) != (sequence_width, sequence_height):
