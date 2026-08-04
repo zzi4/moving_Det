@@ -378,6 +378,20 @@ def _native_float(value: object, context: str) -> float:
     return value
 
 
+def _native_config_float(value: object, context: str) -> float:
+    if type(value) not in {int, float}:
+        raise ValueError(f"{context} must be a finite native YAML number")
+    try:
+        converted = float(value)
+    except OverflowError as exc:
+        raise ValueError(
+            f"{context} must be a finite native YAML number"
+        ) from exc
+    if not math.isfinite(converted):
+        raise ValueError(f"{context} must be a finite native YAML number")
+    return converted
+
+
 def _nonempty_string(value: object, context: str) -> str:
     if type(value) is not str or not value.strip():
         raise ValueError(f"{context} must be a non-empty string")
@@ -524,34 +538,30 @@ def _strict_config_values(
             f"{path} {name}",
         )
     for name in _CONFIG_FLOAT_FIELDS:
-        converted[name] = _native_float(
+        converted[name] = _native_config_float(
             payload[name],
             f"{path} {name}",
         )
-    for names, item_type, validator in (
-        (
-            _CONFIG_INTEGER_LIST_FIELDS,
-            int,
-            _native_integer,
-        ),
-        (
-            _CONFIG_FLOAT_LIST_FIELDS,
-            float,
-            _native_float,
-        ),
-    ):
-        for name in names:
-            raw = payload[name]
-            if type(raw) is not list or not raw:
-                raise ValueError(f"{path} {name} must be a non-empty list")
-            if any(type(item) is not item_type for item in raw):
-                raise ValueError(
-                    f"{path} {name} elements use an invalid native type"
-                )
-            converted[name] = tuple(
-                validator(item, f"{path} {name} element")
-                for item in raw
+    for name in _CONFIG_INTEGER_LIST_FIELDS:
+        raw = payload[name]
+        if type(raw) is not list or not raw:
+            raise ValueError(f"{path} {name} must be a non-empty list")
+        if any(type(item) is not int for item in raw):
+            raise ValueError(
+                f"{path} {name} elements use an invalid native type"
             )
+        converted[name] = tuple(
+            _native_integer(item, f"{path} {name} element")
+            for item in raw
+        )
+    for name in _CONFIG_FLOAT_LIST_FIELDS:
+        raw = payload[name]
+        if type(raw) is not list or not raw:
+            raise ValueError(f"{path} {name} must be a non-empty list")
+        converted[name] = tuple(
+            _native_config_float(item, f"{path} {name} element")
+            for item in raw
+        )
     return converted
 
 

@@ -11,7 +11,7 @@ import yaml
 from PIL import Image, ImageDraw
 
 from moving_det.cli import main
-from moving_det.config import ExperimentConfig
+from moving_det.config import ExperimentConfig, load_config
 from moving_det.experiment import run_method
 from moving_det.models import OBB, Proposal
 from moving_det.visualization.overlays import render_overlay
@@ -520,15 +520,15 @@ def test_visualize_cli_rejects_noncanonical_run_metadata(
             id="bool-as-integer",
         ),
         pytest.param(
-            lambda payload: payload.__setitem__("mad_floor", 2),
-            id="integer-in-float-field",
+            lambda payload: payload.__setitem__("mad_floor", True),
+            id="bool-in-float-field",
         ),
         pytest.param(
             lambda payload: payload.__setitem__("offsets", [1, True, 7, 15]),
             id="invalid-integer-list-element",
         ),
         pytest.param(
-            lambda payload: payload.__setitem__("scale_factors", [1, 0.7]),
+            lambda payload: payload.__setitem__("scale_factors", [True, 0.7]),
             id="invalid-float-list-element",
         ),
         pytest.param(
@@ -833,6 +833,100 @@ def test_visualize_cli_accepts_real_writer_with_arbitrary_sequence(
         sequence=output_sequence,
         processing_sequence=tiny_sequence,
         method_name="multiscale",
+        scale=1.0,
+        thresholds=(4.0,),
+        output_dir=run_dir,
+    )
+
+    assert _visualize(run_dir) == 0
+    assert (run_dir / "overlays" / "comparison.png").is_file()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "yaml_value"),
+    (
+        pytest.param("mad_floor", 2, id="mad-floor-scalar"),
+        pytest.param("mad_clip", 6, id="mad-clip-scalar"),
+        pytest.param(
+            "ecc_max_translation",
+            20,
+            id="ecc-translation-scalar",
+        ),
+        pytest.param(
+            "ecc_max_rotation_degrees",
+            2,
+            id="ecc-rotation-scalar",
+        ),
+        pytest.param(
+            "obb_padding_factor",
+            1,
+            id="obb-padding-scalar",
+        ),
+        pytest.param(
+            "max_false_proposals_per_100_gt",
+            25,
+            id="max-false-proposals-scalar",
+        ),
+        pytest.param(
+            "scale_factors",
+            [1, 0.7],
+            id="scale-list-element",
+        ),
+        pytest.param(
+            "threshold_candidates",
+            [3, 4, 5, 6],
+            id="threshold-list-elements",
+        ),
+        pytest.param(
+            "mog2_var_threshold_candidates",
+            [9, 16, 25],
+            id="mog2-threshold-list-elements",
+        ),
+        pytest.param(
+            "moving_thresholds",
+            [2, 3, 5],
+            id="moving-threshold-list-elements",
+        ),
+    ),
+)
+def test_visualize_cli_accepts_real_writer_integer_spelling_for_float_config(
+    tmp_path,
+    tiny_sequence,
+    field_name,
+    yaml_value,
+):
+    raw_config = yaml.safe_load(
+        Path("configs/poc.yaml").read_text(encoding="utf-8")
+    )
+    raw_config[field_name] = yaml_value
+    raw_config.update(
+        data_root="relative-unused-data",
+        calibration_sequence="different_calibration",
+        evaluation_sequence="different_evaluation",
+        output_root="unrelated-output",
+    )
+    config_path = tmp_path / f"{field_name}.yaml"
+    config_path.write_text(
+        yaml.safe_dump(raw_config, sort_keys=False),
+        encoding="utf-8",
+    )
+    integer_spelled_config = load_config(config_path)
+    loaded_value = getattr(integer_spelled_config, field_name)
+    if isinstance(yaml_value, list):
+        assert any(type(item) is int for item in loaded_value)
+    else:
+        assert type(loaded_value) is int
+
+    output_sequence = replace(
+        tiny_sequence,
+        frames=tiny_sequence.frames[:3],
+    )
+    run_dir = tmp_path / f"real-writer-{field_name}"
+    run_method(
+        config=integer_spelled_config,
+        sequence=output_sequence,
+        processing_sequence=tiny_sequence,
+        method_name="frame_diff",
         scale=1.0,
         thresholds=(4.0,),
         output_dir=run_dir,
