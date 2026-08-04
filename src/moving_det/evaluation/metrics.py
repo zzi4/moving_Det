@@ -2,6 +2,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Real
 from types import MappingProxyType
 
 import cv2
@@ -92,7 +93,7 @@ def moving_annotations(
 
     annotations_by_track_and_frame, final_frame_index = _track_frame_index(sequence)
     if final_frame_index is None:
-        return {}
+        return MappingProxyType({})
     moving: dict[int, tuple[Annotation, ...]] = {}
     for frame in sequence.frames:
         selected = []
@@ -113,7 +114,7 @@ def moving_annotations(
             if displacement >= threshold:
                 selected.append(annotation)
         moving[frame.frame_index] = tuple(selected)
-    return moving
+    return MappingProxyType(moving)
 
 
 def _threshold_key(threshold: float) -> str:
@@ -684,35 +685,107 @@ def select_calibration_result(
     results: Sequence[CalibrationCandidate],
     max_fp_per_100_gt: float,
 ) -> CalibrationChoice:
-    if not results:
+    candidates = tuple(results)
+    if not candidates:
         raise ValueError("at least one calibration candidate is required")
-    if not math.isfinite(max_fp_per_100_gt) or max_fp_per_100_gt < 0:
+    if (
+        isinstance(max_fp_per_100_gt, bool)
+        or not isinstance(max_fp_per_100_gt, Real)
+    ):
+        raise ValueError("false-positive constraint must be finite and non-negative")
+    try:
+        normalized_constraint = float(max_fp_per_100_gt)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "false-positive constraint must be finite and non-negative"
+        ) from exc
+    if not math.isfinite(normalized_constraint) or normalized_constraint < 0:
         raise ValueError("false-positive constraint must be finite and non-negative")
 
+    validated: list[
+        tuple[CalibrationCandidate, float, float, float]
+    ] = []
+    for candidate in candidates:
+        if not isinstance(candidate, CalibrationCandidate):
+            raise ValueError("results must contain CalibrationCandidate values")
+        if (
+            not isinstance(candidate.parameter_name, str)
+            or not candidate.parameter_name
+        ):
+            raise ValueError("parameter_name must be a non-empty string")
+        if (
+            isinstance(candidate.parameter_value, bool)
+            or not isinstance(candidate.parameter_value, Real)
+        ):
+            raise ValueError("parameter_value must be a finite real number")
+        try:
+            parameter_value = float(candidate.parameter_value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "parameter_value must be a finite real number"
+            ) from exc
+        if not math.isfinite(parameter_value):
+            raise ValueError("parameter_value must be a finite real number")
+
+        if (
+            isinstance(candidate.recall_025, bool)
+            or not isinstance(candidate.recall_025, Real)
+        ):
+            raise ValueError("recall_025 must be finite and within [0, 1]")
+        try:
+            recall = float(candidate.recall_025)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "recall_025 must be finite and within [0, 1]"
+            ) from exc
+        if not math.isfinite(recall) or not 0.0 <= recall <= 1.0:
+            raise ValueError("recall_025 must be finite and within [0, 1]")
+
+        if (
+            isinstance(candidate.fp_per_100_gt, bool)
+            or not isinstance(candidate.fp_per_100_gt, Real)
+        ):
+            raise ValueError(
+                "fp_per_100_gt must be non-negative and not NaN or -inf"
+            )
+        try:
+            fp_per_100_gt = float(candidate.fp_per_100_gt)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "fp_per_100_gt must be non-negative and not NaN or -inf"
+            ) from exc
+        if math.isnan(fp_per_100_gt) or fp_per_100_gt < 0:
+            raise ValueError(
+                "fp_per_100_gt must be non-negative and not NaN or -inf"
+            )
+        validated.append(
+            (candidate, parameter_value, recall, fp_per_100_gt)
+        )
+
     feasible = [
-        candidate
-        for candidate in results
-        if candidate.fp_per_100_gt <= max_fp_per_100_gt
+        item
+        for item in validated
+        if item[3] <= normalized_constraint
     ]
     if feasible:
-        candidate = min(
+        selected = min(
             feasible,
             key=lambda item: (
-                -item.recall_025,
-                item.fp_per_100_gt,
-                item.parameter_name,
-                item.parameter_value,
+                -item[2],
+                item[3],
+                item[0].parameter_name,
+                item[1],
             ),
         )
-        return CalibrationChoice(candidate, True)
+        return CalibrationChoice(selected[0], True)
 
-    candidate = min(
-        results,
+    selected = min(
+        validated,
         key=lambda item: (
-            item.fp_per_100_gt,
-            -item.recall_025,
-            item.parameter_name,
-            item.parameter_value,
+            item[3],
+            -item[2],
+            item[0].parameter_name,
+            item[1],
         ),
     )
-    return CalibrationChoice(candidate, False)
+    return CalibrationChoice(selected[0], False)

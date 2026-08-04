@@ -7,6 +7,7 @@ import pytest
 
 from moving_det.evaluation import (
     CalibrationCandidate,
+    CalibrationChoice,
     evaluate_sequence,
     match_frame,
     moving_annotations,
@@ -118,6 +119,22 @@ def test_motion_filter_uses_backward_comparison_only_at_sequence_boundary():
     moving = moving_annotations(sequence, displacement_frames=5, threshold=3)
 
     assert moving[10] == (sequence.frames[9].annotations[0],)
+
+
+def test_motion_filter_result_mapping_is_read_only_but_normally_consumable(
+    sequence_with_tracks,
+):
+    moving = moving_annotations(
+        sequence_with_tracks,
+        displacement_frames=5,
+        threshold=3.0,
+    )
+
+    assert tuple(moving[10]) == tuple(dict(moving)[10])
+    with pytest.raises(TypeError):
+        moving[10] = ()
+    with pytest.raises(TypeError):
+        del moving[10]
 
 
 @pytest.mark.parametrize(
@@ -243,6 +260,111 @@ def test_calibration_without_feasible_candidate_explicitly_chooses_minimum_fp():
 
     assert choice.candidate.parameter_value == 5
     assert choice.constraint_satisfied is False
+
+
+@pytest.mark.parametrize("recall", [float("nan"), -0.01, 1.01])
+def test_calibration_rejects_recall_outside_finite_unit_interval(recall):
+    candidate = CalibrationCandidate("z_threshold", 4, recall, 10)
+
+    with pytest.raises(ValueError, match="recall_025"):
+        select_calibration_result([candidate], max_fp_per_100_gt=25)
+
+
+@pytest.mark.parametrize(
+    "false_positive_rate",
+    [float("nan"), -0.01, float("-inf")],
+)
+def test_calibration_rejects_invalid_false_positive_rate(false_positive_rate):
+    candidate = CalibrationCandidate(
+        "z_threshold",
+        4,
+        0.9,
+        false_positive_rate,
+    )
+
+    with pytest.raises(ValueError, match="fp_per_100_gt"):
+        select_calibration_result([candidate], max_fp_per_100_gt=25)
+
+
+def test_calibration_accepts_positive_infinite_false_positive_rate():
+    candidate = CalibrationCandidate(
+        "z_threshold",
+        4,
+        0.9,
+        float("inf"),
+    )
+
+    choice = select_calibration_result([candidate], max_fp_per_100_gt=25)
+
+    assert choice == CalibrationChoice(candidate, constraint_satisfied=False)
+
+
+@pytest.mark.parametrize("parameter_name", ["", 4])
+def test_calibration_rejects_invalid_parameter_name(parameter_name):
+    candidate = CalibrationCandidate(parameter_name, 4, 0.9, 10)
+
+    with pytest.raises(ValueError, match="parameter_name"):
+        select_calibration_result([candidate], max_fp_per_100_gt=25)
+
+
+@pytest.mark.parametrize(
+    "parameter_value",
+    [
+        True,
+        "4",
+        1 + 0j,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+    ],
+)
+def test_calibration_rejects_non_sortable_parameter_value(parameter_value):
+    candidate = CalibrationCandidate(
+        "z_threshold",
+        parameter_value,
+        0.9,
+        10,
+    )
+
+    with pytest.raises(ValueError, match="parameter_value"):
+        select_calibration_result([candidate], max_fp_per_100_gt=25)
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [True, "25", float("nan"), float("inf"), float("-inf"), -0.01],
+)
+def test_calibration_rejects_invalid_false_positive_constraint(constraint):
+    candidate = CalibrationCandidate("z_threshold", 4, 0.9, 10)
+
+    with pytest.raises(ValueError, match="constraint"):
+        select_calibration_result([candidate], max_fp_per_100_gt=constraint)
+
+
+def test_calibration_validates_losing_candidates_before_selection():
+    candidates = [
+        CalibrationCandidate("z_threshold", 4, 0.9, 10),
+        CalibrationCandidate("z_threshold", 5, float("nan"), 100),
+    ]
+
+    with pytest.raises(ValueError, match="recall_025"):
+        select_calibration_result(candidates, max_fp_per_100_gt=25)
+
+
+def test_calibration_choice_is_independent_of_candidate_input_order():
+    candidates = [
+        CalibrationCandidate("z_threshold", 5, 0.9, 10),
+        CalibrationCandidate("z_threshold", 4, 0.9, 10),
+        CalibrationCandidate("z_threshold", 3, 0.8, 5),
+    ]
+
+    forward = select_calibration_result(candidates, max_fp_per_100_gt=25)
+    reverse = select_calibration_result(
+        list(reversed(candidates)),
+        max_fp_per_100_gt=25,
+    )
+
+    assert forward == reverse == CalibrationChoice(candidates[1], True)
 
 
 def test_evaluation_uses_only_core_frames_for_primary_metrics():
