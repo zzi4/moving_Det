@@ -27,6 +27,8 @@ _METHOD_NAMES = (
 )
 _SCALE_FACTORS = (1.0, 0.7)
 _MOG2_HISTORY = 60
+_MOG2_VAR_THRESHOLDS = (9.0, 16.0, 25.0)
+_MOG2_DEFAULT_VAR_THRESHOLD = 16.0
 _PRELIMINARY_Z_THRESHOLD = 5.0
 _FRAME_CACHE_SIZE = 31
 _TEMPORAL_STACK_TARGET_BYTES = 64 * 1024 * 1024
@@ -87,6 +89,52 @@ def _validate_scale(scale: float, cfg: ExperimentConfig) -> float:
     return scale
 
 
+def _validate_mog2_factory_config(cfg: ExperimentConfig) -> None:
+    if cfg.mog2_history != _MOG2_HISTORY:
+        raise ValueError("mog2_history must be 60")
+    if (
+        not isinstance(cfg.mog2_var_threshold_candidates, tuple)
+        or cfg.mog2_var_threshold_candidates != _MOG2_VAR_THRESHOLDS
+    ):
+        raise ValueError(
+            "mog2_var_threshold_candidates must be (9.0, 16.0, 25.0)"
+        )
+
+
+def _validate_poc_config(cfg: ExperimentConfig) -> None:
+    checks = (
+        ("window_radius", cfg.window_radius == 15),
+        (
+            "offsets",
+            isinstance(cfg.offsets, tuple)
+            and cfg.offsets == (1, 3, 7, 15),
+        ),
+        (
+            "scale_factors",
+            isinstance(cfg.scale_factors, tuple)
+            and cfg.scale_factors == _SCALE_FACTORS,
+        ),
+        ("mad_floor", cfg.mad_floor == 2.0),
+        ("mad_clip", cfg.mad_clip == 6.0),
+        ("mog2_history", cfg.mog2_history == _MOG2_HISTORY),
+        (
+            "mog2_var_threshold_candidates",
+            isinstance(cfg.mog2_var_threshold_candidates, tuple)
+            and cfg.mog2_var_threshold_candidates
+            == _MOG2_VAR_THRESHOLDS,
+        ),
+        ("ecc_min_correlation", cfg.ecc_min_correlation == 0.8),
+        ("ecc_max_translation", cfg.ecc_max_translation == 20.0),
+        (
+            "ecc_max_rotation_degrees",
+            cfg.ecc_max_rotation_degrees == 2.0,
+        ),
+    )
+    for field_name, is_valid in checks:
+        if not is_valid:
+            raise ValueError(f"{field_name} does not match the fixed POC config")
+
+
 def _ordered_samples(sequence: SequenceData) -> tuple[FrameSample, ...]:
     if not isinstance(sequence, SequenceData):
         raise TypeError("sequence must be a SequenceData")
@@ -103,6 +151,11 @@ def _ordered_samples(sequence: SequenceData) -> tuple[FrameSample, ...]:
     frame_indices = tuple(int(sample.frame_index) for sample in ordered)
     if len(set(frame_indices)) != len(frame_indices):
         raise ValueError("frame indices must be unique")
+    if any(
+        current != previous + 1
+        for previous, current in zip(frame_indices, frame_indices[1:])
+    ):
+        raise ValueError("frame indices must be consecutive integers")
     return ordered
 
 
@@ -197,9 +250,20 @@ def _two_pass_align(
         floor=cfg.mad_floor,
         clip=cfg.mad_clip,
     )
+    moving_exclusion = cv2.warpAffine(
+        np.greater_equal(
+            preliminary_z,
+            _PRELIMINARY_Z_THRESHOLD,
+        ).astype(np.uint8),
+        np.asarray(first_result.matrix, dtype=np.float32),
+        (support.shape[1], support.shape[0]),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    ).astype(bool)
     second_exclusion = np.logical_or(
         base_exclusion,
-        preliminary_z >= _PRELIMINARY_Z_THRESHOLD,
+        moving_exclusion,
     )
     second_result = estimate_euclidean_ecc(
         reference,
@@ -416,6 +480,7 @@ class _AlignedMethod:
         sequence: SequenceData,
         scale: float,
     ) -> Mapping[int, MotionEvidence]:
+        _validate_poc_config(self._cfg)
         scale = _validate_scale(scale, self._cfg)
         samples = _ordered_samples(sequence)
         reader = _ImageReader(sequence, scale)
@@ -454,11 +519,16 @@ class _MOG2Method:
     ) -> Mapping[int, tuple[AlignmentDiagnostic, ...]]:
         return self._diagnostics
 
+    @property
+    def var_threshold(self) -> float:
+        return self._var_threshold
+
     def run(
         self,
         sequence: SequenceData,
         scale: float,
     ) -> Mapping[int, MotionEvidence]:
+        _validate_poc_config(self._cfg)
         scale = _validate_scale(scale, self._cfg)
         samples = _ordered_samples(sequence)
         reader = _ImageReader(sequence, scale)
@@ -520,18 +590,15 @@ def create_method(
         )
         return _AlignedMethod(aligned_name, cfg)
 
-    if cfg.mog2_history != _MOG2_HISTORY:
-        raise ValueError("mog2 history must be 60")
+    _validate_mog2_factory_config(cfg)
     if var_threshold is None:
-        if not cfg.mog2_var_threshold_candidates:
-            raise ValueError("mog2 var_threshold candidates must not be empty")
-        var_threshold = cfg.mog2_var_threshold_candidates[0]
+        var_threshold = _MOG2_DEFAULT_VAR_THRESHOLD
     if (
         isinstance(var_threshold, bool)
         or not isinstance(var_threshold, Real)
         or not np.isfinite(var_threshold)
         or float(var_threshold)
-        not in tuple(float(value) for value in cfg.mog2_var_threshold_candidates)
+        not in _MOG2_VAR_THRESHOLDS
     ):
         raise ValueError(
             "var_threshold must be one of the configured MOG2 candidates"

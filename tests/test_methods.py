@@ -1,13 +1,15 @@
 from dataclasses import replace
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 from PIL import Image
 
 from moving_det.models import FrameSample, SequenceData
-from moving_det.motion.alignment import AlignmentResult
+from moving_det.motion.alignment import AlignmentResult, warp_to_reference
 from moving_det.motion import methods as methods_module
+from moving_det.motion.evidence import robust_z
 from moving_det.motion.methods import create_method
 
 
@@ -48,6 +50,55 @@ def _sequence(
         height=96,
         fps=30,
         frames=tuple(frames),
+    )
+
+
+def _translated_sequence(
+    tmp_path: Path,
+) -> tuple[SequenceData, np.ndarray, np.ndarray]:
+    yy, xx = np.indices((96, 128))
+    background = ((3 * xx + 5 * yy) % 96).astype(np.uint8)
+    first_matrix = np.float32([[1, 0, -8], [0, 1, 0]])
+    support = cv2.warpAffine(
+        background,
+        first_matrix,
+        (128, 96),
+        borderMode=cv2.BORDER_REFLECT101,
+    )
+    reference = background.copy()
+    reference[36:44, 50:58] = 255
+    support_path = tmp_path / "000001.png"
+    reference_path = tmp_path / "000002.png"
+    Image.fromarray(support).save(support_path)
+    Image.fromarray(reference).save(reference_path)
+    frames = (
+        FrameSample(
+            sequence_id="translated_sequence",
+            frame_index=1,
+            timestamp=0.0,
+            image_path=support_path,
+            annotations=(),
+            ignore_polygons=(),
+        ),
+        FrameSample(
+            sequence_id="translated_sequence",
+            frame_index=2,
+            timestamp=1 / 30,
+            image_path=reference_path,
+            annotations=(),
+            ignore_polygons=(),
+        ),
+    )
+    return (
+        SequenceData(
+            sequence_id="translated_sequence",
+            width=128,
+            height=96,
+            fps=30,
+            frames=frames,
+        ),
+        reference,
+        support,
     )
 
 
@@ -225,6 +276,55 @@ def test_two_pass_alignment_scales_ignore_mask_and_records_fallbacks(
     assert diagnostic.second_pass.correlation == 0.0
 
 
+def test_two_pass_alignment_warps_preliminary_exclusion_to_support_coordinates(
+    tmp_path,
+    config,
+    monkeypatch,
+):
+    sequence, reference, support = _translated_sequence(tmp_path)
+    first_result = AlignmentResult(
+        matrix=np.float32([[1, 0, -8], [0, 1, 0]]),
+        correlation=0.95,
+        used_fallback=False,
+        reason=None,
+    )
+    second_result = AlignmentResult(
+        matrix=np.float32([[1, 0, 0], [0, 1, 0]]),
+        correlation=0.96,
+        used_fallback=False,
+        reason=None,
+    )
+    exclude_masks = []
+
+    def controlled_ecc(reference_image, moving_image, cfg, exclude_mask=None):
+        del reference_image, moving_image, cfg
+        exclude_masks.append(exclude_mask.copy())
+        return first_result if len(exclude_masks) == 1 else second_result
+
+    monkeypatch.setattr(
+        methods_module,
+        "estimate_euclidean_ecc",
+        controlled_ecc,
+    )
+
+    result = create_method("frame_diff", config).run(
+        sequence,
+        scale=1.0,
+    )
+
+    assert len(exclude_masks) == 2
+    assert exclude_masks[1].dtype == np.bool_
+    assert exclude_masks[1][40, 44]
+    assert not exclude_masks[1][40, 54]
+    expected_aligned = warp_to_reference(support, second_result)
+    expected_z = robust_z(
+        cv2.absdiff(reference, expected_aligned),
+        floor=config.mad_floor,
+        clip=config.mad_clip,
+    )
+    np.testing.assert_array_equal(result[2].fused_z, expected_z)
+
+
 def test_mog2_outputs_binary_z_and_identity_diagnostics(
     synthetic_sequence,
     config,
@@ -294,3 +394,174 @@ def test_factory_rejects_unplanned_mog2_var_thresholds(
 def test_mog2_rejects_non_poc_history(config):
     with pytest.raises(ValueError, match="history"):
         create_method("mog2", replace(config, mog2_history=30))
+
+
+def test_mog2_none_uses_fixed_opencv_default_threshold(config):
+    method = create_method("mog2", config)
+
+    assert method.var_threshold == 16.0
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        (16.0, 9.0, 25.0),
+        (9.0, 16.0),
+        (9.0, 16.0, 25.0, 36.0),
+        [9.0, 16.0, 25.0],
+    ],
+)
+def test_factory_rejects_non_poc_mog2_candidate_config(candidates, config):
+    with pytest.raises(ValueError, match="mog2_var_threshold_candidates"):
+        create_method(
+            "mog2",
+            replace(config, mog2_var_threshold_candidates=candidates),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("window_radius", 7),
+        ("offsets", (1, 3, 7)),
+        ("scale_factors", (1.0,)),
+        ("mad_floor", 1.0),
+        ("mad_clip", 5.0),
+        ("mog2_history", 30),
+        ("mog2_var_threshold_candidates", (16.0, 9.0, 25.0)),
+        ("ecc_min_correlation", 0.7),
+        ("ecc_max_translation", 10.0),
+        ("ecc_max_rotation_degrees", 1.0),
+    ],
+)
+def test_run_rejects_non_poc_method_config_before_reading_images(
+    field,
+    value,
+    tmp_path,
+    config,
+    monkeypatch,
+):
+    sequence = _sequence(tmp_path)
+
+    def unexpected_read(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("image loading must not happen")
+
+    monkeypatch.setattr(methods_module.cv2, "imread", unexpected_read)
+    method = create_method(
+        "frame_diff",
+        replace(config, **{field: value}),
+    )
+
+    with pytest.raises(ValueError, match=field):
+        method.run(sequence, scale=1.0)
+
+
+def test_temporal_median_rejects_non_poc_window_radius(
+    tmp_path,
+    config,
+):
+    sequence = _sequence(tmp_path)
+    method = create_method(
+        "temporal_median",
+        replace(config, window_radius=7),
+    )
+
+    with pytest.raises(ValueError, match="window_radius"):
+        method.run(sequence, scale=1.0)
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "frame_diff",
+        "mog2",
+        "temporal_median",
+        "multiscale",
+        "multiscale_tubelet",
+    ],
+)
+def test_missing_frame_index_is_rejected_before_expensive_work(
+    method_name,
+    tmp_path,
+    config,
+    monkeypatch,
+):
+    sequence = _sequence(tmp_path)
+    sequence = replace(
+        sequence,
+        frames=(
+            sequence.frames[0],
+            replace(sequence.frames[1], frame_index=3),
+        ),
+    )
+
+    def unexpected_call(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("expensive work must not happen")
+
+    monkeypatch.setattr(methods_module.cv2, "imread", unexpected_call)
+    monkeypatch.setattr(
+        methods_module.cv2,
+        "createBackgroundSubtractorMOG2",
+        unexpected_call,
+    )
+    monkeypatch.setattr(
+        methods_module,
+        "estimate_euclidean_ecc",
+        unexpected_call,
+    )
+    method = create_method(method_name, config)
+
+    with pytest.raises(ValueError, match="consecutive"):
+        method.run(sequence, scale=1.0)
+
+
+@pytest.mark.parametrize(
+    ("replacement_index", "exception", "message"),
+    [
+        (1, ValueError, "unique"),
+        (1.5, TypeError, "integers"),
+        ("2", TypeError, "integers"),
+        (True, TypeError, "integers"),
+    ],
+)
+def test_run_rejects_invalid_frame_index_contract(
+    replacement_index,
+    exception,
+    message,
+    tmp_path,
+    config,
+):
+    sequence = _sequence(tmp_path)
+    sequence = replace(
+        sequence,
+        frames=(
+            sequence.frames[0],
+            replace(
+                sequence.frames[1],
+                frame_index=replacement_index,
+            ),
+        ),
+    )
+
+    with pytest.raises(exception, match=message):
+        create_method("frame_diff", config).run(sequence, scale=1.0)
+
+
+def test_run_rejects_unreadable_image_path(tmp_path, config):
+    sequence = _sequence(tmp_path)
+    sequence.frames[0].image_path.unlink()
+
+    with pytest.raises(ValueError, match="unable to read frame 1"):
+        create_method("frame_diff", config).run(sequence, scale=1.0)
+
+
+def test_run_rejects_image_size_inconsistent_with_sequence(tmp_path, config):
+    sequence = _sequence(tmp_path)
+    Image.fromarray(np.zeros((64, 64), dtype=np.uint8)).save(
+        sequence.frames[0].image_path,
+    )
+
+    with pytest.raises(ValueError, match="does not match sequence shape"):
+        create_method("frame_diff", config).run(sequence, scale=1.0)
