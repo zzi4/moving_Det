@@ -119,6 +119,30 @@ def test_each_method_returns_one_evidence_map_per_frame(
     assert all(item.fused_z.shape == (96, 128) for item in results.values())
 
 
+def test_frame_diff_stream_yields_before_decoding_the_complete_sequence(
+    synthetic_sequence,
+    config,
+    monkeypatch,
+):
+    original_imread = methods_module.cv2.imread
+    decoded_paths = []
+
+    def counting_imread(path, flags):
+        decoded_paths.append(path)
+        return original_imread(path, flags)
+
+    monkeypatch.setattr(methods_module.cv2, "imread", counting_imread)
+    stream = create_method("frame_diff", config).iter_run(
+        synthetic_sequence,
+        scale=1.0,
+    )
+
+    first = next(stream)
+
+    assert first.frame_index == 1
+    assert len(decoded_paths) == 1
+
+
 def test_mog2_detects_moving_square_after_warmup(
     synthetic_sequence,
     config,

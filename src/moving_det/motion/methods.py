@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from numbers import Integral, Real
 from types import MappingProxyType
@@ -374,18 +374,18 @@ class _AlignedMethod:
             diagnostics.append(diagnostic)
         return aligned, tuple(diagnostics)
 
-    def _run_frame_diff(
+    def _iter_frame_diff(
         self,
         samples: tuple[FrameSample, ...],
         reader: _ImageReader,
         scale: float,
-    ) -> tuple[
-        dict[int, MotionEvidence],
-        dict[int, tuple[AlignmentDiagnostic, ...]],
-    ]:
+    ) -> Iterator[MotionEvidence]:
         by_index = {int(sample.frame_index): sample for sample in samples}
-        results = {}
-        all_diagnostics = {}
+        all_diagnostics: dict[
+            int,
+            tuple[AlignmentDiagnostic, ...],
+        ] = {}
+        self._diagnostics = MappingProxyType(all_diagnostics)
         for center_sample in samples:
             center_index = int(center_sample.frame_index)
             previous_sample = by_index.get(center_index - 1)
@@ -411,7 +411,7 @@ class _AlignedMethod:
                 )
                 support_indices = (center_index - 1, center_index)
                 diagnostics = (diagnostic,)
-            results[center_index] = _single_channel_evidence(
+            evidence = _single_channel_evidence(
                 center_index,
                 "d1",
                 z,
@@ -419,19 +419,19 @@ class _AlignedMethod:
                 self._cfg,
             )
             all_diagnostics[center_index] = diagnostics
-        return results, all_diagnostics
+            yield evidence
 
-    def _run_windowed(
+    def _iter_windowed(
         self,
         samples: tuple[FrameSample, ...],
         reader: _ImageReader,
         scale: float,
-    ) -> tuple[
-        dict[int, MotionEvidence],
-        dict[int, tuple[AlignmentDiagnostic, ...]],
-    ]:
-        results = {}
-        all_diagnostics = {}
+    ) -> Iterator[MotionEvidence]:
+        all_diagnostics: dict[
+            int,
+            tuple[AlignmentDiagnostic, ...],
+        ] = {}
+        self._diagnostics = MappingProxyType(all_diagnostics)
         for center_sample in samples:
             center_index = int(center_sample.frame_index)
             support_samples = tuple(
@@ -471,32 +471,32 @@ class _AlignedMethod:
                     aligned,
                     self._cfg,
                 )
-            results[center_index] = evidence
             all_diagnostics[center_index] = diagnostics
-        return results, all_diagnostics
+            yield evidence
+
+    def iter_run(
+        self,
+        sequence: SequenceData,
+        scale: float,
+    ) -> Iterator[MotionEvidence]:
+        _validate_poc_config(self._cfg)
+        scale = _validate_scale(scale, self._cfg)
+        samples = _ordered_samples(sequence)
+        reader = _ImageReader(sequence, scale)
+        if self._name == "frame_diff":
+            yield from self._iter_frame_diff(samples, reader, scale)
+        else:
+            yield from self._iter_windowed(samples, reader, scale)
 
     def run(
         self,
         sequence: SequenceData,
         scale: float,
     ) -> Mapping[int, MotionEvidence]:
-        _validate_poc_config(self._cfg)
-        scale = _validate_scale(scale, self._cfg)
-        samples = _ordered_samples(sequence)
-        reader = _ImageReader(sequence, scale)
-        if self._name == "frame_diff":
-            results, diagnostics = self._run_frame_diff(
-                samples,
-                reader,
-                scale,
-            )
-        else:
-            results, diagnostics = self._run_windowed(
-                samples,
-                reader,
-                scale,
-            )
-        self._diagnostics = MappingProxyType(diagnostics)
+        results = {
+            evidence.frame_index: evidence
+            for evidence in self.iter_run(sequence, scale)
+        }
         return MappingProxyType(results)
 
 
@@ -528,6 +528,17 @@ class _MOG2Method:
         sequence: SequenceData,
         scale: float,
     ) -> Mapping[int, MotionEvidence]:
+        results = {
+            evidence.frame_index: evidence
+            for evidence in self.iter_run(sequence, scale)
+        }
+        return MappingProxyType(results)
+
+    def iter_run(
+        self,
+        sequence: SequenceData,
+        scale: float,
+    ) -> Iterator[MotionEvidence]:
         _validate_poc_config(self._cfg)
         scale = _validate_scale(scale, self._cfg)
         samples = _ordered_samples(sequence)
@@ -540,8 +551,11 @@ class _MOG2Method:
         for sample in samples[:_MOG2_HISTORY]:
             subtractor.apply(reader.read(sample))
 
-        results = {}
-        diagnostics = {}
+        diagnostics: dict[
+            int,
+            tuple[AlignmentDiagnostic, ...],
+        ] = {}
+        self._diagnostics = MappingProxyType(diagnostics)
         for sample in samples:
             frame_index = int(sample.frame_index)
             foreground_mask = subtractor.apply(reader.read(sample))
@@ -549,7 +563,7 @@ class _MOG2Method:
                 np.not_equal(foreground_mask, 0).astype(np.float32)
                 * self._cfg.mad_clip
             )
-            results[frame_index] = _single_channel_evidence(
+            evidence = _single_channel_evidence(
                 frame_index,
                 "foreground",
                 z,
@@ -565,8 +579,7 @@ class _MOG2Method:
                     second_pass=None,
                 ),
             )
-        self._diagnostics = MappingProxyType(diagnostics)
-        return MappingProxyType(results)
+            yield evidence
 
 
 def create_method(

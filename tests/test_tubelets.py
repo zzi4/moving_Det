@@ -4,7 +4,11 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from moving_det.motion.masks import extract_components, threshold_and_clean
+from moving_det.motion.masks import (
+    clean_binary_mask,
+    extract_components,
+    threshold_and_clean,
+)
 from moving_det.motion.tubelets import (
     link_tubelets,
     proposals_for_frame,
@@ -39,6 +43,21 @@ def test_threshold_cleanup_fills_holes_and_removes_small_components(config):
     fused_z[10, 10] = 4.0
 
     mask = threshold_and_clean(fused_z, 4.0, config)
+
+    expected = np.zeros((12, 12), dtype=np.uint8)
+    expected[2:7, 2:7] = 1
+    np.testing.assert_array_equal(mask, expected)
+
+
+def test_binary_mask_cleanup_does_not_apply_a_second_numeric_threshold(config):
+    foreground = np.zeros((12, 12), dtype=np.uint8)
+    foreground[2, 2:7] = 1
+    foreground[6, 2:7] = 1
+    foreground[2:7, 2] = 1
+    foreground[2:7, 6] = 1
+    foreground[10, 10] = 1
+
+    mask = clean_binary_mask(foreground, config)
 
     expected = np.zeros((12, 12), dtype=np.uint8)
     expected[2:7, 2:7] = 1

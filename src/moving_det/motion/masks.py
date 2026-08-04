@@ -42,8 +42,17 @@ def threshold_and_clean(
     ):
         raise ValueError("threshold must be a finite real number")
     thresholded = np.greater_equal(fused_z, threshold).astype(np.uint8)
+    return clean_binary_mask(thresholded, cfg)
+
+
+def clean_binary_mask(
+    mask: np.ndarray,
+    cfg: ExperimentConfig,
+) -> np.ndarray:
+    _validate_real_2d_array(mask, "mask")
+    foreground = np.not_equal(mask, 0).astype(np.uint8)
     closed = cv2.morphologyEx(
-        thresholded,
+        foreground,
         cv2.MORPH_CLOSE,
         _CLOSE_KERNEL,
         iterations=1,
