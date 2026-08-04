@@ -9,7 +9,7 @@ from types import MappingProxyType
 import cv2
 import numpy as np
 
-from moving_det.evaluation.matching import match_frame
+from moving_det.evaluation.matching import _match_frame_thresholds, match_frame
 from moving_det.geometry.obb import (
     obb_to_points,
     polygon_overlap_ratio,
@@ -509,14 +509,16 @@ def evaluate_sequence(
         )
         mask = masks_by_frame.get(frame_index)
 
-        primary_matches = {
-            threshold: match_frame(primary_gt, proposals, threshold)
-            for threshold in thresholds
-        }
-        difficult_matches = {
-            threshold: match_frame(difficult_gt, proposals, threshold)
-            for threshold in thresholds
-        }
+        primary_matches = _match_frame_thresholds(
+            primary_gt,
+            proposals,
+            thresholds,
+        )
+        difficult_matches = _match_frame_thresholds(
+            difficult_gt,
+            proposals,
+            thresholds,
+        )
 
         base_matches = primary_matches[0.25]
         unmatched_proposal_indices = base_matches.unmatched_proposal_indices

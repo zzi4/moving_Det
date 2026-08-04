@@ -522,6 +522,48 @@ def _validate_run_inputs(
     return normalized_scale, tuple(normalized)
 
 
+def _validate_processing_sequence(
+    sequence: SequenceData,
+    processing_sequence: SequenceData | None,
+) -> SequenceData:
+    if processing_sequence is None:
+        return sequence
+    if not isinstance(processing_sequence, SequenceData):
+        raise TypeError("processing_sequence must be a SequenceData")
+    if (
+        processing_sequence.sequence_id != sequence.sequence_id
+        or processing_sequence.width != sequence.width
+        or processing_sequence.height != sequence.height
+        or processing_sequence.fps != sequence.fps
+    ):
+        raise ValueError(
+            "processing_sequence must describe the same source sequence"
+        )
+    processing_by_index = {
+        frame.frame_index: frame
+        for frame in processing_sequence.frames
+    }
+    if len(processing_by_index) != len(processing_sequence.frames):
+        raise ValueError("processing_sequence frame indices must be unique")
+    processing_indices = tuple(processing_by_index)
+    if any(
+        current != previous + 1
+        for previous, current in zip(
+            processing_indices,
+            processing_indices[1:],
+        )
+    ):
+        raise ValueError(
+            "processing_sequence frames must be consecutive and ordered"
+        )
+    for frame in sequence.frames:
+        if processing_by_index.get(frame.frame_index) != frame:
+            raise ValueError(
+                "processing_sequence must contain every output frame unchanged"
+            )
+    return processing_sequence
+
+
 def _preview(array: np.ndarray, interpolation: int) -> np.ndarray:
     height, width = array.shape
     ratio = min(
@@ -579,13 +621,18 @@ def _method_stream(
     method: object,
     sequence: SequenceData,
     scale: float,
+    center_indices: Sequence[int],
 ) -> Iterator[MotionEvidence]:
     iterator = getattr(method, "iter_run", None)
     if not callable(iterator):
         raise RuntimeError(
             "motion method does not provide bounded-memory iter_run()"
         )
-    yield from iterator(sequence, scale)
+    yield from iterator(
+        sequence,
+        scale,
+        center_indices=center_indices,
+    )
 
 
 def _new_state(
@@ -615,6 +662,7 @@ def _consume_stream(
     *,
     config: ExperimentConfig,
     sequence: SequenceData,
+    processing_sequence: SequenceData,
     scale: float,
     method_names: Sequence[str],
     thresholds_by_method: Mapping[str, tuple[float, ...]],
@@ -655,7 +703,12 @@ def _consume_stream(
                 var_threshold=threshold,
             )
             observed = []
-            for evidence in _method_stream(method, sequence, scale):
+            for evidence in _method_stream(
+                method,
+                processing_sequence,
+                scale,
+                expected_indices,
+            ):
                 observed.append(evidence.frame_index)
                 mask = clean_binary_mask(
                     np.not_equal(evidence.fused_z, 0).astype(np.uint8),
@@ -691,7 +744,12 @@ def _consume_stream(
         )
     method = create_method(evidence_method, config)
     observed = []
-    for evidence in _method_stream(method, sequence, scale):
+    for evidence in _method_stream(
+        method,
+        processing_sequence,
+        scale,
+        expected_indices,
+    ):
         observed.append(evidence.frame_index)
         score_path = score_dir / f"{evidence.frame_index:06d}.npy"
         _store_preview(score_path, _preview_score(evidence.fused_score))
@@ -1001,12 +1059,19 @@ def _compute_group(
     thresholds_by_method: Mapping[str, tuple[float, ...]],
     output_dirs: Mapping[str, Path],
     work_dir: Path,
+    processing_sequence: SequenceData | None = None,
 ) -> dict[str, _MethodRunResult]:
     _prepare_determinism(config)
     work_dir.mkdir(parents=True)
+    processing_sequence = (
+        sequence
+        if processing_sequence is None
+        else processing_sequence
+    )
     states = _consume_stream(
         config=config,
         sequence=sequence,
+        processing_sequence=processing_sequence,
         scale=scale,
         method_names=method_names,
         thresholds_by_method=thresholds_by_method,
@@ -1076,6 +1141,7 @@ def run_method(
     scale: float,
     thresholds: Sequence[float],
     output_dir: Path,
+    processing_sequence: SequenceData | None = None,
 ) -> RunArtifacts:
     scale, normalized_thresholds = _validate_run_inputs(
         config,
@@ -1083,6 +1149,10 @@ def run_method(
         method_name,
         scale,
         thresholds,
+    )
+    processing_sequence = _validate_processing_sequence(
+        sequence,
+        processing_sequence,
     )
     output_dir = Path(output_dir)
     work_root = _new_work_root(output_dir)
@@ -1098,6 +1168,7 @@ def run_method(
             },
             output_dirs={method_name: staged_output},
             work_dir=work_root / "cache",
+            processing_sequence=processing_sequence,
         )
         shutil.rmtree(work_root / "cache")
         os.replace(staged_output, output_dir)

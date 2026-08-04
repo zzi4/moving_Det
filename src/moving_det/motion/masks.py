@@ -85,12 +85,23 @@ def extract_components(
         connectivity=8,
     )
     score_array = np.asarray(score)
+    foreground_ys, foreground_xs = np.nonzero(labels)
+    foreground_labels = labels[foreground_ys, foreground_xs]
+    stable_order = np.argsort(foreground_labels, kind="stable")
+    ordered_labels = foreground_labels[stable_order]
+    ordered_ys = foreground_ys[stable_order]
+    ordered_xs = foreground_xs[stable_order]
+    label_counts = np.bincount(ordered_labels, minlength=count)
+    label_offsets = np.cumsum(label_counts, dtype=np.int64)
     components = []
     for label in range(1, count):
         area = int(stats[label, cv2.CC_STAT_AREA])
         if area < cfg.min_component_area:
             continue
-        ys, xs = np.nonzero(labels == label)
+        start = int(label_offsets[label - 1])
+        stop = int(label_offsets[label])
+        ys = ordered_ys[start:stop]
+        xs = ordered_xs[start:stop]
         points_xy = np.column_stack((xs, ys)).astype(np.float32)
         x = int(stats[label, cv2.CC_STAT_LEFT])
         y = int(stats[label, cv2.CC_STAT_TOP])

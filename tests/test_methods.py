@@ -143,6 +143,134 @@ def test_frame_diff_stream_yields_before_decoding_the_complete_sequence(
     assert len(decoded_paths) == 1
 
 
+def test_multiscale_selected_centers_use_context_only_as_support(
+    tmp_path,
+    config,
+    monkeypatch,
+):
+    sequence = _sequence(tmp_path, frame_indices=tuple(range(1, 41)))
+    reference_indices = []
+
+    def controlled_align(
+        reference_sample,
+        support_sample,
+        reference,
+        support,
+        cfg,
+        scale,
+    ):
+        del support_sample, reference, cfg, scale
+        reference_indices.append(reference_sample.frame_index)
+        return support, None
+
+    monkeypatch.setattr(
+        methods_module,
+        "_two_pass_align",
+        controlled_align,
+    )
+    selected = tuple(range(16, 26))
+
+    results = tuple(
+        create_method("multiscale", config).iter_run(
+            sequence,
+            scale=1.0,
+            center_indices=selected,
+        )
+    )
+
+    assert tuple(result.frame_index for result in results) == selected
+    assert results[0].support_indices == tuple(range(1, 32))
+    assert results[-1].support_indices == tuple(range(10, 41))
+    assert set(reference_indices) == set(selected)
+    assert len(reference_indices) == 300
+
+
+def test_mog2_selected_centers_match_same_frames_from_full_source_run(
+    synthetic_sequence,
+    config,
+):
+    selected = tuple(range(31, 36))
+    full_results = create_method(
+        "mog2",
+        config,
+        var_threshold=16,
+    ).run(synthetic_sequence, scale=1.0)
+
+    selected_results = tuple(
+        create_method(
+            "mog2",
+            config,
+            var_threshold=16,
+        ).iter_run(
+            synthetic_sequence,
+            scale=1.0,
+            center_indices=selected,
+        )
+    )
+
+    assert tuple(result.frame_index for result in selected_results) == selected
+    for result in selected_results:
+        expected = full_results[result.frame_index]
+        np.testing.assert_array_equal(result.fused_z, expected.fused_z)
+        np.testing.assert_array_equal(
+            result.fused_score,
+            expected.fused_score,
+        )
+
+
+@pytest.mark.parametrize(
+    ("center_indices", "exception", "message"),
+    (
+        ((2, 1), ValueError, "ordered"),
+        ((1, 1), ValueError, "unique"),
+        ((1, 3), ValueError, "consecutive"),
+        ((0,), ValueError, "exist"),
+        ((True,), TypeError, "integers"),
+    ),
+)
+def test_selected_centers_reject_invalid_index_contract_before_image_reads(
+    center_indices,
+    exception,
+    message,
+    tmp_path,
+    config,
+    monkeypatch,
+):
+    sequence = _sequence(tmp_path)
+
+    def unexpected_read(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("image loading must not happen")
+
+    monkeypatch.setattr(methods_module.cv2, "imread", unexpected_read)
+    stream = create_method("multiscale", config).iter_run(
+        sequence,
+        scale=1.0,
+        center_indices=center_indices,
+    )
+
+    with pytest.raises(exception, match=message):
+        tuple(stream)
+
+
+def test_selected_center_still_rejects_genuinely_missing_offset_support(
+    tmp_path,
+    config,
+):
+    sequence = _sequence(
+        tmp_path,
+        frame_indices=tuple(range(16, 26)),
+    )
+    stream = create_method("multiscale", config).iter_run(
+        sequence,
+        scale=1.0,
+        center_indices=(16,),
+    )
+
+    with pytest.raises(ValueError, match="offset 15"):
+        tuple(stream)
+
+
 def test_mog2_detects_moving_square_after_warmup(
     synthetic_sequence,
     config,

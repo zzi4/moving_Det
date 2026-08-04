@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import moving_det.evaluation.matching as matching_module
 from moving_det.evaluation import (
     CalibrationCandidate,
     CalibrationChoice,
@@ -17,6 +18,55 @@ from moving_det.evaluation import (
 )
 from moving_det.models import FrameSample, OBB, SequenceData
 from tests.helpers import ann, proposal
+
+
+def _brute_force_match_frame(gt, proposals, iou_threshold):
+    gt_count = len(gt)
+    proposal_count = len(proposals)
+    if gt_count == 0 or proposal_count == 0:
+        return matching_module.FrameMatches(
+            pairs=(),
+            unmatched_gt_indices=tuple(range(gt_count)),
+            unmatched_proposal_indices=tuple(range(proposal_count)),
+        )
+    ious = np.empty((gt_count, proposal_count), dtype=np.float64)
+    for gt_index, annotation in enumerate(gt):
+        for proposal_index, candidate in enumerate(proposals):
+            ious[gt_index, proposal_index] = matching_module.rotated_iou(
+                annotation.obb,
+                candidate.obb,
+            )
+    assigned_gt, assigned_proposals = matching_module.linear_sum_assignment(
+        1.0 - ious
+    )
+    pairs = tuple(
+        sorted(
+            (
+                int(gt_index),
+                int(proposal_index),
+                float(ious[gt_index, proposal_index]),
+            )
+            for gt_index, proposal_index in zip(
+                assigned_gt,
+                assigned_proposals,
+                strict=True,
+            )
+            if ious[gt_index, proposal_index] >= iou_threshold
+        )
+    )
+    matched_gt = {gt_index for gt_index, _, _ in pairs}
+    matched_proposals = {proposal_index for _, proposal_index, _ in pairs}
+    return matching_module.FrameMatches(
+        pairs=pairs,
+        unmatched_gt_indices=tuple(
+            index for index in range(gt_count) if index not in matched_gt
+        ),
+        unmatched_proposal_indices=tuple(
+            index
+            for index in range(proposal_count)
+            if index not in matched_proposals
+        ),
+    )
 
 
 def _sequence(
@@ -222,6 +272,171 @@ def test_matching_empty_inputs_have_deterministic_unmatched_indices(
     assert matches.pairs == ()
     assert matches.unmatched_gt_indices == expected_gt
     assert matches.unmatched_proposal_indices == expected_proposals
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_matching_threshold_batch_matches_brute_force_exactly(seed):
+    rng = np.random.default_rng(seed)
+    gt = tuple(
+        ann(
+            track=index + 1,
+            cx=float(rng.uniform(-200, 200)),
+            cy=float(rng.uniform(-200, 200)),
+            width=float(rng.uniform(8, 40)),
+            height=float(rng.uniform(2, 8)),
+            theta=float(rng.uniform(-math.pi / 2, math.pi / 2)),
+        )
+        for index in range(7)
+    )
+    proposals = tuple(
+        proposal(
+            cx=(
+                gt[index].obb.cx + float(rng.uniform(-5, 5))
+                if index < len(gt)
+                else float(rng.uniform(1000, 2000))
+            ),
+            cy=(
+                gt[index].obb.cy + float(rng.uniform(-5, 5))
+                if index < len(gt)
+                else float(rng.uniform(1000, 2000))
+            ),
+            width=float(rng.uniform(8, 40)),
+            height=float(rng.uniform(2, 8)),
+            theta=float(rng.uniform(-math.pi / 2, math.pi / 2)),
+            tubelet_id=index + 1,
+        )
+        for index in range(13)
+    )
+    thresholds = (0.0, 0.25, 0.5, 1.0)
+
+    actual = matching_module._match_frame_thresholds(
+        gt,
+        proposals,
+        thresholds,
+    )
+
+    assert actual == {
+        threshold: _brute_force_match_frame(
+            gt,
+            proposals,
+            threshold,
+        )
+        for threshold in thresholds
+    }
+
+
+def test_matching_threshold_batch_reuses_iou_matrix_and_assignment(monkeypatch):
+    gt = tuple(
+        ann(track=index + 1, cx=index * 1000, cy=0)
+        for index in range(12)
+    )
+    proposals = tuple(
+        proposal(cx=index * 1000, cy=0, tubelet_id=index + 1)
+        for index in range(12)
+    )
+    call_count = 0
+    original = matching_module.rotated_iou
+
+    def counting_rotated_iou(first, second):
+        nonlocal call_count
+        call_count += 1
+        return original(first, second)
+
+    monkeypatch.setattr(
+        matching_module,
+        "rotated_iou",
+        counting_rotated_iou,
+    )
+
+    matches = matching_module._match_frame_thresholds(
+        gt,
+        proposals,
+        (0.0, 0.25, 0.5, 1.0),
+    )
+
+    assert set(matches) == {0.0, 0.25, 0.5, 1.0}
+    assert call_count == len(gt)
+
+
+def test_matching_aabb_filter_keeps_touching_boundary_as_exact_candidate(
+    monkeypatch,
+):
+    gt = (ann(track=1, cx=0, cy=0, width=2, height=2),)
+    proposals = (proposal(cx=2, cy=0, width=2, height=2),)
+    call_count = 0
+    original = matching_module.rotated_iou
+
+    def counting_rotated_iou(first, second):
+        nonlocal call_count
+        call_count += 1
+        return original(first, second)
+
+    monkeypatch.setattr(
+        matching_module,
+        "rotated_iou",
+        counting_rotated_iou,
+    )
+
+    matches = match_frame(gt, proposals, iou_threshold=0.0)
+
+    assert matches.pairs == ((0, 0, 0.0),)
+    assert call_count == 1
+
+
+def test_matching_zero_overlap_ties_keep_brute_force_assignment():
+    gt = (
+        ann(track=1, cx=0, cy=0),
+        ann(track=2, cx=100, cy=0),
+    )
+    proposals = (
+        proposal(cx=1000, cy=0, tubelet_id=1),
+        proposal(cx=1100, cy=0, tubelet_id=2),
+    )
+
+    actual = matching_module._match_frame_thresholds(
+        gt,
+        proposals,
+        (0.0, 0.25),
+    )
+
+    assert actual == {
+        threshold: _brute_force_match_frame(
+            gt,
+            proposals,
+            threshold,
+        )
+        for threshold in (0.0, 0.25)
+    }
+
+
+def test_matching_aabb_filter_skips_sparse_cartesian_pairs(monkeypatch):
+    count = 80
+    gt = tuple(
+        ann(track=index + 1, cx=index * 1000, cy=0)
+        for index in range(count)
+    )
+    proposals = tuple(
+        proposal(cx=index * 1000, cy=0, tubelet_id=index + 1)
+        for index in range(count)
+    )
+    call_count = 0
+    original = matching_module.rotated_iou
+
+    def counting_rotated_iou(first, second):
+        nonlocal call_count
+        call_count += 1
+        return original(first, second)
+
+    monkeypatch.setattr(
+        matching_module,
+        "rotated_iou",
+        counting_rotated_iou,
+    )
+
+    matches = match_frame(gt, proposals, iou_threshold=0.25)
+
+    assert len(matches.pairs) == count
+    assert call_count == count
 
 
 def test_calibration_maximizes_recall_under_false_positive_constraint():
@@ -658,6 +873,60 @@ def test_difficult_match_is_diagnostic_and_not_a_false_proposal():
     assert report.aggregate["difficult_moving_gt_count"] == 1
     assert report.aggregate["diagnostic_difficult_recall_025"] == 1.0
     assert report.aggregate["false_proposal_count"] == 0
+
+
+def test_difficult_absorption_recomputes_unmatched_proposal_subset(monkeypatch):
+    sequence = _sequence(
+        {
+            16: (
+                ann(track=1, cx=0),
+                replace(ann(track=2, cx=1), difficult=True),
+            ),
+            21: (
+                ann(track=1, cx=5),
+                replace(ann(track=2, cx=6), difficult=True),
+            ),
+        }
+    )
+    proposals = (
+        proposal(cx=0, frame=16, tubelet_id=1),
+        proposal(cx=5, frame=16, tubelet_id=2),
+        *(
+            proposal(
+                cx=1000 + index * 100,
+                frame=16,
+                tubelet_id=index + 3,
+            )
+            for index in range(40)
+        ),
+    )
+    call_count = 0
+    original = matching_module.rotated_iou
+
+    def counting_rotated_iou(first, second):
+        nonlocal call_count
+        call_count += 1
+        return original(first, second)
+
+    monkeypatch.setattr(
+        matching_module,
+        "rotated_iou",
+        counting_rotated_iou,
+    )
+
+    report = evaluate_sequence(
+        sequence,
+        proposals_by_frame={16: proposals},
+        masks_by_frame={},
+        moving_threshold=3,
+        iou_thresholds=(0.0, 0.25, 0.5, 1.0),
+        scale=1.0,
+    )
+
+    assert report.aggregate["moving_gt_count"] == 1
+    assert report.aggregate["difficult_moving_gt_count"] == 1
+    assert report.aggregate["false_proposal_count"] == 40
+    assert call_count <= 5
 
 
 def test_per_track_metrics_report_delay_coverage_and_extra_fragments():

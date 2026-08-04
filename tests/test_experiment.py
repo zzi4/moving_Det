@@ -48,18 +48,28 @@ class _StreamingMethod:
         self.fail_after_first = fail_after_first
         self.foreground = foreground
         self.iteration_count = 0
+        self.center_indices_calls = []
 
     def run(self, sequence, scale):
         del sequence, scale
         raise AssertionError("experiment orchestration must not call run()")
 
-    def iter_run(self, sequence, scale):
+    def iter_run(self, sequence, scale, *, center_indices=None):
         self.iteration_count += 1
+        selected_indices = (
+            tuple(sample.frame_index for sample in sequence.frames)
+            if center_indices is None
+            else tuple(center_indices)
+        )
+        self.center_indices_calls.append(selected_indices)
+        selected_set = set(selected_indices)
         shape = (
             round(sequence.height * scale),
             round(sequence.width * scale),
         )
         for position, sample in enumerate(sequence.frames):
+            if sample.frame_index not in selected_set:
+                continue
             if self.fail_after_first and position == 1:
                 raise RuntimeError("controlled stream failure")
             z = np.zeros(shape, dtype=np.float32)
@@ -332,10 +342,11 @@ def test_empty_track_csv_keeps_fixed_header_and_preview_resize_values(
         height=1080,
         frames=tiny_sequence.frames[:1],
     )
+    method = _StreamingMethod(foreground=True)
     monkeypatch.setattr(
         experiment_module,
         "create_method",
-        lambda *args, **kwargs: _StreamingMethod(foreground=True),
+        lambda *args, **kwargs: method,
     )
 
     artifacts = run_method(
@@ -874,7 +885,7 @@ def test_cli_reports_reader_errors_without_repairing_or_skipping(
     assert "missing keys" in capsys.readouterr().err
 
 
-def test_cli_parser_only_dispatches_run_arguments(
+def test_cli_dispatches_requested_frames_with_window_context(
     tmp_path,
     tiny_config_path,
     monkeypatch,
@@ -919,14 +930,159 @@ def test_cli_parser_only_dispatches_run_arguments(
     assert tuple(
         frame.frame_index for frame in captured["sequence"].frames
     ) == tuple(range(16, 26))
+    assert tuple(
+        frame.frame_index for frame in captured["processing_sequence"].frames
+    ) == tuple(range(1, 41))
     assert set(captured) == {
         "config",
         "sequence",
+        "processing_sequence",
         "method_name",
         "scale",
         "thresholds",
         "output_dir",
     }
+
+
+def test_cli_mog2_subset_uses_full_source_for_background_state(
+    tmp_path,
+    tiny_config_path,
+    monkeypatch,
+):
+    captured = {}
+
+    def controlled_run(**kwargs):
+        captured.update(kwargs)
+        return type("Artifacts", (), {"root": Path(kwargs["output_dir"])})()
+
+    monkeypatch.setattr("moving_det.cli.run_method", controlled_run)
+
+    assert (
+        main(
+            [
+                "run",
+                "--config",
+                str(tiny_config_path),
+                "--sequence",
+                "calibration",
+                "--method",
+                "mog2",
+                "--scale",
+                "1.0",
+                "--threshold",
+                "16",
+                "--frame-start",
+                "31",
+                "--frame-end",
+                "35",
+                "--output",
+                str(tmp_path / "run"),
+            ]
+        )
+        == 0
+    )
+
+    assert tuple(
+        frame.frame_index for frame in captured["sequence"].frames
+    ) == tuple(range(31, 36))
+    assert tuple(
+        frame.frame_index for frame in captured["processing_sequence"].frames
+    ) == tuple(range(1, 41))
+
+
+def test_cli_mog2_context_stops_after_required_warmup_and_target_prefix(
+    tmp_path,
+    synthetic_sequence,
+    config,
+    monkeypatch,
+):
+    captured = {}
+
+    def controlled_run(**kwargs):
+        captured.update(kwargs)
+        return type("Artifacts", (), {"root": Path(kwargs["output_dir"])})()
+
+    monkeypatch.setattr("moving_det.cli.load_config", lambda path: config)
+    monkeypatch.setattr(
+        "moving_det.cli._selected_sequence",
+        lambda loaded_config, selection: synthetic_sequence,
+    )
+    monkeypatch.setattr("moving_det.cli.run_method", controlled_run)
+
+    assert (
+        main(
+            [
+                "run",
+                "--config",
+                str(tmp_path / "unused.yaml"),
+                "--sequence",
+                "calibration",
+                "--method",
+                "mog2",
+                "--scale",
+                "1.0",
+                "--threshold",
+                "16",
+                "--frame-start",
+                "31",
+                "--frame-end",
+                "35",
+                "--output",
+                str(tmp_path / "run"),
+            ]
+        )
+        == 0
+    )
+
+    assert tuple(
+        frame.frame_index for frame in captured["processing_sequence"].frames
+    ) == tuple(range(1, 61))
+
+
+def test_run_method_context_does_not_leak_into_output_artifacts(
+    tmp_path,
+    tiny_sequence,
+    config,
+    monkeypatch,
+):
+    target = replace(
+        tiny_sequence,
+        frames=tiny_sequence.frames[15:25],
+    )
+    method = _StreamingMethod(foreground=True)
+    monkeypatch.setattr(
+        experiment_module,
+        "create_method",
+        lambda *args, **kwargs: method,
+    )
+
+    artifacts = run_method(
+        config=config,
+        sequence=target,
+        method_name="multiscale_tubelet",
+        scale=1.0,
+        thresholds=(4.0,),
+        output_dir=tmp_path / "run",
+        processing_sequence=tiny_sequence,
+    )
+
+    expected = tuple(range(16, 26))
+    assert tuple(
+        int(path.stem)
+        for path in sorted(artifacts.frame_cache_dir.glob("*.npz"))
+    ) == expected
+    with artifacts.per_frame_path.open(encoding="utf-8", newline="") as stream:
+        per_frame = tuple(csv.DictReader(stream))
+    assert tuple(int(row["frame_index"]) for row in per_frame) == expected
+    proposal_frames = {
+        json.loads(line)["frame_index"]
+        for line in artifacts.proposals_path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    }
+    assert proposal_frames <= set(expected)
+    assert _strict_load(artifacts.run_metadata_path)["frame_range"] == [16, 25]
+    assert method.center_indices_calls == [expected]
 
 
 def test_report_cli_writes_named_measured_gate_table(tmp_path):

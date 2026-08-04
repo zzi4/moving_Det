@@ -15,6 +15,7 @@ from moving_det.experiment import (
     run_method,
     write_report,
 )
+from moving_det.visualization.overlays import visualize_run
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -60,6 +61,10 @@ def _parser() -> argparse.ArgumentParser:
     report_parser = commands.add_parser("report")
     report_parser.add_argument("--metrics", type=Path, required=True)
     report_parser.add_argument("--output", type=Path, required=True)
+
+    visualize_parser = commands.add_parser("visualize")
+    visualize_parser.add_argument("--run", type=Path, required=True)
+    visualize_parser.add_argument("--frames", required=True)
     return parser
 
 
@@ -118,19 +123,59 @@ def _frame_subset(sequence, frame_start: int | None, frame_end: int | None):
     return replace(sequence, frames=selected)
 
 
+def _processing_context(
+    sequence,
+    output_sequence,
+    window_radius: int,
+    method_name: str,
+    mog2_history: int,
+):
+    if output_sequence is sequence:
+        return sequence
+    output_indices = tuple(
+        frame.frame_index
+        for frame in output_sequence.frames
+    )
+    if method_name == "mog2":
+        warmup_frames = sequence.frames[:mog2_history]
+        context_start = sequence.frames[0].frame_index
+        context_end = max(
+            max(output_indices),
+            warmup_frames[-1].frame_index,
+        )
+    else:
+        context_start = min(output_indices) - window_radius
+        context_end = max(output_indices) + window_radius
+    context = tuple(
+        frame
+        for frame in sequence.frames
+        if context_start <= frame.frame_index <= context_end
+    )
+    return replace(sequence, frames=context)
+
+
 def _dispatch(arguments: argparse.Namespace) -> int:
     if arguments.command == "inspect-data":
         return _inspect(arguments.config)
     if arguments.command == "run":
         config = load_config(arguments.config)
+        source_sequence = _selected_sequence(config, arguments.sequence)
         sequence = _frame_subset(
-            _selected_sequence(config, arguments.sequence),
+            source_sequence,
             arguments.frame_start,
             arguments.frame_end,
+        )
+        processing_sequence = _processing_context(
+            source_sequence,
+            sequence,
+            config.window_radius,
+            arguments.method,
+            config.mog2_history,
         )
         artifacts = run_method(
             config=config,
             sequence=sequence,
+            processing_sequence=processing_sequence,
             method_name=arguments.method,
             scale=arguments.scale,
             thresholds=(arguments.threshold,),
@@ -148,6 +193,9 @@ def _dispatch(arguments: argparse.Namespace) -> int:
         return 0
     if arguments.command == "report":
         print(write_report(arguments.metrics, arguments.output))
+        return 0
+    if arguments.command == "visualize":
+        print(visualize_run(arguments.run, arguments.frames).resolve())
         return 0
     raise AssertionError(f"unhandled command {arguments.command!r}")
 

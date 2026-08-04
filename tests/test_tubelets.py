@@ -4,18 +4,160 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+import moving_det.motion.tubelets as tubelets_module
+import moving_det.motion.masks as masks_module
 from moving_det.motion.masks import (
     clean_binary_mask,
     extract_components,
     threshold_and_clean,
 )
 from moving_det.motion.tubelets import (
+    _components_link,
     link_tubelets,
     proposals_for_frame,
     proposals_from_components,
 )
-from moving_det.models import Tubelet
+from moving_det.models import Component, Tubelet
 from tests.helpers import component_at, tubelet_at
+
+
+def _brute_force_extract_components(
+    frame_index,
+    mask,
+    score,
+    config,
+):
+    foreground = np.not_equal(mask, 0).astype(np.uint8)
+    count, labels, stats, _ = masks_module.cv2.connectedComponentsWithStats(
+        foreground,
+        connectivity=8,
+    )
+    components = []
+    for label in range(1, count):
+        area = int(stats[label, masks_module.cv2.CC_STAT_AREA])
+        if area < config.min_component_area:
+            continue
+        ys, xs = np.nonzero(labels == label)
+        points_xy = np.column_stack((xs, ys)).astype(np.float32)
+        x = int(stats[label, masks_module.cv2.CC_STAT_LEFT])
+        y = int(stats[label, masks_module.cv2.CC_STAT_TOP])
+        width = int(stats[label, masks_module.cv2.CC_STAT_WIDTH])
+        height = int(stats[label, masks_module.cv2.CC_STAT_HEIGHT])
+        components.append(
+            Component(
+                component_id=len(components) + 1,
+                frame_index=frame_index,
+                points_xy=points_xy,
+                bbox_xyxy=(x, y, x + width, y + height),
+                area=area,
+                mean_score=float(
+                    np.mean(score[ys, xs], dtype=np.float64)
+                ),
+            )
+        )
+    return tuple(components)
+
+
+def _assert_components_exact(actual, expected):
+    assert len(actual) == len(expected)
+    for actual_component, expected_component in zip(
+        actual,
+        expected,
+        strict=True,
+    ):
+        assert actual_component.component_id == expected_component.component_id
+        assert actual_component.frame_index == expected_component.frame_index
+        np.testing.assert_array_equal(
+            actual_component.points_xy,
+            expected_component.points_xy,
+        )
+        assert actual_component.points_xy.dtype == np.float32
+        assert actual_component.bbox_xyxy == expected_component.bbox_xyxy
+        assert actual_component.area == expected_component.area
+        assert actual_component.mean_score == expected_component.mean_score
+
+
+def _brute_force_tubelet_signatures(
+    components_by_frame,
+    *,
+    radius,
+    min_frames,
+):
+    ordered_by_frame = {
+        frame_index: tuple(
+            sorted(components, key=tubelets_module._component_key)
+        )
+        for frame_index, components in sorted(components_by_frame.items())
+    }
+    nodes = [
+        component
+        for components in ordered_by_frame.values()
+        for component in components
+    ]
+    parents = list(range(len(nodes)))
+    node_indices = {id(component): index for index, component in enumerate(nodes)}
+
+    def find(index):
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
+
+    def union(first_index, second_index):
+        first_root = find(first_index)
+        second_root = find(second_index)
+        if first_root != second_root:
+            parents[second_root] = first_root
+
+    for frame_index, components in ordered_by_frame.items():
+        for first in components:
+            for second in ordered_by_frame.get(frame_index + 1, ()):
+                if _components_link(first, second, radius):
+                    union(
+                        node_indices[id(first)],
+                        node_indices[id(second)],
+                    )
+
+    groups = {}
+    for index, component in enumerate(nodes):
+        groups.setdefault(find(index), []).append(component)
+    surviving = [
+        tuple(sorted(components, key=tubelets_module._component_key))
+        for components in groups.values()
+        if len({component.frame_index for component in components})
+        >= min_frames
+    ]
+    surviving.sort(
+        key=lambda components: tuple(
+            tubelets_module._component_key(component)
+            for component in components
+        )
+    )
+    return tuple(
+        tuple(
+            (
+                component.frame_index,
+                component.component_id,
+                component.bbox_xyxy,
+            )
+            for component in components
+        )
+        for components in surviving
+    )
+
+
+def _tubelet_signatures(tubelets):
+    return tuple(
+        tuple(
+            (
+                component.frame_index,
+                component.component_id,
+                component.bbox_xyxy,
+            )
+            for component in tubelet.components
+        )
+        for tubelet in tubelets
+    )
 
 
 def test_threshold_is_inclusive_and_returns_binary_uint8_without_mutation(config):
@@ -155,6 +297,96 @@ def test_extract_components_uses_eight_connectivity_and_mean_score(config):
     np.testing.assert_array_equal(score, score_before)
 
 
+@pytest.mark.parametrize("seed", range(5))
+def test_extract_components_matches_brute_force_exactly(seed, config):
+    rng = np.random.default_rng(seed)
+    mask = np.less(rng.random((67, 91)), 0.08).astype(np.uint8)
+    mask[10:15, 20:27] = 3
+    mask[40:46, 60:69] = 1
+    score = rng.normal(size=mask.shape).astype(np.float32)
+    extraction_config = replace(config, min_component_area=3)
+
+    expected = _brute_force_extract_components(
+        frame_index=17,
+        mask=mask,
+        score=score,
+        config=extraction_config,
+    )
+    actual = extract_components(
+        frame_index=17,
+        mask=mask,
+        score=score,
+        cfg=extraction_config,
+    )
+
+    _assert_components_exact(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "score_dtype",
+    (np.uint64, np.int64, np.float16, np.float32, np.float64),
+)
+def test_extract_components_preserves_mean_semantics_for_score_dtypes(
+    score_dtype,
+    config,
+):
+    mask = np.zeros((9, 11), dtype=np.uint8)
+    mask[1:4, 2:6] = 1
+    mask[6:8, 8:10] = 1
+    values = np.arange(mask.size, dtype=np.uint64).reshape(mask.shape)
+    score = values.astype(score_dtype)
+    extraction_config = replace(config, min_component_area=1)
+
+    expected = _brute_force_extract_components(
+        4,
+        mask,
+        score,
+        extraction_config,
+    )
+    actual = extract_components(
+        4,
+        mask,
+        score,
+        extraction_config,
+    )
+
+    _assert_components_exact(actual, expected)
+
+
+def test_extract_components_enumerates_foreground_pixels_once(
+    monkeypatch,
+    config,
+):
+    height, width = 1024, 2048
+    mask = np.zeros((height, width), dtype=np.uint8)
+    ys, xs = np.meshgrid(
+        np.arange(8, height, 64),
+        np.arange(8, width, 64),
+        indexing="ij",
+    )
+    mask[ys, xs] = 1
+    score = np.ones(mask.shape, dtype=np.float32)
+    nonzero_call_count = 0
+    original = masks_module.np.nonzero
+
+    def counting_nonzero(value):
+        nonlocal nonzero_call_count
+        nonzero_call_count += 1
+        return original(value)
+
+    monkeypatch.setattr(masks_module.np, "nonzero", counting_nonzero)
+
+    components = extract_components(
+        3,
+        mask,
+        score,
+        replace(config, min_component_area=1),
+    )
+
+    assert len(components) == ys.size
+    assert nonzero_call_count == 1
+
+
 @pytest.mark.parametrize(
     ("mask", "score"),
     (
@@ -266,6 +498,98 @@ def test_large_component_half_diagonal_can_link_components(config):
     }
 
     assert len(link_tubelets(components, config)) == 1
+
+
+def test_large_second_component_half_diagonal_can_link_components(config):
+    components = {
+        1: (component_at(frame=1, x=49, y=50, width=2, height=2),),
+        2: (component_at(frame=2, x=0, y=0, width=100, height=2),),
+    }
+
+    assert len(link_tubelets(components, config)) == 1
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_spatial_candidates_match_brute_force_graph_exactly(seed, config):
+    rng = np.random.default_rng(seed)
+    components = {}
+    for frame_index in range(1, 5):
+        frame_components = []
+        for component_id in range(1, 31):
+            width = int(rng.integers(1, 90))
+            height = int(rng.integers(1, 90))
+            frame_components.append(
+                component_at(
+                    frame=frame_index,
+                    x=int(rng.integers(-200, 800)),
+                    y=int(rng.integers(-200, 800)),
+                    width=width,
+                    height=height,
+                    component_id=component_id,
+                )
+            )
+        rng.shuffle(frame_components)
+        components[frame_index] = tuple(frame_components)
+    optimized_config = replace(
+        config,
+        tubelet_link_radius=17,
+        tubelet_min_frames=1,
+    )
+
+    expected = _brute_force_tubelet_signatures(
+        components,
+        radius=optimized_config.tubelet_link_radius,
+        min_frames=optimized_config.tubelet_min_frames,
+    )
+    actual = _tubelet_signatures(
+        link_tubelets(components, optimized_config)
+    )
+
+    assert actual == expected
+
+
+def test_sparse_frames_do_not_run_all_component_pairs(monkeypatch, config):
+    component_count = 600
+    components = {
+        1: tuple(
+            component_at(
+                frame=1,
+                x=index * 1000,
+                y=0,
+                width=1,
+                height=1,
+                component_id=index + 1,
+            )
+            for index in range(component_count)
+        ),
+        2: tuple(
+            component_at(
+                frame=2,
+                x=index * 1000 + 500,
+                y=500,
+                width=1,
+                height=1,
+                component_id=index + 1,
+            )
+            for index in range(component_count)
+        ),
+    }
+    exact_call_count = 0
+    original = tubelets_module._components_link
+
+    def counting_components_link(first, second, radius):
+        nonlocal exact_call_count
+        exact_call_count += 1
+        return original(first, second, radius)
+
+    monkeypatch.setattr(
+        tubelets_module,
+        "_components_link",
+        counting_components_link,
+    )
+
+    assert link_tubelets(components, config) == ()
+    assert exact_call_count < component_count * 2
 
 
 def test_all_qualifying_temporal_graph_edges_form_one_component(config):

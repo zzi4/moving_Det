@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral, Real
 from types import MappingProxyType
@@ -157,6 +157,42 @@ def _ordered_samples(sequence: SequenceData) -> tuple[FrameSample, ...]:
     ):
         raise ValueError("frame indices must be consecutive integers")
     return ordered
+
+
+def _center_samples(
+    samples: tuple[FrameSample, ...],
+    center_indices: Sequence[int] | None,
+) -> tuple[FrameSample, ...]:
+    if center_indices is None:
+        return samples
+    try:
+        requested = tuple(center_indices)
+    except TypeError as exc:
+        raise TypeError("center indices must be an integer sequence") from exc
+    if not requested:
+        raise ValueError("at least one center index is required")
+    if any(
+        isinstance(index, bool) or not isinstance(index, Integral)
+        for index in requested
+    ):
+        raise TypeError("center indices must be integers")
+    normalized = tuple(int(index) for index in requested)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("center indices must be unique")
+    if normalized != tuple(sorted(normalized)):
+        raise ValueError("center indices must be ordered")
+    if any(
+        current != previous + 1
+        for previous, current in zip(normalized, normalized[1:])
+    ):
+        raise ValueError("center indices must be consecutive")
+    by_index = {
+        int(sample.frame_index): sample
+        for sample in samples
+    }
+    if any(index not in by_index for index in normalized):
+        raise ValueError("center indices must exist in the processing sequence")
+    return tuple(by_index[index] for index in normalized)
 
 
 class _ImageReader:
@@ -377,6 +413,7 @@ class _AlignedMethod:
     def _iter_frame_diff(
         self,
         samples: tuple[FrameSample, ...],
+        center_samples: tuple[FrameSample, ...],
         reader: _ImageReader,
         scale: float,
     ) -> Iterator[MotionEvidence]:
@@ -386,7 +423,7 @@ class _AlignedMethod:
             tuple[AlignmentDiagnostic, ...],
         ] = {}
         self._diagnostics = MappingProxyType(all_diagnostics)
-        for center_sample in samples:
+        for center_sample in center_samples:
             center_index = int(center_sample.frame_index)
             previous_sample = by_index.get(center_index - 1)
             center = reader.read(center_sample)
@@ -424,6 +461,7 @@ class _AlignedMethod:
     def _iter_windowed(
         self,
         samples: tuple[FrameSample, ...],
+        center_samples: tuple[FrameSample, ...],
         reader: _ImageReader,
         scale: float,
     ) -> Iterator[MotionEvidence]:
@@ -432,7 +470,7 @@ class _AlignedMethod:
             tuple[AlignmentDiagnostic, ...],
         ] = {}
         self._diagnostics = MappingProxyType(all_diagnostics)
-        for center_sample in samples:
+        for center_sample in center_samples:
             center_index = int(center_sample.frame_index)
             support_samples = tuple(
                 sample
@@ -478,15 +516,28 @@ class _AlignedMethod:
         self,
         sequence: SequenceData,
         scale: float,
+        *,
+        center_indices: Sequence[int] | None = None,
     ) -> Iterator[MotionEvidence]:
         _validate_poc_config(self._cfg)
         scale = _validate_scale(scale, self._cfg)
         samples = _ordered_samples(sequence)
+        centers = _center_samples(samples, center_indices)
         reader = _ImageReader(sequence, scale)
         if self._name == "frame_diff":
-            yield from self._iter_frame_diff(samples, reader, scale)
+            yield from self._iter_frame_diff(
+                samples,
+                centers,
+                reader,
+                scale,
+            )
         else:
-            yield from self._iter_windowed(samples, reader, scale)
+            yield from self._iter_windowed(
+                samples,
+                centers,
+                reader,
+                scale,
+            )
 
     def run(
         self,
@@ -538,10 +589,18 @@ class _MOG2Method:
         self,
         sequence: SequenceData,
         scale: float,
+        *,
+        center_indices: Sequence[int] | None = None,
     ) -> Iterator[MotionEvidence]:
         _validate_poc_config(self._cfg)
         scale = _validate_scale(scale, self._cfg)
         samples = _ordered_samples(sequence)
+        centers = _center_samples(samples, center_indices)
+        selected_indices = {
+            int(sample.frame_index)
+            for sample in centers
+        }
+        final_selected_index = max(selected_indices)
         reader = _ImageReader(sequence, scale)
         subtractor = cv2.createBackgroundSubtractorMOG2(
             history=_MOG2_HISTORY,
@@ -558,7 +617,11 @@ class _MOG2Method:
         self._diagnostics = MappingProxyType(diagnostics)
         for sample in samples:
             frame_index = int(sample.frame_index)
+            if frame_index > final_selected_index:
+                break
             foreground_mask = subtractor.apply(reader.read(sample))
+            if frame_index not in selected_indices:
+                continue
             z = (
                 np.not_equal(foreground_mask, 0).astype(np.float32)
                 * self._cfg.mad_clip
