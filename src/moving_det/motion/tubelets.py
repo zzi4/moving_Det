@@ -191,6 +191,8 @@ def proposals_from_components(
         or frame_index < 0
     ):
         raise ValueError("frame_index must be a nonnegative integer")
+    normalized_frame_index = int(frame_index)
+    normalized_components = []
     for component in components:
         if (
             isinstance(component.component_id, bool)
@@ -200,18 +202,26 @@ def proposals_from_components(
             raise ValueError(
                 "component_id must be an integer in [0, 100000)"
             )
+        normalized_components.append(
+            (component, int(component.component_id))
+        )
 
     proposals = []
-    for component in sorted(components, key=_component_key):
+    for component, component_id in sorted(
+        normalized_components,
+        key=lambda item: _component_key(item[0]),
+    ):
         obb = _component_obb(component, cfg.obb_padding_factor)
         if _is_ignored(obb, ignore_polygons):
             continue
         proposals.append(
             Proposal(
-                frame_index=frame_index,
+                frame_index=normalized_frame_index,
                 obb=obb,
                 motion_score=component.mean_score,
-                tubelet_id=-(frame_index * 100000 + component.component_id),
+                tubelet_id=-(
+                    normalized_frame_index * 100000 + component_id
+                ),
             )
         )
     return tuple(proposals)

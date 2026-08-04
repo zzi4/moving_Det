@@ -447,6 +447,90 @@ def test_per_frame_proposal_id_boundary_is_unique_across_frames(config):
     assert last_in_frame.tubelet_id != first_in_next_frame.tubelet_id
 
 
+def test_per_frame_proposals_normalizes_uint64_frames_before_encoding(config):
+    ordinary_frame = np.uint64(1)
+    huge_frame = np.uint64(1 + 2**59)
+    ordinary = proposals_from_components(
+        ordinary_frame,
+        (
+            component_at(
+                frame=ordinary_frame,
+                x=20,
+                y=20,
+                component_id=np.uint64(1),
+            ),
+        ),
+        (),
+        config,
+    )[0]
+    huge = proposals_from_components(
+        huge_frame,
+        (
+            component_at(
+                frame=huge_frame,
+                x=20,
+                y=20,
+                component_id=np.uint64(1),
+            ),
+        ),
+        (),
+        config,
+    )[0]
+
+    assert ordinary.frame_index == 1
+    assert type(ordinary.frame_index) is int
+    assert ordinary.tubelet_id == -100001
+    assert type(ordinary.tubelet_id) is int
+    assert huge.frame_index == 576460752303423489
+    assert type(huge.frame_index) is int
+    assert huge.tubelet_id == -57646075230342348900001
+    assert type(huge.tubelet_id) is int
+    assert ordinary.tubelet_id != huge.tubelet_id
+
+
+def test_per_frame_proposals_normalizes_uint64_component_boundary(config):
+    accepted = component_at(
+        frame=1,
+        x=20,
+        y=20,
+        component_id=np.uint64(99999),
+    )
+    rejected = replace(accepted, component_id=np.uint64(100000))
+
+    proposal = proposals_from_components(1, (accepted,), (), config)[0]
+
+    assert proposal.tubelet_id == -199999
+    assert type(proposal.tubelet_id) is int
+    with pytest.raises(ValueError):
+        proposals_from_components(1, (rejected,), (), config)
+
+
+@pytest.mark.parametrize(
+    ("frame_index", "component_id"),
+    ((True, 1), (1, True)),
+    ids=("bool-frame", "bool-component"),
+)
+def test_per_frame_proposals_rejects_boolean_ids(
+    frame_index,
+    component_id,
+    config,
+):
+    component = component_at(
+        frame=frame_index,
+        x=20,
+        y=20,
+        component_id=component_id,
+    )
+
+    with pytest.raises(ValueError):
+        proposals_from_components(
+            frame_index,
+            (component,),
+            (),
+            config,
+        )
+
+
 def test_tubelet_proposals_only_include_requested_frame(config):
     tubelet = Tubelet(
         tubelet_id=9,
