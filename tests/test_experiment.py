@@ -85,6 +85,37 @@ def _strict_load(path: Path):
     )
 
 
+def _expected_calibration_fingerprint(config):
+    return {
+        "random_seed": config.random_seed,
+        "fps": config.fps,
+        "window_radius": config.window_radius,
+        "offsets": list(config.offsets),
+        "scale_factors": list(config.scale_factors),
+        "mad_floor": config.mad_floor,
+        "mad_clip": config.mad_clip,
+        "threshold_candidates": list(config.threshold_candidates),
+        "mog2_history": config.mog2_history,
+        "mog2_var_threshold_candidates": list(
+            config.mog2_var_threshold_candidates
+        ),
+        "ecc_min_correlation": config.ecc_min_correlation,
+        "ecc_max_translation": config.ecc_max_translation,
+        "ecc_max_rotation_degrees": config.ecc_max_rotation_degrees,
+        "close_kernel": config.close_kernel,
+        "min_component_area": config.min_component_area,
+        "tubelet_link_radius": config.tubelet_link_radius,
+        "tubelet_min_frames": config.tubelet_min_frames,
+        "obb_padding_factor": config.obb_padding_factor,
+        "moving_displacement_frames": config.moving_displacement_frames,
+        "moving_thresholds": list(config.moving_thresholds),
+        "primary_iou_thresholds": list(config.primary_iou_thresholds),
+        "max_false_proposals_per_100_gt": (
+            config.max_false_proposals_per_100_gt
+        ),
+    }
+
+
 def _valid_calibration_payload(config):
     methods = {}
     for method_name in (
@@ -128,8 +159,7 @@ def _valid_calibration_payload(config):
                 config.data_root / config.calibration_sequence
             ).resolve()
         ),
-        "random_seed": config.random_seed,
-        "scale_factors": list(config.scale_factors),
+        "config_fingerprint": _expected_calibration_fingerprint(config),
         "methods": methods,
     }
 
@@ -331,6 +361,24 @@ def test_empty_track_csv_keeps_fixed_header_and_preview_resize_values(
         assert preview["preview_mask"][1, 1] == 1
 
 
+def test_preview_resize_uses_area_for_scores_and_nearest_for_masks():
+    score = np.zeros((1080, 1920), dtype=np.float32)
+    score[:2, :2] = np.array(
+        [[0.0, 0.25], [0.5, 1.0]],
+        dtype=np.float32,
+    )
+    mask = np.zeros((1080, 1920), dtype=np.uint8)
+    mask[:2, :2] = np.array([[0, 1], [1, 1]], dtype=np.uint8)
+
+    preview_score = experiment_module._preview_score(score)
+    preview_mask = experiment_module._preview_mask(mask)
+
+    assert preview_score.shape == (540, 960)
+    assert preview_mask.shape == (540, 960)
+    assert preview_score[0, 0] == 112
+    assert preview_mask[0, 0] == 0
+
+
 def test_csv_writer_rejects_row_schema_drift_before_writing(tmp_path):
     path = tmp_path / "rows.csv"
 
@@ -497,6 +545,9 @@ def test_calibration_covers_all_methods_scales_and_candidates_with_shared_eviden
 
     payload = _strict_load(calibration_path)
     assert payload["sequence_id"] == config.calibration_sequence
+    assert payload["config_fingerprint"] == _expected_calibration_fingerprint(
+        config
+    )
     assert set(payload["methods"]) == {
         "frame_diff",
         "mog2",
@@ -615,6 +666,136 @@ def test_frozen_calibration_accepts_only_complete_exact_schema(
     assert selections["mog2"]["0.7"] == 9.0
 
 
+def test_frozen_calibration_rejects_legacy_incomplete_config_binding(
+    tmp_path,
+    config,
+):
+    payload = _valid_calibration_payload(config)
+    del payload["config_fingerprint"]
+    payload["random_seed"] = config.random_seed
+    payload["scale_factors"] = list(config.scale_factors)
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="calibration"):
+        experiment_module._frozen_selections(config, path)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    (
+        ("random_seed", 1),
+        ("fps", 31),
+        ("window_radius", 16),
+        ("offsets", (1, 3, 7, 14)),
+        ("scale_factors", (1.0, 0.6)),
+        ("mad_floor", 2.5),
+        ("mad_clip", 5.5),
+        ("threshold_candidates", (3.0, 4.0, 5.0, 5.5)),
+        ("mog2_history", 61),
+        ("mog2_var_threshold_candidates", (9.0, 16.0, 26.0)),
+        ("ecc_min_correlation", 0.81),
+        ("ecc_max_translation", 21.0),
+        ("ecc_max_rotation_degrees", 2.5),
+        ("close_kernel", 5),
+        ("min_component_area", 5),
+        ("tubelet_link_radius", 21),
+        ("tubelet_min_frames", 3),
+        ("obb_padding_factor", 1.5),
+        ("moving_displacement_frames", 6),
+        ("moving_thresholds", (2.0, 3.0, 6.0)),
+        ("primary_iou_thresholds", (0.25, 0.6)),
+        ("max_false_proposals_per_100_gt", 26.0),
+    ),
+)
+def test_frozen_calibration_rejects_any_fingerprinted_config_change(
+    tmp_path,
+    config,
+    field_name,
+    changed_value,
+):
+    path = tmp_path / "calibration.json"
+    path.write_text(
+        json.dumps(_valid_calibration_payload(config), allow_nan=False),
+        encoding="utf-8",
+    )
+    experiment_module._frozen_selections(config, path)
+
+    changed_config = replace(config, **{field_name: changed_value})
+    with pytest.raises(ValueError):
+        experiment_module._frozen_selections(changed_config, path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "field_name"),
+    (
+        ("missing", "window_radius"),
+        ("unknown", "unexpected"),
+        ("integer_as_float", "fps"),
+        ("float_as_integer", "mad_floor"),
+        ("integer_list_as_float", "offsets"),
+        ("float_list_as_integer", "scale_factors"),
+    ),
+)
+def test_frozen_config_fingerprint_requires_exact_fields_and_native_types(
+    tmp_path,
+    config,
+    mutation,
+    field_name,
+):
+    payload = _valid_calibration_payload(config)
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+    experiment_module._frozen_selections(config, path)
+
+    fingerprint = payload["config_fingerprint"]
+    if mutation == "missing":
+        del fingerprint[field_name]
+    elif mutation == "unknown":
+        fingerprint[field_name] = True
+    elif mutation == "integer_as_float":
+        fingerprint[field_name] = float(fingerprint[field_name])
+    elif mutation == "float_as_integer":
+        fingerprint[field_name] = int(fingerprint[field_name])
+    elif mutation == "integer_list_as_float":
+        fingerprint[field_name][0] = float(fingerprint[field_name][0])
+    elif mutation == "float_list_as_integer":
+        fingerprint[field_name][0] = int(fingerprint[field_name][0])
+    else:
+        raise AssertionError(mutation)
+    path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="calibration"):
+        experiment_module._frozen_selections(config, path)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "changed_value"),
+    (
+        ("evaluation_sequence", "different-evaluation-sequence"),
+        ("output_root", Path("/tmp/different-output-root")),
+    ),
+)
+def test_frozen_fingerprint_excludes_evaluation_and_output_routing(
+    tmp_path,
+    config,
+    field_name,
+    changed_value,
+):
+    path = tmp_path / "calibration.json"
+    path.write_text(
+        json.dumps(_valid_calibration_payload(config), allow_nan=False),
+        encoding="utf-8",
+    )
+
+    selections = experiment_module._frozen_selections(
+        replace(config, **{field_name: changed_value}),
+        path,
+    )
+
+    assert selections["frame_diff"]["1.0"] == 3.0
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -622,8 +803,6 @@ def test_frozen_calibration_accepts_only_complete_exact_schema(
         "unknown_top",
         "missing_input_path",
         "input_path_mismatch",
-        "random_seed_mismatch",
-        "scale_factors_mismatch",
         "missing_candidates",
         "unknown_entry_field",
         "candidate_parameter_string",
@@ -652,10 +831,6 @@ def test_frozen_calibration_rejects_schema_tampering(
         del payload["input_path"]
     elif mutation == "input_path_mismatch":
         payload["input_path"] = "/tmp/not-the-calibration-sequence"
-    elif mutation == "random_seed_mismatch":
-        payload["random_seed"] = config.random_seed + 1
-    elif mutation == "scale_factors_mismatch":
-        payload["scale_factors"] = [1.0]
     elif mutation == "missing_candidates":
         del entry["candidates"]
     elif mutation == "unknown_entry_field":

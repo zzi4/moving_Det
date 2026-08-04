@@ -58,6 +58,30 @@ _DEFAULT_MOVING_THRESHOLD = 3.0
 _PREVIEW_MAX_WIDTH = 960
 _PREVIEW_MAX_HEIGHT = 540
 _SCHEMA_VERSION = 1
+_CALIBRATION_CONFIG_SCHEMA = (
+    ("random_seed", int, False),
+    ("fps", int, False),
+    ("window_radius", int, False),
+    ("offsets", int, True),
+    ("scale_factors", float, True),
+    ("mad_floor", float, False),
+    ("mad_clip", float, False),
+    ("threshold_candidates", float, True),
+    ("mog2_history", int, False),
+    ("mog2_var_threshold_candidates", float, True),
+    ("ecc_min_correlation", float, False),
+    ("ecc_max_translation", float, False),
+    ("ecc_max_rotation_degrees", float, False),
+    ("close_kernel", int, False),
+    ("min_component_area", int, False),
+    ("tubelet_link_radius", int, False),
+    ("tubelet_min_frames", int, False),
+    ("obb_padding_factor", float, False),
+    ("moving_displacement_frames", int, False),
+    ("moving_thresholds", float, True),
+    ("primary_iou_thresholds", float, True),
+    ("max_false_proposals_per_100_gt", float, False),
+)
 _GATE_LABELS = {
     "tubelet_recall_improvement": (
         "Recall@rIoU 0.25 improvement over best single baseline"
@@ -1117,6 +1141,36 @@ def _calibration_entry(
     }
 
 
+def _calibration_config_fingerprint(
+    config: ExperimentConfig,
+) -> dict[str, object]:
+    fingerprint: dict[str, object] = {}
+    for field_name, item_type, repeated in _CALIBRATION_CONFIG_SCHEMA:
+        value = getattr(config, field_name)
+        if repeated:
+            if type(value) is not tuple or any(
+                type(item) is not item_type
+                or (item_type is float and not math.isfinite(item))
+                for item in value
+            ):
+                raise ValueError(
+                    f"configuration fingerprint field {field_name} "
+                    "must use its native tuple type"
+                )
+            fingerprint[field_name] = list(value)
+        else:
+            if (
+                type(value) is not item_type
+                or (item_type is float and not math.isfinite(value))
+            ):
+                raise ValueError(
+                    f"configuration fingerprint field {field_name} "
+                    "must use its native scalar type"
+                )
+            fingerprint[field_name] = value
+    return fingerprint
+
+
 def calibrate(
     config: ExperimentConfig,
     output_dir: Path,
@@ -1193,8 +1247,7 @@ def calibrate(
                 "schema_version": _SCHEMA_VERSION,
                 "sequence_id": sequence.sequence_id,
                 "input_path": sequence_path.resolve(),
-                "random_seed": config.random_seed,
-                "scale_factors": config.scale_factors,
+                "config_fingerprint": _calibration_config_fingerprint(config),
                 "methods": {
                     method_name: {
                         scale_key: _calibration_entry(result)
@@ -1313,6 +1366,46 @@ def _same_json_record(
     )
 
 
+def _validate_frozen_config_fingerprint(
+    value: object,
+    config: ExperimentConfig,
+) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("calibration config_fingerprint must be an object")
+    expected = _calibration_config_fingerprint(config)
+    _require_exact_keys(
+        value,
+        set(expected),
+        "calibration config_fingerprint",
+    )
+    for field_name, expected_value in expected.items():
+        actual_value = value[field_name]
+        if type(actual_value) is not type(expected_value):
+            raise ValueError(
+                "calibration config_fingerprint native type does not match "
+                f"configuration for {field_name}"
+            )
+        if isinstance(expected_value, list):
+            if len(actual_value) != len(expected_value) or any(
+                type(actual_item) is not type(expected_item)
+                or actual_item != expected_item
+                for actual_item, expected_item in zip(
+                    actual_value,
+                    expected_value,
+                    strict=True,
+                )
+            ):
+                raise ValueError(
+                    "calibration config_fingerprint does not match "
+                    f"configuration for {field_name}"
+                )
+        elif actual_value != expected_value:
+            raise ValueError(
+                "calibration config_fingerprint does not match "
+                f"configuration for {field_name}"
+            )
+
+
 def _frozen_selections(
     config: ExperimentConfig,
     calibration_path: Path,
@@ -1327,8 +1420,7 @@ def _frozen_selections(
             "schema_version",
             "sequence_id",
             "input_path",
-            "random_seed",
-            "scale_factors",
+            "config_fingerprint",
             "methods",
         },
         "calibration top level",
@@ -1347,26 +1439,10 @@ def _frozen_selections(
     )
     if payload["input_path"] != expected_input_path:
         raise ValueError("calibration input_path does not match configuration")
-    random_seed = payload["random_seed"]
-    if (
-        isinstance(random_seed, bool)
-        or not isinstance(random_seed, int)
-        or random_seed != config.random_seed
-    ):
-        raise ValueError("calibration random_seed does not match configuration")
-    scale_factors = payload["scale_factors"]
-    if (
-        not isinstance(scale_factors, list)
-        or any(
-            isinstance(scale, bool)
-            or not isinstance(scale, (int, float))
-            or not math.isfinite(float(scale))
-            for scale in scale_factors
-        )
-        or tuple(float(scale) for scale in scale_factors)
-        != tuple(float(scale) for scale in config.scale_factors)
-    ):
-        raise ValueError("calibration scale_factors do not match configuration")
+    _validate_frozen_config_fingerprint(
+        payload["config_fingerprint"],
+        config,
+    )
     methods = payload.get("methods")
     if not isinstance(methods, dict) or set(methods) != set(_METHOD_NAMES):
         raise ValueError("calibration must contain every configured method")
