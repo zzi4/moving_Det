@@ -58,15 +58,16 @@ def clean_binary_mask(
         iterations=1,
     )
     filled = binary_fill_holes(closed).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(
         filled,
         connectivity=8,
     )
-    cleaned = np.zeros(filled.shape, dtype=np.uint8)
-    for label in range(1, count):
-        if int(stats[label, cv2.CC_STAT_AREA]) >= cfg.min_component_area:
-            cleaned[labels == label] = 1
-    return cleaned
+    keep = np.greater_equal(
+        stats[:, cv2.CC_STAT_AREA],
+        cfg.min_component_area,
+    )
+    keep[0] = False
+    return keep[labels].astype(np.uint8)
 
 
 def extract_components(

@@ -58,6 +58,27 @@ def _brute_force_extract_components(
     return tuple(components)
 
 
+def _brute_force_clean_binary_mask(mask, config):
+    foreground = np.not_equal(mask, 0).astype(np.uint8)
+    closed = masks_module.cv2.morphologyEx(
+        foreground,
+        masks_module.cv2.MORPH_CLOSE,
+        masks_module._CLOSE_KERNEL,
+        iterations=1,
+    )
+    filled = masks_module.binary_fill_holes(closed).astype(np.uint8)
+    count, labels, stats, _ = masks_module.cv2.connectedComponentsWithStats(
+        filled,
+        connectivity=8,
+    )
+    cleaned = np.zeros(filled.shape, dtype=np.uint8)
+    for label in range(1, count):
+        area = int(stats[label, masks_module.cv2.CC_STAT_AREA])
+        if area >= config.min_component_area:
+            cleaned[labels == label] = 1
+    return cleaned
+
+
 def _assert_components_exact(actual, expected):
     assert len(actual) == len(expected)
     for actual_component, expected_component in zip(
@@ -229,6 +250,69 @@ def test_threshold_cleanup_applies_close_exactly_once(config):
     expected = np.zeros((10, 10), dtype=np.uint8)
     expected[2, 3:7] = 1
     np.testing.assert_array_equal(mask, expected)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_binary_mask_cleanup_matches_brute_force_exactly(seed, config):
+    rng = np.random.default_rng(seed)
+    mask = rng.integers(0, 9, size=(41, 53), dtype=np.uint8)
+    mask[mask < 7] = 0
+    mask[0, seed] = 3
+    mask[-1, -(seed + 1)] = 5
+    mask_before = mask.copy()
+    mask.flags.writeable = False
+    cleanup_config = replace(config, min_component_area=seed + 1)
+
+    expected = _brute_force_clean_binary_mask(mask, cleanup_config)
+    actual = clean_binary_mask(mask, cleanup_config)
+
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(mask, mask_before)
+    assert actual.dtype == np.uint8
+    assert set(np.unique(actual)) <= {0, 1}
+
+
+def test_binary_mask_cleanup_does_not_compare_full_labels_per_component(
+    monkeypatch,
+    config,
+):
+    height, width = 256, 512
+    mask = np.zeros((height, width), dtype=np.uint8)
+    ys, xs = np.meshgrid(
+        np.arange(2, height, 8),
+        np.arange(2, width, 8),
+        indexing="ij",
+    )
+    mask[ys, xs] = 1
+    equality_call_count = 0
+    connected_components = masks_module.cv2.connectedComponentsWithStats
+
+    class CountingLabels(np.ndarray):
+        def __eq__(self, other):
+            nonlocal equality_call_count
+            equality_call_count += 1
+            return super().__eq__(other)
+
+    def counting_connected_components(value, *, connectivity):
+        count, labels, stats, centroids = connected_components(
+            value,
+            connectivity=connectivity,
+        )
+        return count, labels.view(CountingLabels), stats, centroids
+
+    monkeypatch.setattr(
+        masks_module.cv2,
+        "connectedComponentsWithStats",
+        counting_connected_components,
+    )
+
+    cleaned = clean_binary_mask(
+        mask,
+        replace(config, min_component_area=1),
+    )
+
+    np.testing.assert_array_equal(cleaned, mask)
+    assert equality_call_count == 0
 
 
 @pytest.mark.parametrize(
