@@ -165,6 +165,25 @@ def test_robust_z_promotes_integer_extremes_without_wrap(
 
 
 @pytest.mark.filterwarnings("error")
+def test_robust_z_preserves_adjacent_uint64_offsets():
+    maximum = np.iinfo(np.uint64).max
+    delta = np.array(
+        [
+            [maximum - 3, maximum - 2],
+            [maximum - 1, maximum],
+        ],
+        dtype=np.uint64,
+    )
+
+    z = robust_z(delta, floor=2.0, clip=6.0)
+
+    np.testing.assert_array_equal(
+        z,
+        np.array([[0.0, 0.0], [0.25, 0.75]], dtype=np.float32),
+    )
+
+
+@pytest.mark.filterwarnings("error")
 @pytest.mark.parametrize("dtype", (np.float32, np.float64, np.longdouble))
 def test_robust_z_handles_finite_float_extremes_without_overflow(dtype):
     maximum = np.finfo(dtype).max
@@ -215,6 +234,41 @@ def test_robust_z_rejects_invalid_scale_parameters(floor, clip, message):
     delta = np.zeros((8, 8), dtype=np.float32)
     with pytest.raises(ValueError, match=message):
         robust_z(delta, floor=floor, clip=clip)
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize(
+    ("floor", "clip", "expected", "expected_dtype"),
+    [
+        (1e300, 6.0, 12.0 / 1e300, np.float64),
+        (2.0, 1e300, 6.0, np.float32),
+        (np.nextafter(0.0, 1.0), 6.0, 6.0, np.float32),
+    ],
+)
+def test_robust_z_preserves_public_floor_and_clip_range(
+    floor,
+    clip,
+    expected,
+    expected_dtype,
+):
+    delta = np.zeros((4, 4), dtype=np.float32)
+    delta[2, 3] = 12
+
+    z = robust_z(delta, floor=floor, clip=clip)
+
+    assert z.dtype == expected_dtype
+    assert z[2, 3] == pytest.approx(expected)
+
+
+@pytest.mark.filterwarnings("error")
+def test_robust_z_uses_wider_output_when_score_exceeds_float32():
+    delta = np.zeros((4, 4), dtype=np.float64)
+    delta[2, 3] = np.finfo(np.float64).max
+
+    z = robust_z(delta, floor=2.0, clip=1e300)
+
+    assert z.dtype == np.float64
+    assert z[2, 3] == pytest.approx(1e300)
 
 
 def test_motion_evidence_rejects_missing_center(config):
@@ -347,6 +401,25 @@ def test_motion_evidence_handles_extreme_finite_float64_without_warning(config):
 
 
 @pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize("dtype", (np.float32, np.float64, np.longdouble))
+def test_motion_evidence_handles_opposite_finite_float_extremes(
+    config,
+    dtype,
+):
+    frames = {
+        index: np.zeros((8, 8), dtype=dtype)
+        for index in range(-15, 16)
+    }
+    maximum = np.finfo(dtype).max
+    frames[0][3, 4] = maximum
+    frames[1][3, 4] = -maximum
+
+    evidence = compute_motion_evidence(0, frames, config)
+
+    assert evidence.channel_z["d1"][3, 4] == pytest.approx(6.0)
+
+
+@pytest.mark.filterwarnings("error")
 @pytest.mark.parametrize("dtype", REAL_NUMERIC_DTYPES)
 def test_motion_evidence_accepts_real_numeric_frame_dtypes(config, dtype):
     frames = {
@@ -414,5 +487,7 @@ def test_motion_evidence_returned_arrays_are_read_only(config):
 
     assert all(not array.flags.writeable for array in returned_arrays)
     for array in returned_arrays:
+        with pytest.raises(ValueError):
+            array.setflags(write=True)
         with pytest.raises(ValueError, match="read-only"):
             array[0, 0] = 1

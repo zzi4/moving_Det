@@ -32,19 +32,37 @@ def _working_dtype(dtype: np.dtype) -> np.dtype:
     return np.dtype(np.longdouble)
 
 
+def _calculation_dtype(dtype: np.dtype) -> np.dtype:
+    return np.dtype(np.promote_types(_working_dtype(dtype), np.float64))
+
+
+def _ordered_unsigned(values: np.ndarray) -> np.ndarray:
+    unsigned_dtype = np.dtype(f"u{values.dtype.itemsize}")
+    unsigned = values.view(unsigned_dtype)
+    if np.issubdtype(values.dtype, np.signedinteger):
+        sign_bit = unsigned_dtype.type(1 << (8 * values.dtype.itemsize - 1))
+        return np.bitwise_xor(unsigned, sign_bit)
+    return unsigned
+
+
 def _absolute_difference(
     center: np.ndarray,
     frame: np.ndarray,
+    working_dtype: np.dtype,
 ) -> np.ndarray:
-    difference = frame.astype(center.dtype, copy=True)
-    try:
-        with np.errstate(over="raise", invalid="raise"):
-            np.subtract(center, difference, out=difference)
-            np.abs(difference, out=difference)
-    except FloatingPointError as error:
-        raise ValueError(
-            "aligned grayscale frame difference exceeds numeric range"
-        ) from error
+    if np.issubdtype(center.dtype, np.integer):
+        center_ordered = _ordered_unsigned(center)
+        frame_ordered = _ordered_unsigned(frame)
+        larger = np.maximum(center_ordered, frame_ordered)
+        smaller = np.minimum(center_ordered, frame_ordered)
+        return np.subtract(larger, smaller, dtype=larger.dtype)
+
+    difference = center.astype(working_dtype, copy=True)
+    difference *= working_dtype.type(0.5)
+    other = frame.astype(working_dtype, copy=True)
+    other *= working_dtype.type(0.5)
+    np.subtract(difference, other, out=difference)
+    np.abs(difference, out=difference)
     return difference
 
 
@@ -90,6 +108,155 @@ def _temporal_median(
     return background
 
 
+def _temporal_integer_difference(
+    center: np.ndarray,
+    aligned_gray: Mapping[int, np.ndarray],
+    support_indices: tuple[int, ...],
+    working_dtype: np.dtype,
+) -> np.ndarray:
+    height, width = center.shape
+    bytes_per_row = (
+        len(support_indices) * width * center.dtype.itemsize
+    )
+    rows_per_chunk = max(1, _TEMPORAL_STACK_TARGET_BYTES // bytes_per_row)
+    difference = np.empty(center.shape, dtype=working_dtype)
+    midpoint = len(support_indices) // 2
+    for start in range(0, height, rows_per_chunk):
+        stop = min(start + rows_per_chunk, height)
+        stack = np.stack(
+            [aligned_gray[index][start:stop] for index in support_indices],
+            axis=0,
+        )
+        ordered = _ordered_unsigned(stack)
+        if len(support_indices) % 2:
+            ordered.partition(midpoint, axis=0)
+            lower = upper = ordered[midpoint]
+        else:
+            ordered.partition((midpoint - 1, midpoint), axis=0)
+            lower = ordered[midpoint - 1]
+            upper = ordered[midpoint]
+
+        center_ordered = _ordered_unsigned(center[start:stop])
+        gap = np.subtract(upper, lower, dtype=ordered.dtype)
+        half_gap = gap.astype(working_dtype) / 2
+        below = center_ordered <= lower
+        chunk = difference[start:stop]
+        lower_distance = np.subtract(
+            lower[below],
+            center_ordered[below],
+            dtype=ordered.dtype,
+        )
+        chunk[below] = lower_distance.astype(working_dtype) + half_gap[below]
+        above = ~below
+        upper_distance = np.subtract(
+            center_ordered[above],
+            upper[above],
+            dtype=ordered.dtype,
+        )
+        chunk[above] = upper_distance.astype(working_dtype) + half_gap[above]
+    return difference
+
+
+def _integer_centered_components(
+    values: np.ndarray,
+    calculation_dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray]:
+    ordered = _ordered_unsigned(values)
+    midpoint = values.size // 2
+    if values.size % 2:
+        partitioned = np.partition(ordered, midpoint, axis=None)
+        lower = upper = int(partitioned[midpoint])
+    else:
+        partitioned = np.partition(
+            ordered,
+            (midpoint - 1, midpoint),
+            axis=None,
+        )
+        lower = int(partitioned[midpoint - 1])
+        upper = int(partitioned[midpoint])
+
+    half_gap = calculation_dtype.type(upper - lower) / 2
+    below = ordered <= lower
+    deviations = np.empty(values.shape, dtype=calculation_dtype)
+    positive = np.zeros(values.shape, dtype=calculation_dtype)
+    lower_distance = np.subtract(
+        np.array(lower, dtype=ordered.dtype),
+        ordered[below],
+        dtype=ordered.dtype,
+    )
+    deviations[below] = lower_distance.astype(calculation_dtype) + half_gap
+    above = ~below
+    upper_distance = np.subtract(
+        ordered[above],
+        np.array(upper, dtype=ordered.dtype),
+        dtype=ordered.dtype,
+    )
+    positive[above] = upper_distance.astype(calculation_dtype) + half_gap
+    deviations[above] = positive[above]
+    return positive, deviations
+
+
+def _float_centered_components(
+    values: np.ndarray,
+    calculation_dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray, np.floating, np.dtype]:
+    converted = values.astype(calculation_dtype, copy=False)
+    minimum = converted.min()
+    maximum = converted.max()
+    limit = np.finfo(calculation_dtype).max
+    value_scale = calculation_dtype.type(1.0)
+    if minimum < 0 and maximum > limit + minimum:
+        calculation_dtype = np.dtype(
+            np.promote_types(calculation_dtype, np.longdouble)
+        )
+        value_scale = calculation_dtype.type(0.5)
+        converted = values.astype(calculation_dtype) * value_scale
+    median = _scalar_median(converted)
+    centered = converted - median
+    return (
+        np.maximum(centered, 0.0),
+        np.abs(centered),
+        value_scale,
+        calculation_dtype,
+    )
+
+
+def _output_score_array(values: np.ndarray) -> np.ndarray:
+    positive = values[values > 0]
+    maximum = values.max()
+    for dtype in (np.dtype(np.float32), np.dtype(np.float64)):
+        info = np.finfo(dtype)
+        if maximum > info.max:
+            continue
+        if positive.size and positive.min() < info.smallest_subnormal:
+            continue
+        return values.astype(dtype, copy=False)
+    return values
+
+
+def _normalize_components(
+    positive: np.ndarray,
+    deviations: np.ndarray,
+    floor: float,
+    clip: float,
+    calculation_dtype: np.dtype,
+    value_scale: np.floating,
+) -> np.ndarray:
+    floor_value = calculation_dtype.type(floor) * value_scale
+    clip_value = calculation_dtype.type(clip)
+    mad = _scalar_median(deviations)
+    scale = calculation_dtype.type(1.4826)
+    if mad > floor_value / scale:
+        with np.errstate(over="ignore"):
+            numerator_limit = mad * clip_value * scale
+        z = np.minimum(positive, numerator_limit) / mad / scale
+    else:
+        with np.errstate(over="ignore"):
+            numerator_limit = clip_value * floor_value
+        z = np.minimum(positive, numerator_limit) / floor_value
+    return _output_score_array(np.clip(z, 0.0, clip_value))
+
+
 def robust_z(delta: np.ndarray, floor: float, clip: float) -> np.ndarray:
     if (
         isinstance(floor, bool)
@@ -117,29 +284,36 @@ def robust_z(delta: np.ndarray, floor: float, clip: float) -> np.ndarray:
     ):
         raise ValueError("delta must contain only finite values")
 
-    working_dtype = _working_dtype(delta.dtype)
-    values = delta.astype(working_dtype, copy=False)
     try:
         with np.errstate(over="raise", invalid="raise", divide="raise"):
-            median = _scalar_median(values)
-            centered = values - median
-            mad = _scalar_median(np.abs(centered))
-            scale = working_dtype.type(1.4826)
-            floor_value = working_dtype.type(floor)
-            clip_value = working_dtype.type(clip)
-            positive = np.maximum(centered, 0.0)
-            if mad > floor_value / scale:
-                with np.errstate(over="ignore"):
-                    numerator_limit = mad * clip_value * scale
-                z = np.minimum(positive, numerator_limit) / mad / scale
+            calculation_dtype = _calculation_dtype(delta.dtype)
+            value_scale = calculation_dtype.type(1.0)
+            if np.issubdtype(delta.dtype, np.integer):
+                positive, deviations = _integer_centered_components(
+                    delta,
+                    calculation_dtype,
+                )
             else:
-                denominator = floor_value
-                with np.errstate(over="ignore"):
-                    numerator_limit = clip_value * denominator
-                z = np.minimum(positive, numerator_limit) / denominator
+                (
+                    positive,
+                    deviations,
+                    value_scale,
+                    calculation_dtype,
+                ) = _float_centered_components(delta, calculation_dtype)
+            return _normalize_components(
+                positive,
+                deviations,
+                floor,
+                clip,
+                calculation_dtype,
+                value_scale,
+            )
     except FloatingPointError as error:
         raise ValueError("delta values exceed supported numeric range") from error
-    return np.clip(z, 0.0, clip).astype(np.float32, copy=False)
+
+
+def _immutable_array(array: np.ndarray) -> np.ndarray:
+    return np.frombuffer(array.tobytes(), dtype=array.dtype).reshape(array.shape)
 
 
 def compute_motion_evidence(
@@ -208,12 +382,18 @@ def compute_motion_evidence(
             )
 
     working_dtype = _working_dtype(center_frame.dtype)
-    center = center_frame.astype(working_dtype, copy=False)
+    difference_scale = (
+        0.5 if np.issubdtype(center_frame.dtype, np.floating) else 1.0
+    )
     channel_z: dict[str, np.ndarray] = {}
 
     for offset in _OFFSETS:
         differences = [
-            _absolute_difference(center, aligned_gray[index])
+            _absolute_difference(
+                center_frame,
+                aligned_gray[index],
+                working_dtype,
+            )
             for index in (center_index - offset, center_index + offset)
             if index in aligned_gray
         ]
@@ -226,26 +406,43 @@ def compute_motion_evidence(
             np.maximum(differences[0], differences[1], out=delta)
         channel_z[f"d{offset}"] = robust_z(
             delta,
-            floor=cfg.mad_floor,
+            floor=cfg.mad_floor * difference_scale,
             clip=cfg.mad_clip,
         )
 
-    background = _temporal_median(
-        aligned_gray,
-        support_indices,
-        center_frame.shape,
-        center_frame.dtype,
-        working_dtype,
-    )
+    if np.issubdtype(center_frame.dtype, np.integer):
+        background_difference = _temporal_integer_difference(
+            center_frame,
+            aligned_gray,
+            support_indices,
+            working_dtype,
+        )
+    else:
+        background = _temporal_median(
+            aligned_gray,
+            support_indices,
+            center_frame.shape,
+            center_frame.dtype,
+            working_dtype,
+        )
+        background_difference = _absolute_difference(
+            center_frame,
+            background,
+            working_dtype,
+        )
     channel_z["dbg"] = robust_z(
-        _absolute_difference(center, background),
-        floor=cfg.mad_floor,
+        background_difference,
+        floor=cfg.mad_floor * difference_scale,
         clip=cfg.mad_clip,
     )
     fused_z = np.maximum.reduce(tuple(channel_z.values()))
     fused_score = fused_z / cfg.mad_clip
-    for array in (*channel_z.values(), fused_z, fused_score):
-        array.flags.writeable = False
+    channel_z = {
+        name: _immutable_array(array)
+        for name, array in channel_z.items()
+    }
+    fused_z = _immutable_array(fused_z)
+    fused_score = _immutable_array(fused_score)
     return MotionEvidence(
         frame_index=center_index,
         channel_z=MappingProxyType(channel_z),
