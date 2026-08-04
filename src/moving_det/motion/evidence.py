@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from numbers import Integral, Real
+from types import MappingProxyType
 
 import numpy as np
 
@@ -12,13 +13,23 @@ _OFFSETS = (1, 3, 7, 15)
 _MAD_FLOOR = 2.0
 _MAD_CLIP = 6.0
 _TEMPORAL_STACK_TARGET_BYTES = 64 * 1024 * 1024
-_SUPPORTED_FRAME_DTYPES = {
-    np.dtype(np.uint8),
-    np.dtype(np.uint16),
-    np.dtype(np.int16),
-    np.dtype(np.float32),
-    np.dtype(np.float64),
-}
+
+
+def _is_real_numeric_dtype(dtype: np.dtype) -> bool:
+    return np.issubdtype(dtype, np.integer) or np.issubdtype(
+        dtype,
+        np.floating,
+    )
+
+
+def _working_dtype(dtype: np.dtype) -> np.dtype:
+    if np.issubdtype(dtype, np.floating):
+        return np.dtype(np.promote_types(dtype, np.float32))
+    if dtype.itemsize <= 2:
+        return np.dtype(np.float32)
+    if dtype.itemsize <= 4:
+        return np.dtype(np.float64)
+    return np.dtype(np.longdouble)
 
 
 def _absolute_difference(
@@ -98,7 +109,7 @@ def robust_z(delta: np.ndarray, floor: float, clip: float) -> np.ndarray:
         raise TypeError("delta must be a numpy array")
     if delta.ndim != 2 or delta.size == 0:
         raise ValueError("delta must be a non-empty 2D array")
-    if delta.dtype not in _SUPPORTED_FRAME_DTYPES:
+    if not _is_real_numeric_dtype(delta.dtype):
         raise ValueError(f"unsupported dtype for delta: {delta.dtype}")
     if (
         np.issubdtype(delta.dtype, np.floating)
@@ -106,19 +117,26 @@ def robust_z(delta: np.ndarray, floor: float, clip: float) -> np.ndarray:
     ):
         raise ValueError("delta must contain only finite values")
 
-    working_dtype = (
-        np.dtype(np.float64)
-        if delta.dtype == np.dtype(np.float64)
-        else np.dtype(np.float32)
-    )
+    working_dtype = _working_dtype(delta.dtype)
     values = delta.astype(working_dtype, copy=False)
     try:
         with np.errstate(over="raise", invalid="raise", divide="raise"):
             median = _scalar_median(values)
             centered = values - median
             mad = _scalar_median(np.abs(centered))
-            denominator = max(1.4826 * float(mad), floor)
-            z = np.maximum(centered, 0.0) / denominator
+            scale = working_dtype.type(1.4826)
+            floor_value = working_dtype.type(floor)
+            clip_value = working_dtype.type(clip)
+            positive = np.maximum(centered, 0.0)
+            if mad > floor_value / scale:
+                with np.errstate(over="ignore"):
+                    numerator_limit = mad * clip_value * scale
+                z = np.minimum(positive, numerator_limit) / mad / scale
+            else:
+                denominator = floor_value
+                with np.errstate(over="ignore"):
+                    numerator_limit = clip_value * denominator
+                z = np.minimum(positive, numerator_limit) / denominator
     except FloatingPointError as error:
         raise ValueError("delta values exceed supported numeric range") from error
     return np.clip(z, 0.0, clip).astype(np.float32, copy=False)
@@ -164,7 +182,7 @@ def compute_motion_evidence(
         raise TypeError("aligned grayscale frames must be numpy arrays")
     if center_frame.ndim != 2 or center_frame.size == 0:
         raise ValueError("aligned grayscale frames must be non-empty 2D grayscale")
-    if center_frame.dtype not in _SUPPORTED_FRAME_DTYPES:
+    if not _is_real_numeric_dtype(center_frame.dtype):
         raise ValueError(f"unsupported dtype for frame {center_index}")
 
     for index in support_indices:
@@ -177,7 +195,7 @@ def compute_motion_evidence(
             )
         if frame.shape != center_frame.shape:
             raise ValueError("aligned grayscale frames must have the same shape")
-        if frame.dtype not in _SUPPORTED_FRAME_DTYPES:
+        if not _is_real_numeric_dtype(frame.dtype):
             raise ValueError(f"unsupported dtype for frame {index}")
         if frame.dtype != center_frame.dtype:
             raise ValueError("aligned grayscale frames must have the same dtype")
@@ -189,11 +207,7 @@ def compute_motion_evidence(
                 "aligned grayscale frames must contain only finite values"
             )
 
-    working_dtype = (
-        np.dtype(np.float64)
-        if center_frame.dtype == np.dtype(np.float64)
-        else np.dtype(np.float32)
-    )
+    working_dtype = _working_dtype(center_frame.dtype)
     center = center_frame.astype(working_dtype, copy=False)
     channel_z: dict[str, np.ndarray] = {}
 
@@ -229,10 +243,13 @@ def compute_motion_evidence(
         clip=cfg.mad_clip,
     )
     fused_z = np.maximum.reduce(tuple(channel_z.values()))
+    fused_score = fused_z / cfg.mad_clip
+    for array in (*channel_z.values(), fused_z, fused_score):
+        array.flags.writeable = False
     return MotionEvidence(
         frame_index=center_index,
-        channel_z=channel_z,
+        channel_z=MappingProxyType(channel_z),
         fused_z=fused_z,
-        fused_score=fused_z / cfg.mad_clip,
+        fused_score=fused_score,
         support_indices=support_indices,
     )

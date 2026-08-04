@@ -6,6 +6,22 @@ import pytest
 from moving_det.motion.evidence import compute_motion_evidence, robust_z
 
 
+REAL_NUMERIC_DTYPES = (
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.float16,
+    np.float32,
+    np.float64,
+    np.longdouble,
+)
+
+
 def stationary_frames_with_square(
     indices: range,
     square_positions: dict[int, tuple[int, int]],
@@ -112,6 +128,59 @@ def test_robust_z_rejects_non_finite_delta():
 
 
 @pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize("dtype", REAL_NUMERIC_DTYPES)
+def test_robust_z_accepts_real_numeric_ndarray_dtypes(dtype):
+    delta = np.zeros((4, 4), dtype=dtype)
+    delta[2, 3] = 12
+
+    z = robust_z(delta, floor=2.0, clip=6.0)
+
+    assert z.dtype == np.float32
+    assert z[2, 3] == pytest.approx(6.0)
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize(
+    ("dtype", "minimum", "maximum"),
+    [
+        (np.int64, np.iinfo(np.int64).min, np.iinfo(np.int64).max),
+        (np.uint64, 0, np.iinfo(np.uint64).max),
+    ],
+)
+def test_robust_z_promotes_integer_extremes_without_wrap(
+    dtype,
+    minimum,
+    maximum,
+):
+    delta = np.array(
+        [[minimum, 0], [0, maximum]],
+        dtype=dtype,
+    )
+
+    z = robust_z(delta, floor=2.0, clip=6.0)
+
+    assert z.dtype == np.float32
+    assert z[0, 0] == 0
+    assert z[1, 1] > 0
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize("dtype", (np.float32, np.float64, np.longdouble))
+def test_robust_z_handles_finite_float_extremes_without_overflow(dtype):
+    maximum = np.finfo(dtype).max
+    delta = np.array(
+        [[-maximum, -maximum], [maximum, maximum]],
+        dtype=dtype,
+    )
+
+    z = robust_z(delta, floor=2.0, clip=6.0)
+
+    assert z.dtype == np.float32
+    assert z[0, 0] == 0
+    assert z[1, 1] == pytest.approx(1.0 / 1.4826)
+
+
+@pytest.mark.filterwarnings("error")
 @pytest.mark.parametrize(
     ("delta", "exception", "message"),
     [
@@ -120,7 +189,7 @@ def test_robust_z_rejects_non_finite_delta():
         (np.zeros((2, 2, 2), dtype=np.float32), ValueError, "non-empty 2D"),
         (np.zeros((2, 2), dtype=bool), ValueError, "unsupported dtype"),
         (np.zeros((2, 2), dtype=np.complex64), ValueError, "unsupported dtype"),
-        (np.zeros((2, 2), dtype=np.int64), ValueError, "unsupported dtype"),
+        (np.zeros((2, 2), dtype=object), ValueError, "unsupported dtype"),
         ([[0.0, 1.0]], TypeError, "numpy array"),
     ],
 )
@@ -223,7 +292,7 @@ def test_motion_evidence_rejects_unsupported_frame_dtype(config):
         indices=range(-15, 16),
         square_positions={},
     )
-    frames[1] = frames[1].astype(np.int64)
+    frames[1] = frames[1].astype(np.complex64)
     with pytest.raises(ValueError, match="unsupported dtype"):
         compute_motion_evidence(0, frames, config)
 
@@ -275,3 +344,75 @@ def test_motion_evidence_handles_extreme_finite_float64_without_warning(config):
     evidence = compute_motion_evidence(0, frames, config)
 
     assert evidence.channel_z["d1"][3, 4] == pytest.approx(6.0)
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize("dtype", REAL_NUMERIC_DTYPES)
+def test_motion_evidence_accepts_real_numeric_frame_dtypes(config, dtype):
+    frames = {
+        index: np.zeros((8, 8), dtype=dtype)
+        for index in range(-15, 16)
+    }
+    for index in (-15, -7, -3, -1, 0, 1, 3, 7, 15):
+        frames[index][3, 4] = 12
+
+    evidence = compute_motion_evidence(0, frames, config)
+
+    lag_names = ("d1", "d3", "d7", "d15")
+    assert all(evidence.channel_z[name].max() == 0 for name in lag_names)
+    assert evidence.channel_z["dbg"][3, 4] == pytest.approx(6.0)
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize(
+    ("dtype", "center_value", "side_value"),
+    [
+        (np.int64, np.iinfo(np.int64).min, np.iinfo(np.int64).max),
+        (np.uint64, np.iinfo(np.uint64).max, 0),
+    ],
+)
+def test_motion_evidence_promotes_integer_extremes_without_wrap(
+    config,
+    dtype,
+    center_value,
+    side_value,
+):
+    frames = {
+        index: np.zeros((8, 8), dtype=dtype)
+        for index in range(-15, 16)
+    }
+    frames[0][3, 4] = center_value
+    frames[1][3, 4] = side_value
+
+    evidence = compute_motion_evidence(0, frames, config)
+
+    assert evidence.channel_z["d1"][3, 4] == pytest.approx(6.0)
+
+
+def test_motion_evidence_channel_mapping_is_immutable(config):
+    frames = stationary_frames_with_square(
+        indices=range(-15, 16),
+        square_positions={},
+    )
+    evidence = compute_motion_evidence(0, frames, config)
+
+    with pytest.raises(TypeError):
+        evidence.channel_z["extra"] = np.zeros((64, 64), dtype=np.float32)
+
+
+def test_motion_evidence_returned_arrays_are_read_only(config):
+    frames = stationary_frames_with_square(
+        indices=range(-15, 16),
+        square_positions={},
+    )
+    evidence = compute_motion_evidence(0, frames, config)
+    returned_arrays = (
+        *evidence.channel_z.values(),
+        evidence.fused_z,
+        evidence.fused_score,
+    )
+
+    assert all(not array.flags.writeable for array in returned_arrays)
+    for array in returned_arrays:
+        with pytest.raises(ValueError, match="read-only"):
+            array[0, 0] = 1
