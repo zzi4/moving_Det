@@ -35,6 +35,16 @@ def test_four_points_round_trip_to_long_edge_obb():
     assert normalize_theta(recovered.theta - original.theta) == pytest.approx(0.0)
 
 
+def test_points_to_obb_is_translation_invariant_at_large_coordinates():
+    points = obb_to_points(OBB(1e12, 1e12, 40, 20, 0.3))
+    recovered = points_to_obb(points)
+    assert recovered.cx == pytest.approx(1e12, abs=1e-3)
+    assert recovered.cy == pytest.approx(1e12, abs=1e-3)
+    assert recovered.width == pytest.approx(40, abs=1e-3)
+    assert recovered.height == pytest.approx(20, abs=1e-3)
+    assert recovered.theta == pytest.approx(0.3, abs=1e-6)
+
+
 @pytest.mark.parametrize(
     "points",
     [

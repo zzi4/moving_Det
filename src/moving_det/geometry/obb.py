@@ -40,10 +40,7 @@ def points_to_obb(points: Sequence[Sequence[float]]) -> OBB:
     lengths = np.linalg.norm(edges, axis=1)
     if np.any(lengths <= 0):
         raise ValueError("OBB sides must be positive")
-    area = abs(
-        np.dot(array[:, 0], np.roll(array[:, 1], -1))
-        - np.dot(array[:, 1], np.roll(array[:, 0], -1))
-    ) / 2
+    area = abs(edges[0, 0] * edges[1, 1] - edges[0, 1] * edges[1, 0])
     opposite_edges_match = np.allclose(edges[0], -edges[2]) and np.allclose(
         edges[1], -edges[3]
     )
