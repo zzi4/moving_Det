@@ -184,6 +184,34 @@ def test_robust_z_preserves_adjacent_uint64_offsets():
 
 
 @pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize(
+    "dtype_code",
+    ("i2", "i4", "i8", "u2", "u4", "u8"),
+)
+def test_robust_z_is_byte_order_independent_for_integer_dtypes(dtype_code):
+    native_dtype = np.dtype(dtype_code).newbyteorder("=")
+    non_native_dtype = native_dtype.newbyteorder("S")
+    maximum = np.iinfo(native_dtype).max
+    expected = np.array(
+        [[0.0, 0.0], [0.25, 0.75]],
+        dtype=np.float32,
+    )
+
+    for dtype in (native_dtype, non_native_dtype):
+        delta = np.array(
+            [
+                [maximum - 3, maximum - 2],
+                [maximum - 1, maximum],
+            ],
+            dtype=dtype,
+        )
+
+        z = robust_z(delta, floor=2.0, clip=6.0)
+
+        np.testing.assert_array_equal(z, expected)
+
+
+@pytest.mark.filterwarnings("error")
 @pytest.mark.parametrize("dtype", (np.float32, np.float64, np.longdouble))
 def test_robust_z_handles_finite_float_extremes_without_overflow(dtype):
     maximum = np.finfo(dtype).max
@@ -269,6 +297,48 @@ def test_robust_z_uses_wider_output_when_score_exceeds_float32():
 
     assert z.dtype == np.float64
     assert z[2, 3] == pytest.approx(1e300)
+
+
+@pytest.mark.filterwarnings("error")
+def test_robust_z_clips_when_floor_clip_product_would_underflow():
+    delta = np.zeros((4, 4), dtype=np.float64)
+    delta[2, 3] = 1.0
+    floor = np.nextafter(0.0, 1.0)
+
+    z = robust_z(delta, floor=floor, clip=0.1)
+
+    assert z.dtype == np.float32
+    assert z[2, 3] == pytest.approx(0.1)
+
+
+@pytest.mark.filterwarnings("error")
+def test_robust_z_preserves_longdouble_floor_above_float64_range():
+    maximum = np.finfo(np.float64).max
+    floor = np.longdouble(maximum) * np.longdouble(4)
+    delta = np.zeros((4, 4), dtype=np.float64)
+    delta[2, 3] = maximum
+
+    z = robust_z(delta, floor=floor, clip=np.longdouble(6))
+
+    assert z.dtype == np.float32
+    assert z[2, 3] == pytest.approx(0.25)
+
+
+@pytest.mark.filterwarnings("error")
+def test_robust_z_preserves_longdouble_clip_above_float64_range():
+    maximum = np.finfo(np.float64).max
+    clip = np.longdouble(maximum) * np.longdouble(4)
+    delta = np.zeros((4, 4), dtype=np.float64)
+    delta[2, 3] = maximum
+
+    z = robust_z(
+        delta,
+        floor=np.nextafter(0.0, 1.0),
+        clip=clip,
+    )
+
+    assert z.dtype == np.dtype(np.longdouble)
+    assert z[2, 3] == clip
 
 
 def test_motion_evidence_rejects_missing_center(config):
@@ -460,6 +530,50 @@ def test_motion_evidence_promotes_integer_extremes_without_wrap(
     evidence = compute_motion_evidence(0, frames, config)
 
     assert evidence.channel_z["d1"][3, 4] == pytest.approx(6.0)
+
+
+@pytest.mark.filterwarnings("error")
+@pytest.mark.parametrize(
+    "dtype_code",
+    ("i2", "i4", "i8", "u2", "u4", "u8"),
+)
+def test_motion_evidence_is_byte_order_independent_for_integer_frames(
+    config,
+    dtype_code,
+):
+    native_dtype = np.dtype(dtype_code).newbyteorder("=")
+    non_native_dtype = native_dtype.newbyteorder("S")
+    evidences = []
+
+    for dtype in (native_dtype, non_native_dtype):
+        maximum = np.iinfo(dtype).max
+        frames = {
+            index: np.full((8, 8), maximum, dtype=dtype)
+            for index in range(-15, 16)
+        }
+        frames[1][1, 1] = maximum - 1
+        for index in (*range(-15, 0), 2):
+            frames[index][2, 2] = maximum - 1
+
+        evidence = compute_motion_evidence(0, frames, config)
+
+        assert evidence.channel_z["d1"][1, 1] == pytest.approx(0.5)
+        assert evidence.channel_z["dbg"][2, 2] == pytest.approx(0.5)
+        evidences.append(evidence)
+
+    for name in evidences[0].channel_z:
+        np.testing.assert_array_equal(
+            evidences[0].channel_z[name],
+            evidences[1].channel_z[name],
+        )
+    np.testing.assert_array_equal(
+        evidences[0].fused_z,
+        evidences[1].fused_z,
+    )
+    np.testing.assert_array_equal(
+        evidences[0].fused_score,
+        evidences[1].fused_score,
+    )
 
 
 def test_motion_evidence_channel_mapping_is_immutable(config):

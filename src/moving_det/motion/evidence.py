@@ -32,13 +32,29 @@ def _working_dtype(dtype: np.dtype) -> np.dtype:
     return np.dtype(np.longdouble)
 
 
-def _calculation_dtype(dtype: np.dtype) -> np.dtype:
-    return np.dtype(np.promote_types(_working_dtype(dtype), np.float64))
+def _calculation_dtype(
+    dtype: np.dtype,
+    floor: Real,
+    clip: Real,
+) -> np.dtype:
+    calculation_dtype = np.dtype(
+        np.promote_types(_working_dtype(dtype), np.float64)
+    )
+    for parameter in (floor, clip):
+        calculation_dtype = np.dtype(
+            np.promote_types(
+                calculation_dtype,
+                np.asarray(parameter).dtype,
+            )
+        )
+    return calculation_dtype
 
 
 def _ordered_unsigned(values: np.ndarray) -> np.ndarray:
+    native_dtype = values.dtype.newbyteorder("=")
+    native_values = values.astype(native_dtype, copy=False)
     unsigned_dtype = np.dtype(f"u{values.dtype.itemsize}")
-    unsigned = values.view(unsigned_dtype)
+    unsigned = native_values.view(unsigned_dtype)
     if np.issubdtype(values.dtype, np.signedinteger):
         sign_bit = unsigned_dtype.type(1 << (8 * values.dtype.itemsize - 1))
         return np.bitwise_xor(unsigned, sign_bit)
@@ -237,27 +253,25 @@ def _output_score_array(values: np.ndarray) -> np.ndarray:
 def _normalize_components(
     positive: np.ndarray,
     deviations: np.ndarray,
-    floor: float,
-    clip: float,
+    floor: Real,
+    clip: Real,
     calculation_dtype: np.dtype,
     value_scale: np.floating,
 ) -> np.ndarray:
-    floor_value = calculation_dtype.type(floor) * value_scale
+    floor_value = calculation_dtype.type(floor)
     clip_value = calculation_dtype.type(clip)
     mad = _scalar_median(deviations)
     scale = calculation_dtype.type(1.4826)
-    if mad > floor_value / scale:
-        with np.errstate(over="ignore"):
-            numerator_limit = mad * clip_value * scale
-        z = np.minimum(positive, numerator_limit) / mad / scale
-    else:
-        with np.errstate(over="ignore"):
-            numerator_limit = clip_value * floor_value
-        z = np.minimum(positive, numerator_limit) / floor_value
+    with np.errstate(over="ignore", under="ignore"):
+        scaled_mad = mad / value_scale
+        if scaled_mad > floor_value / scale:
+            z = positive / mad / scale
+        else:
+            z = positive / floor_value / value_scale
     return _output_score_array(np.clip(z, 0.0, clip_value))
 
 
-def robust_z(delta: np.ndarray, floor: float, clip: float) -> np.ndarray:
+def robust_z(delta: np.ndarray, floor: Real, clip: Real) -> np.ndarray:
     if (
         isinstance(floor, bool)
         or not isinstance(floor, Real)
@@ -286,7 +300,11 @@ def robust_z(delta: np.ndarray, floor: float, clip: float) -> np.ndarray:
 
     try:
         with np.errstate(over="raise", invalid="raise", divide="raise"):
-            calculation_dtype = _calculation_dtype(delta.dtype)
+            calculation_dtype = _calculation_dtype(
+                delta.dtype,
+                floor,
+                clip,
+            )
             value_scale = calculation_dtype.type(1.0)
             if np.issubdtype(delta.dtype, np.integer):
                 positive, deviations = _integer_centered_components(
