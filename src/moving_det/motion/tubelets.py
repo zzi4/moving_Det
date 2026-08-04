@@ -1,5 +1,6 @@
 import math
 from collections.abc import Mapping, Sequence
+from numbers import Integral
 
 import cv2
 import numpy as np
@@ -57,10 +58,16 @@ def link_tubelets(
     components_by_frame: Mapping[int, Sequence[Component]],
     cfg: ExperimentConfig,
 ) -> tuple[Tubelet, ...]:
-    ordered_by_frame = {
-        frame_index: tuple(sorted(components, key=_component_key))
-        for frame_index, components in sorted(components_by_frame.items())
-    }
+    ordered_by_frame = {}
+    for frame_index, components in sorted(components_by_frame.items()):
+        for component in components:
+            if component.frame_index != frame_index:
+                raise ValueError(
+                    "component frame_index must match its mapping key"
+                )
+        ordered_by_frame[frame_index] = tuple(
+            sorted(components, key=_component_key)
+        )
     nodes = [
         component
         for components in ordered_by_frame.values()
@@ -178,6 +185,22 @@ def proposals_from_components(
     ignore_polygons: Sequence[Sequence[Sequence[float]]],
     cfg: ExperimentConfig,
 ) -> tuple[Proposal, ...]:
+    if (
+        isinstance(frame_index, bool)
+        or not isinstance(frame_index, Integral)
+        or frame_index < 0
+    ):
+        raise ValueError("frame_index must be a nonnegative integer")
+    for component in components:
+        if (
+            isinstance(component.component_id, bool)
+            or not isinstance(component.component_id, Integral)
+            or not 0 <= component.component_id < 100000
+        ):
+            raise ValueError(
+                "component_id must be an integer in [0, 100000)"
+            )
+
     proposals = []
     for component in sorted(components, key=_component_key):
         obb = _component_obb(component, cfg.obb_padding_factor)

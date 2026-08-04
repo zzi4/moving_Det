@@ -1,3 +1,6 @@
+import math
+from numbers import Real
+
 import cv2
 import numpy as np
 from scipy.ndimage import binary_fill_holes
@@ -9,11 +12,35 @@ from moving_det.models import Component
 _CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
 
+def _validate_real_2d_array(array: np.ndarray, name: str) -> None:
+    if (
+        not isinstance(array, np.ndarray)
+        or array.ndim != 2
+        or array.size == 0
+    ):
+        raise ValueError(f"{name} must be a non-empty 2D NumPy array")
+    if not (
+        np.issubdtype(array.dtype, np.bool_)
+        or np.issubdtype(array.dtype, np.integer)
+        or np.issubdtype(array.dtype, np.floating)
+    ):
+        raise ValueError(f"{name} must have a real numeric dtype")
+    if not np.isfinite(array).all():
+        raise ValueError(f"{name} must contain only finite values")
+
+
 def threshold_and_clean(
     fused_z: np.ndarray,
     threshold: float,
     cfg: ExperimentConfig,
 ) -> np.ndarray:
+    _validate_real_2d_array(fused_z, "fused_z")
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, Real)
+        or not math.isfinite(threshold)
+    ):
+        raise ValueError("threshold must be a finite real number")
     thresholded = np.greater_equal(fused_z, threshold).astype(np.uint8)
     closed = cv2.morphologyEx(
         thresholded,
@@ -39,6 +66,10 @@ def extract_components(
     score: np.ndarray,
     cfg: ExperimentConfig,
 ) -> tuple[Component, ...]:
+    _validate_real_2d_array(mask, "mask")
+    _validate_real_2d_array(score, "score")
+    if mask.shape != score.shape:
+        raise ValueError("mask and score must have the same shape")
     foreground = np.not_equal(mask, 0).astype(np.uint8)
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         foreground,
