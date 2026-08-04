@@ -1,6 +1,7 @@
+import csv
 import json
 from collections import Counter
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -13,6 +14,33 @@ from moving_det.cli import main
 from moving_det.config import ExperimentConfig, load_config
 from moving_det.experiment import calibrate, evaluate, run_method
 from moving_det.models import MotionEvidence
+
+
+_EXPECTED_PER_FRAME_FIELDS = (
+    "frame_index",
+    "is_primary",
+    "moving_gt_count",
+    "matched_gt_count_025",
+    "recall_025",
+    "matched_gt_count_050",
+    "recall_050",
+    "center_in_gt_count",
+    "center_in_gt_recall",
+    "mask_coverage_mean",
+    "difficult_moving_gt_count",
+    "proposal_count",
+    "false_proposal_count",
+)
+_EXPECTED_PER_TRACK_FIELDS = (
+    "track_id",
+    "first_moving_frame",
+    "first_detection_frame",
+    "first_detection_delay_frames",
+    "moving_frame_count",
+    "detected_moving_frame_count",
+    "moving_frame_coverage",
+    "extra_tubelet_fragments",
+)
 
 
 class _StreamingMethod:
@@ -57,6 +85,105 @@ def _strict_load(path: Path):
     )
 
 
+def _valid_calibration_payload(config):
+    methods = {}
+    for method_name in (
+        "frame_diff",
+        "mog2",
+        "temporal_median",
+        "multiscale",
+        "multiscale_tubelet",
+    ):
+        parameter_name = (
+            "varThreshold" if method_name == "mog2" else "z_threshold"
+        )
+        values = (
+            (9.0, 16.0, 25.0)
+            if method_name == "mog2"
+            else (3.0, 4.0, 5.0, 6.0)
+        )
+        candidates = [
+            {
+                "parameter_name": parameter_name,
+                "parameter_value": value,
+                "recall_025": 0.5,
+                "fp_per_100_gt": 10.0,
+            }
+            for value in values
+        ]
+        methods[method_name] = {
+            str(float(scale)): {
+                "parameter_name": parameter_name,
+                "candidates": candidates,
+                "selected": dict(candidates[0]),
+                "constraint_satisfied": True,
+            }
+            for scale in config.scale_factors
+        }
+    return {
+        "schema_version": 1,
+        "sequence_id": config.calibration_sequence,
+        "input_path": str(
+            (
+                config.data_root / config.calibration_sequence
+            ).resolve()
+        ),
+        "random_seed": config.random_seed,
+        "scale_factors": list(config.scale_factors),
+        "methods": methods,
+    }
+
+
+def test_strict_json_serializes_numpy_scalars_without_item_recursion(tmp_path):
+    path = tmp_path / "numpy-scalars.json"
+    precise_longdouble = np.longdouble("1.0000000000000000001")
+    huge_longdouble = np.longdouble(np.finfo(np.float64).max) * 2
+
+    experiment_module._write_json(
+        path,
+        {
+            "bool": np.bool_(True),
+            "integer": np.int64(7),
+            "finite": np.float32(1.25),
+            "exact_longdouble": np.longdouble("1.5"),
+            "precise_longdouble": precise_longdouble,
+            "huge_longdouble": huge_longdouble,
+            "positive_infinity": np.longdouble("inf"),
+            "negative_infinity": np.longdouble("-inf"),
+        },
+    )
+
+    payload = _strict_load(path)
+    assert payload["bool"] is True
+    assert payload["integer"] == 7
+    assert payload["finite"] == 1.25
+    assert payload["exact_longdouble"] == 1.5
+    assert payload["precise_longdouble"] == np.format_float_scientific(
+        precise_longdouble,
+        unique=True,
+        trim="k",
+    )
+    assert payload["huge_longdouble"] == np.format_float_scientific(
+        huge_longdouble,
+        unique=True,
+        trim="k",
+    )
+    assert payload["positive_infinity"] == "Infinity"
+    assert payload["negative_infinity"] == "-Infinity"
+
+
+def test_strict_json_rejects_numpy_nan_without_recursion(tmp_path):
+    path = tmp_path / "nan.json"
+
+    with pytest.raises(ValueError, match="NaN"):
+        experiment_module._write_json(
+            path,
+            {"value": np.longdouble("nan")},
+        )
+
+    assert not path.exists()
+
+
 def test_run_writes_reproducible_artifacts(tmp_path, tiny_sequence, config):
     artifacts = run_method(
         config=config,
@@ -99,6 +226,10 @@ def test_run_writes_reproducible_artifacts(tmp_path, tiny_sequence, config):
         "pillow",
         "moving-det",
     }
+    with artifacts.per_frame_path.open(encoding="utf-8", newline="") as stream:
+        assert tuple(next(csv.reader(stream))) == _EXPECTED_PER_FRAME_FIELDS
+    with artifacts.per_track_path.open(encoding="utf-8", newline="") as stream:
+        assert tuple(next(csv.reader(stream))) == _EXPECTED_PER_TRACK_FIELDS
 
 
 def test_inspect_data_cli_prints_both_sequences(capsys, tiny_config_path):
@@ -140,6 +271,149 @@ def test_run_streams_once_for_all_z_thresholds_and_writes_strict_infinity(
         for item in candidates
     } == {"Infinity"}
     assert ": Infinity" not in artifacts.metrics_path.read_text(encoding="utf-8")
+    proposal_line = artifacts.proposals_path.read_text(
+        encoding="utf-8"
+    ).splitlines()[0]
+    proposal = json.loads(proposal_line)
+    assert set(proposal) == {
+        "frame_index",
+        "motion_score",
+        "obb",
+        "tubelet_id",
+    }
+    assert set(proposal["obb"]) == {
+        "cx",
+        "cy",
+        "width",
+        "height",
+        "theta",
+    }
+
+
+def test_empty_track_csv_keeps_fixed_header_and_preview_resize_values(
+    tmp_path,
+    tiny_sequence,
+    config,
+    monkeypatch,
+):
+    short_large_sequence = replace(
+        tiny_sequence,
+        width=1920,
+        height=1080,
+        frames=tiny_sequence.frames[:1],
+    )
+    monkeypatch.setattr(
+        experiment_module,
+        "create_method",
+        lambda *args, **kwargs: _StreamingMethod(foreground=True),
+    )
+
+    artifacts = run_method(
+        config,
+        short_large_sequence,
+        "frame_diff",
+        1.0,
+        (4.0,),
+        tmp_path / "run",
+    )
+
+    with artifacts.per_frame_path.open(encoding="utf-8", newline="") as stream:
+        frame_rows = list(csv.reader(stream))
+    with artifacts.per_track_path.open(encoding="utf-8", newline="") as stream:
+        track_rows = list(csv.reader(stream))
+    assert tuple(frame_rows[0]) == _EXPECTED_PER_FRAME_FIELDS
+    assert len(frame_rows) == 2
+    assert track_rows == [list(_EXPECTED_PER_TRACK_FIELDS)]
+    with np.load(artifacts.frame_cache_dir / "000001.npz") as preview:
+        assert preview["preview_score"].shape == (540, 960)
+        assert preview["preview_mask"].shape == (540, 960)
+        assert preview["preview_score"][1, 1] == 255
+        assert preview["preview_mask"][1, 1] == 1
+
+
+def test_csv_writer_rejects_row_schema_drift_before_writing(tmp_path):
+    path = tmp_path / "rows.csv"
+
+    with pytest.raises(ValueError, match="CSV row schema"):
+        experiment_module._write_csv(
+            path,
+            ({"frame_index": 1, "unexpected": 2},),
+            ("frame_index",),
+        )
+
+    assert not path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "method_name", "threshold"),
+    (
+        ("threshold_candidates", (2.0,), "frame_diff", 2.0),
+        ("mog2_var_threshold_candidates", (8.0,), "mog2", 8.0),
+    ),
+)
+def test_run_rejects_mutated_fixed_candidates_before_creating_method(
+    tmp_path,
+    tiny_sequence,
+    config,
+    monkeypatch,
+    field_name,
+    value,
+    method_name,
+    threshold,
+):
+    mutated = replace(config, **{field_name: value})
+
+    def forbidden_factory(*args, **kwargs):
+        raise AssertionError("method factory must not run")
+
+    monkeypatch.setattr(
+        experiment_module,
+        "create_method",
+        forbidden_factory,
+    )
+
+    with pytest.raises(ValueError, match="fixed POC candidates"):
+        run_method(
+            mutated,
+            tiny_sequence,
+            method_name,
+            1.0,
+            (threshold,),
+            tmp_path / "run",
+        )
+
+    assert not (tmp_path / "run").exists()
+    assert not tuple(tmp_path.glob(".run.*"))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("threshold_candidates", (2.0,)),
+        ("mog2_var_threshold_candidates", (8.0,)),
+    ),
+)
+def test_calibrate_rejects_mutated_fixed_candidates_before_reading_data(
+    tmp_path,
+    config,
+    monkeypatch,
+    field_name,
+    value,
+):
+    mutated = replace(config, **{field_name: value})
+
+    def forbidden_load(*args, **kwargs):
+        raise AssertionError("calibration data must not be read")
+
+    monkeypatch.setattr(
+        "moving_det.data.labelme.load_sequence",
+        forbidden_load,
+    )
+
+    with pytest.raises(ValueError, match="fixed POC candidates"):
+        calibrate(mutated, tmp_path / "calibration")
+
+    assert not (tmp_path / "calibration").exists()
 
 
 def test_mog2_runs_each_var_threshold_once_without_z_thresholding(
@@ -307,6 +581,110 @@ def test_evaluate_rejects_non_strict_or_incomplete_calibration(
 
     with pytest.raises(ValueError, match="strict JSON"):
         evaluate(config, invalid, tmp_path / "evaluation")
+
+
+@pytest.mark.parametrize("constant", ("NaN", "Infinity", "-Infinity"))
+def test_frozen_calibration_rejects_bare_nonstandard_json_constants(
+    tmp_path,
+    config,
+    constant,
+):
+    path = tmp_path / "calibration.json"
+    path.write_text(
+        f'{{"schema_version": 1, "value": {constant}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="strict JSON"):
+        experiment_module._frozen_selections(config, path)
+
+
+def test_frozen_calibration_accepts_only_complete_exact_schema(
+    tmp_path,
+    config,
+):
+    path = tmp_path / "calibration.json"
+    path.write_text(
+        json.dumps(_valid_calibration_payload(config), allow_nan=False),
+        encoding="utf-8",
+    )
+
+    selections = experiment_module._frozen_selections(config, path)
+
+    assert selections["frame_diff"]["1.0"] == 3.0
+    assert selections["mog2"]["0.7"] == 9.0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "minimal",
+        "unknown_top",
+        "missing_input_path",
+        "input_path_mismatch",
+        "random_seed_mismatch",
+        "scale_factors_mismatch",
+        "missing_candidates",
+        "unknown_entry_field",
+        "candidate_parameter_string",
+        "candidate_recall_string",
+        "candidate_fp_string",
+        "selected_missing",
+        "selected_parameter_name",
+        "selected_value",
+        "selected_not_in_candidates",
+        "constraint_not_bool",
+        "constraint_inconsistent",
+    ),
+)
+def test_frozen_calibration_rejects_schema_tampering(
+    tmp_path,
+    config,
+    mutation,
+):
+    payload = _valid_calibration_payload(config)
+    entry = payload["methods"]["frame_diff"]["1.0"]
+    if mutation == "minimal":
+        payload = {"schema_version": 1}
+    elif mutation == "unknown_top":
+        payload["unexpected"] = True
+    elif mutation == "missing_input_path":
+        del payload["input_path"]
+    elif mutation == "input_path_mismatch":
+        payload["input_path"] = "/tmp/not-the-calibration-sequence"
+    elif mutation == "random_seed_mismatch":
+        payload["random_seed"] = config.random_seed + 1
+    elif mutation == "scale_factors_mismatch":
+        payload["scale_factors"] = [1.0]
+    elif mutation == "missing_candidates":
+        del entry["candidates"]
+    elif mutation == "unknown_entry_field":
+        entry["unexpected"] = True
+    elif mutation == "candidate_parameter_string":
+        entry["candidates"][0]["parameter_value"] = "3.0"
+    elif mutation == "candidate_recall_string":
+        entry["candidates"][0]["recall_025"] = "0.5"
+    elif mutation == "candidate_fp_string":
+        entry["candidates"][0]["fp_per_100_gt"] = "10.0"
+    elif mutation == "selected_missing":
+        del entry["selected"]
+    elif mutation == "selected_parameter_name":
+        entry["selected"]["parameter_name"] = "varThreshold"
+    elif mutation == "selected_value":
+        entry["selected"]["parameter_value"] = 2.0
+    elif mutation == "selected_not_in_candidates":
+        entry["selected"]["recall_025"] = 0.75
+    elif mutation == "constraint_not_bool":
+        entry["constraint_satisfied"] = 1
+    elif mutation == "constraint_inconsistent":
+        entry["constraint_satisfied"] = False
+    else:
+        raise AssertionError(mutation)
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps(payload, allow_nan=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="calibration"):
+        experiment_module._frozen_selections(config, path)
 
 
 def test_cli_reports_reader_errors_without_repairing_or_skipping(

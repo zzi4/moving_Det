@@ -52,6 +52,8 @@ _METHOD_NAMES = (
     "multiscale",
     "multiscale_tubelet",
 )
+_Z_THRESHOLDS = (3.0, 4.0, 5.0, 6.0)
+_MOG2_VAR_THRESHOLDS = (9.0, 16.0, 25.0)
 _DEFAULT_MOVING_THRESHOLD = 3.0
 _PREVIEW_MAX_WIDTH = 960
 _PREVIEW_MAX_HEIGHT = 540
@@ -66,6 +68,31 @@ _GATE_LABELS = {
     "moving_frame_track_coverage": "Moving-frame track coverage",
     "mean_extra_fragments": "Mean extra fragments per GT track",
 }
+_PER_FRAME_FIELDS = (
+    "frame_index",
+    "is_primary",
+    "moving_gt_count",
+    "matched_gt_count_025",
+    "recall_025",
+    "matched_gt_count_050",
+    "recall_050",
+    "center_in_gt_count",
+    "center_in_gt_recall",
+    "mask_coverage_mean",
+    "difficult_moving_gt_count",
+    "proposal_count",
+    "false_proposal_count",
+)
+_PER_TRACK_FIELDS = (
+    "track_id",
+    "first_moving_frame",
+    "first_detection_frame",
+    "first_detection_delay_frames",
+    "moving_frame_count",
+    "detected_moving_frame_count",
+    "moving_frame_coverage",
+    "extra_tubelet_fragments",
+)
 
 
 @dataclass(frozen=True)
@@ -138,6 +165,28 @@ def _json_ready(value: object) -> object:
         return value
     if isinstance(value, Path):
         return str(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        if np.isnan(value):
+            raise ValueError("NaN cannot be serialized as strict JSON")
+        if np.isposinf(value):
+            return "Infinity"
+        if np.isneginf(value):
+            return "-Infinity"
+        converted = float(value)
+        if (
+            math.isfinite(converted)
+            and bool(type(value)(converted) == value)
+        ):
+            return converted
+        return np.format_float_scientific(
+            value,
+            unique=True,
+            trim="k",
+        )
     if isinstance(value, np.generic):
         return _json_ready(value.item())
     if isinstance(value, Real):
@@ -252,25 +301,32 @@ def _csv_value(value: object) -> object:
     return value
 
 
-def _write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+def _write_csv(
+    path: Path,
+    rows: Sequence[Mapping[str, object]],
+    field_names: Sequence[str],
+) -> None:
+    normalized_fields = tuple(field_names)
+    expected_fields = set(normalized_fields)
+    if (
+        not normalized_fields
+        or len(expected_fields) != len(normalized_fields)
+    ):
+        raise ValueError("CSV field schema must be non-empty and unique")
+    for row in rows:
+        if set(row) != expected_fields:
+            raise ValueError(
+                "CSV row schema does not match the fixed artifact schema"
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
-    field_names = tuple(
-        dict.fromkeys(
-            key
-            for row in rows
-            for key in row
-        )
-    )
     with path.open("w", encoding="utf-8", newline="") as stream:
-        if not field_names:
-            return
-        writer = csv.DictWriter(stream, fieldnames=field_names)
+        writer = csv.DictWriter(stream, fieldnames=normalized_fields)
         writer.writeheader()
         for row in rows:
             writer.writerow(
                 {
                     key: _csv_value(row.get(key, ""))
-                    for key in field_names
+                    for key in normalized_fields
                 }
             )
 
@@ -384,6 +440,21 @@ def _prepare_determinism(config: ExperimentConfig) -> None:
     cv2.setNumThreads(1)
 
 
+def _validate_fixed_candidates(config: ExperimentConfig) -> None:
+    if not isinstance(config, ExperimentConfig):
+        raise TypeError("config must be an ExperimentConfig")
+    if (
+        not isinstance(config.threshold_candidates, tuple)
+        or config.threshold_candidates != _Z_THRESHOLDS
+        or not isinstance(config.mog2_var_threshold_candidates, tuple)
+        or config.mog2_var_threshold_candidates != _MOG2_VAR_THRESHOLDS
+    ):
+        raise ValueError(
+            "configuration must use the fixed POC candidates "
+            f"{_Z_THRESHOLDS} and {_MOG2_VAR_THRESHOLDS}"
+        )
+
+
 def _validate_run_inputs(
     config: ExperimentConfig,
     sequence: SequenceData,
@@ -391,8 +462,7 @@ def _validate_run_inputs(
     scale: float,
     thresholds: Sequence[float],
 ) -> tuple[float, tuple[float, ...]]:
-    if not isinstance(config, ExperimentConfig):
-        raise TypeError("config must be an ExperimentConfig")
+    _validate_fixed_candidates(config)
     if not isinstance(sequence, SequenceData):
         raise TypeError("sequence must be a SequenceData")
     if method_name not in _METHOD_NAMES:
@@ -407,9 +477,9 @@ def _validate_run_inputs(
         raise ValueError("scale must be a configured finite scale")
 
     allowed = (
-        config.mog2_var_threshold_candidates
+        _MOG2_VAR_THRESHOLDS
         if method_name == "mog2"
-        else config.threshold_candidates
+        else _Z_THRESHOLDS
     )
     normalized = []
     for threshold in thresholds:
@@ -866,8 +936,16 @@ def _write_method_artifacts(
             "gates": {},
         },
     )
-    _write_csv(artifacts.per_frame_path, selected.report.per_frame)
-    _write_csv(artifacts.per_track_path, selected.report.per_track)
+    _write_csv(
+        artifacts.per_frame_path,
+        selected.report.per_frame,
+        _PER_FRAME_FIELDS,
+    )
+    _write_csv(
+        artifacts.per_track_path,
+        selected.report.per_track,
+        _PER_TRACK_FIELDS,
+    )
     _write_proposals(
         artifacts.proposals_path,
         selected.proposals_by_frame,
@@ -1022,13 +1100,16 @@ def _calibration_entry(
     return {
         "parameter_name": result.choice.candidate.parameter_name,
         "candidates": [
-            {
-                "parameter_value": candidate.threshold,
-                "recall_025": candidate.report.aggregate["recall_025"],
-                "fp_per_100_gt": candidate.report.aggregate[
-                    "false_proposals_per_100_moving_gt"
-                ],
-            }
+            CalibrationCandidate(
+                parameter_name=result.choice.candidate.parameter_name,
+                parameter_value=candidate.threshold,
+                recall_025=float(candidate.report.aggregate["recall_025"]),
+                fp_per_100_gt=float(
+                    candidate.report.aggregate[
+                        "false_proposals_per_100_moving_gt"
+                    ]
+                ),
+            )
             for candidate in result.candidates
         ],
         "selected": result.choice.candidate,
@@ -1040,6 +1121,7 @@ def calibrate(
     config: ExperimentConfig,
     output_dir: Path,
 ) -> Path:
+    _validate_fixed_candidates(config)
     from moving_det.data.labelme import load_sequence
 
     sequence_path = config.data_root / config.calibration_sequence
@@ -1061,7 +1143,7 @@ def calibrate(
                     method_names=(method_name,),
                     scale=scale,
                     thresholds_by_method={
-                        method_name: config.threshold_candidates,
+                        method_name: _Z_THRESHOLDS,
                     },
                     output_dirs={
                         method_name: stage
@@ -1077,7 +1159,7 @@ def calibrate(
                 method_names=("mog2",),
                 scale=scale,
                 thresholds_by_method={
-                    "mog2": config.mog2_var_threshold_candidates,
+                    "mog2": _MOG2_VAR_THRESHOLDS,
                 },
                 output_dirs={
                     "mog2": stage / _artifact_relative_path("mog2", scale),
@@ -1091,8 +1173,8 @@ def calibrate(
                 method_names=("multiscale", "multiscale_tubelet"),
                 scale=scale,
                 thresholds_by_method={
-                    "multiscale": config.threshold_candidates,
-                    "multiscale_tubelet": config.threshold_candidates,
+                    "multiscale": _Z_THRESHOLDS,
+                    "multiscale_tubelet": _Z_THRESHOLDS,
                 },
                 output_dirs={
                     method_name: stage
@@ -1134,17 +1216,157 @@ def calibrate(
             shutil.rmtree(work_root, ignore_errors=True)
 
 
+def _require_exact_keys(
+    value: Mapping[str, object],
+    expected: set[str],
+    context: str,
+) -> None:
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        details = []
+        if missing:
+            details.append(f"missing {missing}")
+        if unknown:
+            details.append(f"unknown {unknown}")
+        raise ValueError(f"{context} fields are invalid: {', '.join(details)}")
+
+
+def _frozen_number(
+    value: object,
+    field_name: str,
+    *,
+    minimum: float,
+    maximum: float | None = None,
+    allow_positive_infinity_string: bool = False,
+) -> float:
+    if allow_positive_infinity_string and value == "Infinity":
+        return math.inf
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+    ):
+        raise ValueError(
+            f"calibration {field_name} must use its expected numeric form"
+        )
+    converted = float(value)
+    if converted < minimum or (
+        maximum is not None and converted > maximum
+    ):
+        raise ValueError(f"calibration {field_name} is outside its valid range")
+    return converted
+
+
+def _validate_frozen_candidate(
+    candidate: object,
+    expected_parameter: str,
+    allowed_values: tuple[float, ...],
+) -> tuple[float, float, float]:
+    if not isinstance(candidate, dict):
+        raise ValueError("calibration candidate must be an object")
+    _require_exact_keys(
+        candidate,
+        {
+            "parameter_name",
+            "parameter_value",
+            "recall_025",
+            "fp_per_100_gt",
+        },
+        "calibration candidate",
+    )
+    if candidate["parameter_name"] != expected_parameter:
+        raise ValueError("calibration candidate parameter_name is invalid")
+    parameter_value = _frozen_number(
+        candidate["parameter_value"],
+        "parameter_value",
+        minimum=0.0,
+    )
+    if parameter_value not in allowed_values:
+        raise ValueError("calibration candidate value is not configured")
+    recall = _frozen_number(
+        candidate["recall_025"],
+        "recall_025",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    false_positive_rate = _frozen_number(
+        candidate["fp_per_100_gt"],
+        "fp_per_100_gt",
+        minimum=0.0,
+        allow_positive_infinity_string=True,
+    )
+    return parameter_value, recall, false_positive_rate
+
+
+def _same_json_record(
+    left: Mapping[str, object],
+    right: object,
+) -> bool:
+    if not isinstance(right, dict) or set(left) != set(right):
+        return False
+    return all(
+        type(left[key]) is type(right[key])
+        and left[key] == right[key]
+        for key in left
+    )
+
+
 def _frozen_selections(
     config: ExperimentConfig,
     calibration_path: Path,
 ) -> dict[str, dict[str, float]]:
+    _validate_fixed_candidates(config)
     payload = _load_strict_json(calibration_path)
     if not isinstance(payload, dict):
         raise ValueError("calibration must be a JSON object")
-    if payload.get("schema_version") != _SCHEMA_VERSION:
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "sequence_id",
+            "input_path",
+            "random_seed",
+            "scale_factors",
+            "methods",
+        },
+        "calibration top level",
+    )
+    schema_version = payload["schema_version"]
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != _SCHEMA_VERSION
+    ):
         raise ValueError("unsupported calibration schema_version")
-    if payload.get("sequence_id") != config.calibration_sequence:
+    if payload["sequence_id"] != config.calibration_sequence:
         raise ValueError("calibration sequence does not match configuration")
+    expected_input_path = str(
+        (config.data_root / config.calibration_sequence).resolve()
+    )
+    if payload["input_path"] != expected_input_path:
+        raise ValueError("calibration input_path does not match configuration")
+    random_seed = payload["random_seed"]
+    if (
+        isinstance(random_seed, bool)
+        or not isinstance(random_seed, int)
+        or random_seed != config.random_seed
+    ):
+        raise ValueError("calibration random_seed does not match configuration")
+    scale_factors = payload["scale_factors"]
+    if (
+        not isinstance(scale_factors, list)
+        or any(
+            isinstance(scale, bool)
+            or not isinstance(scale, (int, float))
+            or not math.isfinite(float(scale))
+            for scale in scale_factors
+        )
+        or tuple(float(scale) for scale in scale_factors)
+        != tuple(float(scale) for scale in config.scale_factors)
+    ):
+        raise ValueError("calibration scale_factors do not match configuration")
     methods = payload.get("methods")
     if not isinstance(methods, dict) or set(methods) != set(_METHOD_NAMES):
         raise ValueError("calibration must contain every configured method")
@@ -1162,9 +1384,9 @@ def _frozen_selections(
             )
         selections[method_name] = {}
         allowed = (
-            config.mog2_var_threshold_candidates
+            _MOG2_VAR_THRESHOLDS
             if method_name == "mog2"
-            else config.threshold_candidates
+            else _Z_THRESHOLDS
         )
         expected_parameter = (
             "varThreshold" if method_name == "mog2" else "z_threshold"
@@ -1172,20 +1394,69 @@ def _frozen_selections(
         for scale_key, entry in by_scale.items():
             if not isinstance(entry, dict):
                 raise ValueError("calibration method/scale entry must be an object")
-            if entry.get("parameter_name") != expected_parameter:
+            _require_exact_keys(
+                entry,
+                {
+                    "parameter_name",
+                    "candidates",
+                    "selected",
+                    "constraint_satisfied",
+                },
+                "calibration method/scale entry",
+            )
+            if entry["parameter_name"] != expected_parameter:
                 raise ValueError("calibration parameter_name is invalid")
-            selected = entry.get("selected")
+            candidates = entry["candidates"]
+            if not isinstance(candidates, list):
+                raise ValueError("calibration candidates must be a list")
+            validated_candidates = tuple(
+                _validate_frozen_candidate(
+                    candidate,
+                    expected_parameter,
+                    allowed,
+                )
+                for candidate in candidates
+            )
+            if tuple(
+                candidate[0]
+                for candidate in validated_candidates
+            ) != allowed:
+                raise ValueError(
+                    "calibration candidates must contain the fixed values "
+                    "in deterministic order"
+                )
+            selected = entry["selected"]
             if not isinstance(selected, dict):
                 raise ValueError("calibration selected value is missing")
-            value = selected.get("parameter_value")
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, Real)
-                or not math.isfinite(float(value))
-                or float(value) not in allowed
+            selected_record = _validate_frozen_candidate(
+                selected,
+                expected_parameter,
+                allowed,
+            )
+            if not any(
+                _same_json_record(selected, candidate)
+                for candidate in candidates
             ):
-                raise ValueError("calibration selected value is not configured")
-            selections[method_name][scale_key] = float(value)
+                raise ValueError(
+                    "calibration selected candidate is not present exactly "
+                    "in candidates"
+                )
+            constraint_satisfied = entry["constraint_satisfied"]
+            if not isinstance(constraint_satisfied, bool):
+                raise ValueError(
+                    "calibration constraint_satisfied must be a boolean"
+                )
+            selected_fp = selected_record[2]
+            expected_constraint = (
+                math.isfinite(selected_fp)
+                and selected_fp <= config.max_false_proposals_per_100_gt
+            )
+            if constraint_satisfied != expected_constraint:
+                raise ValueError(
+                    "calibration constraint_satisfied conflicts with selected "
+                    "candidate"
+                )
+            selections[method_name][scale_key] = selected_record[0]
     return selections
 
 
@@ -1282,6 +1553,7 @@ def evaluate(
     calibration_path: Path,
     output_dir: Path,
 ) -> Path:
+    _validate_fixed_candidates(config)
     from moving_det.data.labelme import load_sequence
 
     calibration_path = Path(calibration_path)
