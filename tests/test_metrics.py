@@ -1,5 +1,7 @@
 import math
 from dataclasses import replace
+from fractions import Fraction
+from numbers import Real
 from pathlib import Path
 
 import numpy as np
@@ -365,6 +367,146 @@ def test_calibration_choice_is_independent_of_candidate_input_order():
     )
 
     assert forward == reverse == CalibrationChoice(candidates[1], True)
+
+
+@pytest.mark.parametrize(
+    ("lower_parameter", "higher_parameter"),
+    [
+        (2**53, 2**53 + 1),
+        (np.int64(2**53), np.int64(2**53 + 1)),
+        (np.longdouble(str(2**53)), np.longdouble(str(2**53 + 1))),
+    ],
+    ids=["python-int", "numpy-int64", "numpy-longdouble"],
+)
+def test_calibration_parameter_order_preserves_adjacent_large_real_values(
+    lower_parameter,
+    higher_parameter,
+):
+    candidates = [
+        CalibrationCandidate("z_threshold", higher_parameter, 0.9, 10),
+        CalibrationCandidate("z_threshold", lower_parameter, 0.9, 10),
+    ]
+
+    forward = select_calibration_result(candidates, max_fp_per_100_gt=25)
+    reverse = select_calibration_result(
+        list(reversed(candidates)),
+        max_fp_per_100_gt=25,
+    )
+
+    assert forward == reverse == CalibrationChoice(candidates[1], True)
+
+
+def test_calibration_recall_order_preserves_adjacent_exact_fractions():
+    denominator = 2**54
+    lower_recall = Fraction(2**53, denominator)
+    higher_recall = Fraction(2**53 + 1, denominator)
+    candidates = [
+        CalibrationCandidate("z_threshold", 4, lower_recall, 10),
+        CalibrationCandidate("z_threshold", 5, higher_recall, 10),
+    ]
+
+    forward = select_calibration_result(candidates, max_fp_per_100_gt=25)
+    reverse = select_calibration_result(
+        list(reversed(candidates)),
+        max_fp_per_100_gt=25,
+    )
+
+    assert forward == reverse == CalibrationChoice(candidates[1], True)
+
+
+def test_calibration_fp_order_preserves_adjacent_exact_fractions():
+    denominator = 2**53
+    lower_fp = Fraction(2**53, denominator)
+    higher_fp = Fraction(2**53 + 1, denominator)
+    candidates = [
+        CalibrationCandidate("z_threshold", 4, 0.9, higher_fp),
+        CalibrationCandidate("z_threshold", 5, 0.9, lower_fp),
+    ]
+
+    forward = select_calibration_result(candidates, max_fp_per_100_gt=25)
+    reverse = select_calibration_result(
+        list(reversed(candidates)),
+        max_fp_per_100_gt=25,
+    )
+
+    assert forward == reverse == CalibrationChoice(candidates[1], True)
+
+
+def test_calibration_constraint_uses_exact_fraction_comparison():
+    just_above_one = Fraction(2**53 + 1, 2**53)
+    candidate = CalibrationCandidate(
+        "z_threshold",
+        4,
+        0.9,
+        just_above_one,
+    )
+
+    choice = select_calibration_result(
+        [candidate],
+        max_fp_per_100_gt=1,
+    )
+
+    assert choice == CalibrationChoice(candidate, constraint_satisfied=False)
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (Fraction(4, 1), 4),
+        (4.0, np.int64(4)),
+        (Fraction(1, 2), np.float64(0.5)),
+        (np.longdouble("0.5"), 0.5),
+    ],
+    ids=["fraction-int", "float-numpy-int", "fraction-numpy-float", "longdouble-float"],
+)
+def test_calibration_rejects_numerically_duplicate_parameter_aliases(
+    left,
+    right,
+):
+    candidates = [
+        CalibrationCandidate("z_threshold", left, 0.9, 10),
+        CalibrationCandidate("z_threshold", right, 0.8, 5),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate calibration parameter"):
+        select_calibration_result(candidates, max_fp_per_100_gt=25)
+    with pytest.raises(ValueError, match="duplicate calibration parameter"):
+        select_calibration_result(
+            list(reversed(candidates)),
+            max_fp_per_100_gt=25,
+        )
+
+
+def test_calibration_rejects_repeated_candidate_object_in_either_order():
+    candidate = CalibrationCandidate("z_threshold", 4, 0.9, 10)
+    other = CalibrationCandidate("z_threshold", 5, 0.8, 5)
+
+    for candidates in (
+        [candidate, other, candidate],
+        [candidate, other, candidate][::-1],
+    ):
+        with pytest.raises(ValueError, match="duplicate calibration parameter"):
+            select_calibration_result(candidates, max_fp_per_100_gt=25)
+
+
+class _FloatOnlyReal:
+    def __float__(self):
+        return 4.0
+
+
+Real.register(_FloatOnlyReal)
+
+
+def test_calibration_rejects_real_without_safe_exact_representation():
+    candidate = CalibrationCandidate(
+        "z_threshold",
+        _FloatOnlyReal(),
+        0.9,
+        10,
+    )
+
+    with pytest.raises(ValueError, match="parameter_value"):
+        select_calibration_result([candidate], max_fp_per_100_gt=25)
 
 
 def test_evaluation_uses_only_core_frames_for_primary_metrics():

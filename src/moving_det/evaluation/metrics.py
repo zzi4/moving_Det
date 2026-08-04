@@ -2,6 +2,7 @@ import math
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from numbers import Real
 from types import MappingProxyType
 
@@ -688,23 +689,23 @@ def select_calibration_result(
     candidates = tuple(results)
     if not candidates:
         raise ValueError("at least one calibration candidate is required")
-    if (
-        isinstance(max_fp_per_100_gt, bool)
-        or not isinstance(max_fp_per_100_gt, Real)
-    ):
-        raise ValueError("false-positive constraint must be finite and non-negative")
-    try:
-        normalized_constraint = float(max_fp_per_100_gt)
-    except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError(
-            "false-positive constraint must be finite and non-negative"
-        ) from exc
-    if not math.isfinite(normalized_constraint) or normalized_constraint < 0:
+    normalized_constraint = _exact_real(
+        max_fp_per_100_gt,
+        "false-positive constraint",
+    )
+    assert normalized_constraint is not None
+    if normalized_constraint < 0:
         raise ValueError("false-positive constraint must be finite and non-negative")
 
     validated: list[
-        tuple[CalibrationCandidate, float, float, float]
+        tuple[
+            CalibrationCandidate,
+            Fraction,
+            Fraction,
+            Fraction | None,
+        ]
     ] = []
+    parameter_keys: set[tuple[str, Fraction]] = set()
     for candidate in candidates:
         if not isinstance(candidate, CalibrationCandidate):
             raise ValueError("results must contain CalibrationCandidate values")
@@ -713,48 +714,29 @@ def select_calibration_result(
             or not candidate.parameter_name
         ):
             raise ValueError("parameter_name must be a non-empty string")
-        if (
-            isinstance(candidate.parameter_value, bool)
-            or not isinstance(candidate.parameter_value, Real)
-        ):
-            raise ValueError("parameter_value must be a finite real number")
-        try:
-            parameter_value = float(candidate.parameter_value)
-        except (OverflowError, TypeError, ValueError) as exc:
+        parameter_value = _exact_real(
+            candidate.parameter_value,
+            "parameter_value",
+        )
+        assert parameter_value is not None
+        parameter_key = (candidate.parameter_name, parameter_value)
+        if parameter_key in parameter_keys:
             raise ValueError(
-                "parameter_value must be a finite real number"
-            ) from exc
-        if not math.isfinite(parameter_value):
-            raise ValueError("parameter_value must be a finite real number")
-
-        if (
-            isinstance(candidate.recall_025, bool)
-            or not isinstance(candidate.recall_025, Real)
-        ):
-            raise ValueError("recall_025 must be finite and within [0, 1]")
-        try:
-            recall = float(candidate.recall_025)
-        except (OverflowError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "recall_025 must be finite and within [0, 1]"
-            ) from exc
-        if not math.isfinite(recall) or not 0.0 <= recall <= 1.0:
-            raise ValueError("recall_025 must be finite and within [0, 1]")
-
-        if (
-            isinstance(candidate.fp_per_100_gt, bool)
-            or not isinstance(candidate.fp_per_100_gt, Real)
-        ):
-            raise ValueError(
-                "fp_per_100_gt must be non-negative and not NaN or -inf"
+                "duplicate calibration parameter_name/parameter_value"
             )
-        try:
-            fp_per_100_gt = float(candidate.fp_per_100_gt)
-        except (OverflowError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "fp_per_100_gt must be non-negative and not NaN or -inf"
-            ) from exc
-        if math.isnan(fp_per_100_gt) or fp_per_100_gt < 0:
+        parameter_keys.add(parameter_key)
+
+        recall = _exact_real(candidate.recall_025, "recall_025")
+        assert recall is not None
+        if not 0 <= recall <= 1:
+            raise ValueError("recall_025 must be finite and within [0, 1]")
+
+        fp_per_100_gt = _exact_real(
+            candidate.fp_per_100_gt,
+            "fp_per_100_gt",
+            allow_positive_infinity=True,
+        )
+        if fp_per_100_gt is not None and fp_per_100_gt < 0:
             raise ValueError(
                 "fp_per_100_gt must be non-negative and not NaN or -inf"
             )
@@ -765,7 +747,7 @@ def select_calibration_result(
     feasible = [
         item
         for item in validated
-        if item[3] <= normalized_constraint
+        if item[3] is not None and item[3] <= normalized_constraint
     ]
     if feasible:
         selected = min(
@@ -782,10 +764,46 @@ def select_calibration_result(
     selected = min(
         validated,
         key=lambda item: (
-            item[3],
+            item[3] is None,
+            item[3] if item[3] is not None else Fraction(0),
             -item[2],
             item[0].parameter_name,
             item[1],
         ),
     )
     return CalibrationChoice(selected[0], False)
+
+
+def _exact_real(
+    value: object,
+    field_name: str,
+    *,
+    allow_positive_infinity: bool = False,
+) -> Fraction | None:
+    message = f"{field_name} must be a safely representable finite real number"
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(message)
+    try:
+        if bool(value != value):
+            raise ValueError(message)
+        if bool(value == math.inf):
+            if allow_positive_infinity:
+                return None
+            raise ValueError(message)
+        if bool(value == -math.inf):
+            raise ValueError(message)
+    except (TypeError, ValueError, OverflowError) as exc:
+        if isinstance(exc, ValueError) and str(exc) == message:
+            raise
+        raise ValueError(message) from exc
+
+    ratio_method = getattr(value, "as_integer_ratio", None)
+    try:
+        if callable(ratio_method):
+            numerator, denominator = ratio_method()
+            exact = Fraction(numerator, denominator)
+        else:
+            exact = Fraction(value)
+    except (ArithmeticError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    return exact
