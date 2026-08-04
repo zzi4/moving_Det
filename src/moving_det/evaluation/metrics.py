@@ -199,6 +199,66 @@ def _center_in_obb(cx: float, cy: float, obb: OBB) -> bool:
     )
 
 
+def _proposal_centers(proposals: Sequence[Proposal]) -> np.ndarray:
+    centers = np.empty((len(proposals), 2), dtype=np.float64)
+    for index, candidate in enumerate(proposals):
+        try:
+            centers[index] = (candidate.obb.cx, candidate.obb.cy)
+        except (TypeError, ValueError, OverflowError):
+            centers[index] = (math.nan, math.nan)
+    return centers
+
+
+def _proposal_center_hit(
+    annotation: Annotation,
+    proposals: Sequence[Proposal],
+    centers: np.ndarray,
+) -> bool:
+    if centers.shape != (len(proposals), 2):
+        raise ValueError("proposal centers must have shape (proposal count, 2)")
+    obb = annotation.obb
+    if not _center_in_obb(obb.cx, obb.cy, obb):
+        return False
+    try:
+        points = np.asarray(obb_to_points(obb), dtype=np.float64)
+    except (TypeError, ValueError, OverflowError):
+        points = np.empty((0, 2), dtype=np.float64)
+    if points.shape != (4, 2) or not np.isfinite(points).all():
+        candidate_indices = range(len(proposals))
+    else:
+        magnitude = max(
+            1.0,
+            abs(obb.cx),
+            abs(obb.cy),
+            abs(obb.width),
+            abs(obb.height),
+        )
+        margin = np.finfo(np.float64).eps * magnitude * 64
+        minimum = np.nextafter(
+            np.min(points, axis=0) - margin,
+            -np.inf,
+        )
+        maximum = np.nextafter(
+            np.max(points, axis=0) + margin,
+            np.inf,
+        )
+        candidate_indices = np.flatnonzero(
+            np.isfinite(centers).all(axis=1)
+            & (centers[:, 0] >= minimum[0])
+            & (centers[:, 0] <= maximum[0])
+            & (centers[:, 1] >= minimum[1])
+            & (centers[:, 1] <= maximum[1])
+        )
+    return any(
+        _center_in_obb(
+            proposals[int(index)].obb.cx,
+            proposals[int(index)].obb.cy,
+            obb,
+        )
+        for index in candidate_indices
+    )
+
+
 def _proposal_is_ignored(
     candidate: Proposal,
     polygons: Sequence[Sequence[Sequence[float]]],
@@ -255,15 +315,29 @@ def _mask_coverage(
 ) -> float:
     if mask is None:
         return 0.0
-    target_mask = np.zeros(expected_shape, dtype=np.uint8)
     points = np.rint(obb_to_points(scale_obb(annotation.obb, scale))).astype(
         np.int32
     )
-    cv2.fillPoly(target_mask, [points], color=1)
+    expected_height, expected_width = expected_shape
+    x_min = max(0, int(np.min(points[:, 0])))
+    x_max = min(expected_width - 1, int(np.max(points[:, 0])))
+    y_min = max(0, int(np.min(points[:, 1])))
+    y_max = min(expected_height - 1, int(np.max(points[:, 1])))
+    if x_min > x_max or y_min > y_max:
+        return 0.0
+    target_mask = np.zeros(
+        (y_max - y_min + 1, x_max - x_min + 1),
+        dtype=np.uint8,
+    )
+    local_points = points - np.asarray((x_min, y_min), dtype=np.int32)
+    cv2.fillPoly(target_mask, [local_points], color=1)
     target_area = int(np.count_nonzero(target_mask))
     if target_area == 0:
         return 0.0
-    covered = np.count_nonzero(np.logical_and(target_mask, mask != 0))
+    mask_roi = mask[y_min : y_max + 1, x_min : x_max + 1]
+    covered = np.count_nonzero(
+        np.logical_and(target_mask, mask_roi != 0)
+    )
     return float(covered / target_area)
 
 
@@ -507,6 +581,7 @@ def evaluate_sequence(
             scale,
             frame.ignore_polygons,
         )
+        proposal_centers = _proposal_centers(proposals)
         mask = masks_by_frame.get(frame_index)
 
         primary_matches = _match_frame_thresholds(
@@ -575,13 +650,10 @@ def evaluate_sequence(
                         expected_shape,
                         scale,
                     ),
-                    "center_hit": any(
-                        _center_in_obb(
-                            candidate.obb.cx,
-                            candidate.obb.cy,
-                            annotation.obb,
-                        )
-                        for candidate in proposals
+                    "center_hit": _proposal_center_hit(
+                        annotation,
+                        proposals,
+                        proposal_centers,
                     ),
                     "matched": {
                         threshold: gt_index in primary_pair_maps[threshold]

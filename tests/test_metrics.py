@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 import moving_det.evaluation.matching as matching_module
+import moving_det.evaluation.metrics as metrics_module
 from moving_det.evaluation import (
     CalibrationCandidate,
     CalibrationChoice,
@@ -18,6 +19,36 @@ from moving_det.evaluation import (
 )
 from moving_det.models import FrameSample, OBB, SequenceData
 from tests.helpers import ann, proposal
+
+
+def _full_frame_mask_coverage(annotation, mask, expected_shape, scale):
+    if mask is None:
+        return 0.0
+    target_mask = np.zeros(expected_shape, dtype=np.uint8)
+    points = np.rint(
+        metrics_module.obb_to_points(
+            metrics_module.scale_obb(annotation.obb, scale)
+        )
+    ).astype(np.int32)
+    metrics_module.cv2.fillPoly(target_mask, [points], color=1)
+    target_area = int(np.count_nonzero(target_mask))
+    if target_area == 0:
+        return 0.0
+    covered = np.count_nonzero(
+        np.logical_and(target_mask, mask != 0)
+    )
+    return float(covered / target_area)
+
+
+def _brute_force_center_hit(annotation, proposals):
+    return any(
+        metrics_module._center_in_obb(
+            candidate.obb.cx,
+            candidate.obb.cy,
+            annotation.obb,
+        )
+        for candidate in proposals
+    )
 
 
 def _brute_force_match_frame(gt, proposals, iou_threshold):
@@ -115,6 +146,252 @@ def _moving_evaluation_sequence():
         23: (ann(track=1, cx=17),),
     }
     return _sequence(annotations)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_mask_coverage_roi_matches_full_frame_reference_exactly(seed):
+    rng = np.random.default_rng(seed)
+    annotations = [
+        ann(track=1, cx=-50, cy=-40, width=8, height=4),
+        ann(track=2, cx=0, cy=0, width=1, height=1),
+        ann(
+            track=3,
+            cx=108,
+            cy=72,
+            width=20,
+            height=7,
+            theta=math.pi / 4,
+        ),
+        ann(track=4, cx=54, cy=36, width=500, height=300, theta=0.3),
+        ann(track=5, cx=54, cy=36, width=0, height=0, theta=1.2),
+    ]
+    annotations.extend(
+        ann(
+            track=index + 10,
+            cx=float(rng.uniform(-150, 250)),
+            cy=float(rng.uniform(-100, 180)),
+            width=float(rng.uniform(0, 250)),
+            height=float(rng.uniform(0, 180)),
+            theta=float(rng.uniform(-math.pi, math.pi)),
+        )
+        for index in range(30)
+    )
+
+    for expected_shape, scale in (((73, 109), 1.0), ((51, 76), 0.7)):
+        base = rng.integers(
+            0,
+            5,
+            size=(expected_shape[0], expected_shape[1] * 2),
+            dtype=np.uint8,
+        )
+        mask = base[:, ::2]
+        assert mask.shape == expected_shape
+        assert not mask.flags.c_contiguous
+
+        for annotation in annotations:
+            expected = _full_frame_mask_coverage(
+                annotation,
+                mask,
+                expected_shape,
+                scale,
+            )
+            actual = metrics_module._mask_coverage(
+                annotation,
+                mask,
+                expected_shape,
+                scale,
+            )
+
+            assert actual == expected
+
+    assert metrics_module._mask_coverage(
+        annotations[0],
+        None,
+        (73, 109),
+        1.0,
+    ) == 0.0
+
+
+def test_mask_coverage_does_not_allocate_a_full_frame_target(monkeypatch):
+    expected_shape = (1024, 2048)
+    mask = np.ones(expected_shape, dtype=np.uint8)
+    annotation = ann(
+        track=1,
+        cx=100,
+        cy=100,
+        width=12,
+        height=6,
+        theta=0.4,
+    )
+    allocated_shapes = []
+    original_zeros = np.zeros
+
+    def recording_zeros(shape, *args, **kwargs):
+        normalized_shape = tuple(int(value) for value in shape)
+        allocated_shapes.append(normalized_shape)
+        assert normalized_shape != expected_shape
+        return original_zeros(shape, *args, **kwargs)
+
+    monkeypatch.setattr(metrics_module.np, "zeros", recording_zeros)
+
+    coverage = metrics_module._mask_coverage(
+        annotation,
+        mask,
+        expected_shape,
+        1.0,
+    )
+
+    assert coverage == 1.0
+    assert allocated_shapes
+    assert max(height * width for height, width in allocated_shapes) < 1000
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_center_prefilter_matches_brute_force_reference_exactly(seed):
+    rng = np.random.default_rng(seed)
+    annotations = [
+        ann(track=1, cx=0, cy=0, width=10, height=4, theta=0),
+        ann(
+            track=2,
+            cx=25,
+            cy=-10,
+            width=16,
+            height=3,
+            theta=math.pi / 3,
+        ),
+        ann(track=3, cx=5, cy=5, width=0, height=2, theta=0),
+        ann(track=4, cx=5, cy=5, width=2, height=0, theta=0),
+        ann(track=5, cx=5, cy=5, width=2, height=2, theta=float("nan")),
+    ]
+    annotations.extend(
+        ann(
+            track=index + 10,
+            cx=float(rng.uniform(-200, 200)),
+            cy=float(rng.uniform(-200, 200)),
+            width=float(rng.uniform(0.1, 80)),
+            height=float(rng.uniform(0.1, 40)),
+            theta=float(rng.uniform(-math.pi / 2, math.pi / 2)),
+        )
+        for index in range(30)
+    )
+    proposals = [
+        proposal(
+            cx=float(rng.uniform(-2000, 2000)),
+            cy=float(rng.uniform(-2000, 2000)),
+            tubelet_id=index + 1,
+        )
+        for index in range(300)
+    ]
+    boundary_annotation = annotations[0]
+    proposals.extend(
+        [
+            proposal(cx=5, cy=0, tubelet_id=1001),
+            proposal(
+                cx=math.nextafter(5.0, math.inf),
+                cy=0,
+                tubelet_id=1002,
+            ),
+            proposal(cx=float("nan"), cy=0, tubelet_id=1003),
+            proposal(cx=float("inf"), cy=0, tubelet_id=1004),
+        ]
+    )
+    proposals = tuple(proposals)
+    centers = metrics_module._proposal_centers(proposals)
+
+    assert centers.shape == (len(proposals), 2)
+    assert metrics_module._proposal_center_hit(
+        boundary_annotation,
+        proposals,
+        centers,
+    ) is True
+    for annotation in annotations:
+        assert metrics_module._proposal_center_hit(
+            annotation,
+            proposals,
+            centers,
+        ) is _brute_force_center_hit(annotation, proposals)
+
+
+def test_center_prefilter_avoids_sparse_cartesian_predicates(monkeypatch):
+    count = 160
+    annotations = tuple(
+        ann(
+            track=index + 1,
+            cx=index * 1000,
+            cy=index * 1000,
+            width=20,
+            height=8,
+            theta=0.3,
+        )
+        for index in range(count)
+    )
+    proposals = tuple(
+        proposal(
+            cx=index * 1000,
+            cy=index * 1000,
+            tubelet_id=index + 1,
+        )
+        for index in range(count)
+    )
+    centers = metrics_module._proposal_centers(proposals)
+    call_count = 0
+    original = metrics_module._center_in_obb
+
+    def counting_center_in_obb(cx, cy, obb):
+        nonlocal call_count
+        call_count += 1
+        return original(cx, cy, obb)
+
+    monkeypatch.setattr(
+        metrics_module,
+        "_center_in_obb",
+        counting_center_in_obb,
+    )
+
+    hits = tuple(
+        metrics_module._proposal_center_hit(
+            annotation,
+            proposals,
+            centers,
+        )
+        for annotation in annotations
+    )
+
+    assert all(hits)
+    assert call_count <= count * 2
+    assert call_count < len(annotations) * len(proposals) // 20
+
+
+def test_evaluation_extracts_proposal_centers_once_per_frame(monkeypatch):
+    sequence = _moving_evaluation_sequence()
+    proposals = {
+        16: (proposal(cx=10, frame=16, tubelet_id=10),),
+        17: (proposal(cx=11, frame=17, tubelet_id=10),),
+    }
+    call_count = 0
+    original = metrics_module._proposal_centers
+
+    def counting_proposal_centers(frame_proposals):
+        nonlocal call_count
+        call_count += 1
+        return original(frame_proposals)
+
+    monkeypatch.setattr(
+        metrics_module,
+        "_proposal_centers",
+        counting_proposal_centers,
+    )
+
+    evaluate_sequence(
+        sequence,
+        proposals_by_frame=proposals,
+        masks_by_frame={},
+        moving_threshold=3.0,
+        iou_thresholds=(0.25, 0.5),
+        scale=1.0,
+    )
+
+    assert call_count == len(sequence.frames)
 
 
 def test_five_frame_motion_filter_excludes_stationary_track(
