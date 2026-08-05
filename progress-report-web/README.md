@@ -6,18 +6,18 @@
 
 ```bash
 cd /home/stu1/Projects/moving_Det/.worktrees/motion-evidence-poc/progress-report-web
-npm run lan
+MOVING_DET_LAN_HOST=59.72.89.57 npm run lan
 ```
 
-保持这个终端窗口运行。服务默认监听 `0.0.0.0:8787`。
+保持这个终端窗口运行。当前机器没有物理网卡上的 RFC1918 地址，因此必须显式指定受控校园网地址；服务只绑定该网卡的 `8787` 端口，不绑定 Docker 网桥。
 
 另开一个终端查看访问地址：
 
 ```bash
-npm run lan:url
+MOVING_DET_LAN_HOST=59.72.89.57 npm run lan:url
 ```
 
-本机使用 `http://127.0.0.1:8787`，同一局域网内的其他设备使用脚本输出的局域网地址。
+同一校园网内的设备使用脚本输出的地址。`59.72.89.57` 不是 RFC1918 私有地址，启动脚本会显示暴露风险警告；应通过校园网边界或主机防火墙确保只有可信设备能够访问。
 
 ## 停止
 

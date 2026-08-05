@@ -1,4 +1,5 @@
 import { LiveCalibration } from "./components/live-calibration";
+import { EvidenceImage } from "./components/evidence-image";
 import {
   calibrationRows,
   conditions,
@@ -394,17 +395,25 @@ export default function Home() {
           />
 
           <figure className="evidence-figure">
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src="/evidence/comparison.png"
-              alt="上一帧、当前帧及下一帧的标注可视化对比"
-            />
+            <EvidenceImage />
             <figcaption>
               三帧对比图：上一帧 / 当前帧标注 / 下一帧
             </figcaption>
           </figure>
 
           <div className="artifact-links">
+            <a
+              href="/evidence/comparison-original.png"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <span>4K</span>
+              <div>
+                <strong>打开 41 MiB 原始对比图</strong>
+                <small>3840 × 6480 PNG · 按需加载</small>
+              </div>
+              <b aria-hidden="true">↗</b>
+            </a>
             <a href="/evidence/report.md" target="_blank" rel="noreferrer">
               <span>MD</span>
               <div>
@@ -420,7 +429,7 @@ export default function Home() {
               <div>
                 <strong>Calibration staging</strong>
                 <code>
-                  /home/stu1/Projects/moving_Det/.worktrees/motion-evidence-poc/runs/.poc-calibration.suv1ene2
+                  /home/stu1/Projects/moving_Det/.worktrees/motion-evidence-poc/runs/poc-calibration
                 </code>
               </div>
             </div>

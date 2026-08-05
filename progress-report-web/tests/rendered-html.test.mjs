@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, readFile } from "node:fs/promises";
+import { access, readFile, stat } from "node:fs/promises";
 import test from "node:test";
 
 async function render() {
@@ -46,6 +46,20 @@ test("server-renders the complete Chinese progress report", async () => {
   assert.match(html, /id="risks"/);
   assert.match(html, /id="next"/);
   assert.match(html, /id="evidence"/);
+  assert.match(html, /src="\/evidence\/comparison\.webp"/);
+  assert.match(html, /href="\/evidence\/comparison-original\.png"/);
+});
+
+test("ships a lightweight evidence preview", async () => {
+  const preview = new URL(
+    "../public/evidence/comparison.webp",
+    import.meta.url,
+  );
+  const previewStat = await stat(preview);
+  assert.ok(
+    previewStat.size < 2 * 1024 * 1024,
+    `preview is ${previewStat.size} bytes`,
+  );
 });
 
 test("removes starter preview and exposes the live status shell", async () => {

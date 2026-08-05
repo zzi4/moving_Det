@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { mergeStatusState } from "./live-status-state.mjs";
 
 type CalibrationState =
   | "running"
@@ -50,8 +51,10 @@ function formatBytes(bytes: number | null) {
 }
 
 export function LiveCalibration() {
-  const [status, setStatus] = useState<CalibrationStatus | null>(null);
-  const [refreshError, setRefreshError] = useState(false);
+  const [view, setView] = useState<{
+    snapshot: CalibrationStatus | null;
+    issue: string | null;
+  }>({ snapshot: null, issue: null });
 
   useEffect(() => {
     let active = true;
@@ -62,11 +65,15 @@ export function LiveCalibration() {
         if (!response.ok) throw new Error(String(response.status));
         const next = (await response.json()) as CalibrationStatus;
         if (active) {
-          setStatus(next);
-          setRefreshError(false);
+          setView((current) => mergeStatusState(current, next));
         }
       } catch {
-        if (active) setRefreshError(true);
+        if (active) {
+          setView((current) => ({
+            ...current,
+            issue: "实时状态刷新失败，正在保留上一次有效结果。",
+          }));
+        }
       }
     };
 
@@ -78,7 +85,8 @@ export function LiveCalibration() {
     };
   }, []);
 
-  const state = stateCopy[status?.state ?? "stopped"];
+  const status = view.snapshot;
+  const state = stateCopy[view.issue ? "unavailable" : status?.state ?? "stopped"];
   const frameProgress =
     status?.latest_frame && status.total_frames
       ? Math.min(100, (status.latest_frame / status.total_frames) * 100)
@@ -89,7 +97,7 @@ export function LiveCalibration() {
       <div className="live-heading">
         <div>
           <p className="micro-label">LIVE CALIBRATION</p>
-          <h2>{status?.message ?? "正在读取实时状态…"}</h2>
+          <h2>{view.issue ?? status?.message ?? "正在读取实时状态…"}</h2>
         </div>
         <span className={`status-badge ${state.tone}`}>
           <span className="status-dot" aria-hidden="true" />
@@ -140,8 +148,10 @@ export function LiveCalibration() {
       </div>
 
       <p className="live-footnote">
-        {refreshError
-          ? "本次刷新失败，页面保留上一次有效状态。"
+        {view.issue
+          ? status?.state === "unavailable"
+            ? "尚未取得有效状态；报告正文不受影响。"
+            : "状态暂时不可用，以下指标保留自上一次有效刷新。"
           : status
             ? `最近刷新：${new Date(status.updated_at).toLocaleTimeString(
                 "zh-CN",

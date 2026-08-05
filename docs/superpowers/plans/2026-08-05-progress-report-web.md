@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 页面默认监听 `0.0.0.0:8787`，供同一局域网设备访问。
+- 页面只绑定物理网卡上的 RFC1918 地址；校园网可路由地址必须通过 `MOVING_DET_LAN_HOST` 显式确认后绑定 `8787`。
 - 状态约每 10 秒刷新；自动刷新失败时保留上一次有效状态。
 - 页面和服务只读，不启动、停止、修改或修补实验及标注。
 - 报告数字必须区分十帧 smoke、calibration 中间结果和尚未运行的 frozen evaluation。
@@ -32,7 +32,7 @@
 - Consumes: `createStatusSnapshot({ worktreePath, now? })` 接收固定 worktree 根目录和可选时间。
 - Produces: `CalibrationStatus`，包含 `state`、时间、进程资源、当前方法/尺度/帧、计算组和说明文本。
 - Produces: `GET /api/status`，返回 `application/json; charset=utf-8`。
-- Produces: `GET /evidence/comparison.png` 和 `GET /evidence/report.md` 两个固定只读证据入口。
+- Produces: `GET /evidence/comparison.webp` 轻量预览、`GET /evidence/comparison-original.png` 原图和 `GET /evidence/report.md` 三个固定只读证据入口。
 
 - [x] **Step 1: 写状态模块失败测试**
 
@@ -106,7 +106,7 @@ function localReportApi(): Plugin {
 }
 ```
 
-同时为两个固定证据路径返回文件；拒绝所有其他 `/evidence/*` 路径。将 Vite server 配置为 `host: "0.0.0.0"`、`port: 8787`、`strictPort: true`。
+同时为两个固定证据路径返回文件；拒绝所有其他 `/evidence/*` 路径。启动脚本把已确认的物理网卡地址传给 vinext 的 `--hostname`，并固定 `port: 8787`。
 
 - [x] **Step 5: 运行状态测试**
 
@@ -232,7 +232,7 @@ git commit -m "feat: add LAN progress report dashboard"
 - Modify: `progress-report-web/README.md`
 
 **Interfaces:**
-- Produces: `npm run lan`，启动监听 `0.0.0.0:8787` 的报告服务。
+- Produces: `npm run lan`，启动监听已确认物理网卡地址 `:8787` 的报告服务。
 - Produces: `npm run lan:url`，输出本机地址和可用的 RFC1918 局域网 URL。
 
 - [x] **Step 1: 写局域网地址选择失败测试**
@@ -268,7 +268,7 @@ export function chooseLanAddress(interfaces) {
 }
 ```
 
-`npm run lan` 使用和开发服务相同的 `0.0.0.0:8787` 配置；README 只列出启动、停止和访问方式。
+`npm run lan` 自动选择物理网卡上的 RFC1918 地址；若只有校园网可路由地址，则要求显式设置 `MOVING_DET_LAN_HOST` 并显示风险警告。README 只列出启动、停止和访问方式。
 
 - [x] **Step 4: 运行完整验证**
 
@@ -280,9 +280,9 @@ Run: `curl -fsS http://127.0.0.1:8787/api/status`
 
 Expected: 返回合法 JSON，包含 `state`、`updated_at`、`completed_groups` 和 `total_groups`。
 
-Run: `curl -fsSI http://127.0.0.1:8787/evidence/comparison.png`
+Run: `curl -fsSI http://<已确认网卡IP>:8787/evidence/comparison.webp`
 
-Expected: HTTP 200 且 `Content-Type: image/png`。
+Expected: HTTP 200 且 `Content-Type: image/webp`，响应体小于 2 MiB。
 
 - [x] **Step 5: 从本机与局域网地址验证页面**
 

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { chooseLanAddress } from "./lan-url.mjs";
+import {
+  chooseLanAddress,
+  resolveLanAddress,
+} from "./lan-url.mjs";
 
 test("prefers a private IPv4 address", () => {
   const address = chooseLanAddress({
@@ -63,7 +66,7 @@ test("returns null when no private IPv4 address is available", () => {
   );
 });
 
-test("prefers a physical routed address over a Docker bridge", () => {
+test("does not advertise a public address or Docker bridge by default", () => {
   assert.equal(
     chooseLanAddress({
       eno1: [
@@ -79,6 +82,23 @@ test("prefers a physical routed address over a Docker bridge", () => {
         { address: "172.17.0.1", family: "IPv4", internal: false },
       ],
     }),
+    null,
+  );
+});
+
+test("accepts a public campus address only through an explicit override", () => {
+  const interfaces = {
+    eno2: [
+      { address: "59.72.89.57", family: "IPv4", internal: false },
+    ],
+  };
+
+  assert.equal(
+    resolveLanAddress(interfaces, "59.72.89.57"),
     "59.72.89.57",
+  );
+  assert.throws(
+    () => resolveLanAddress(interfaces, "not-an-ip"),
+    /不是有效的 IPv4/,
   );
 });

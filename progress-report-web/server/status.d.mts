@@ -31,6 +31,15 @@ export function createStatusSnapshot(options: {
   clockTicks?: number;
 }): Promise<CalibrationStatus>;
 
+export function createCachedStatusReader(options: {
+  worktreePath: string;
+  ttlMs?: number;
+  now?: () => number;
+  snapshotFactory?: (options: {
+    worktreePath: string;
+  }) => Promise<CalibrationStatus>;
+}): () => Promise<CalibrationStatus>;
+
 export function streamFixedFile(
   path: string,
   response: ServerResponse,

@@ -1,11 +1,12 @@
 import vinext from "vinext";
-import { access } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import hostingConfig from "./.openai/hosting.json";
 import { sites } from "./build/sites-vite-plugin";
 import {
+  createCachedStatusReader,
   createStatusSnapshot,
   streamFixedFile,
 } from "./server/status.mjs";
@@ -16,13 +17,31 @@ const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
 const { d1, r2 } = hostingConfig;
 const projectPath = dirname(fileURLToPath(import.meta.url));
 const worktreePath = resolve(projectPath, "..");
+const readCalibrationStatus = createCachedStatusReader({
+  worktreePath,
+  snapshotFactory: createStatusSnapshot,
+});
 
 const evidenceFiles = new Map([
   [
-    "/evidence/comparison.png",
+    "/evidence/comparison.webp",
+    {
+      path: join(
+        projectPath,
+        "public",
+        "evidence",
+        "comparison.webp",
+      ),
+      contentType: "image/webp",
+      cacheControl: "private, max-age=3600",
+    },
+  ],
+  [
+    "/evidence/comparison-original.png",
     {
       path: join(worktreePath, "runs", "smoke", "overlays", "comparison.png"),
       contentType: "image/png",
+      cacheControl: "private, max-age=3600",
     },
   ],
   [
@@ -36,6 +55,7 @@ const evidenceFiles = new Map([
         "motion-evidence-poc-progress-report-2026-08-05.md",
       ),
       contentType: "text/markdown; charset=utf-8",
+      cacheControl: "private, max-age=60",
     },
   ],
 ]);
@@ -51,14 +71,22 @@ function localReportApi(): Plugin {
         ).pathname;
 
         if (pathname === "/api/status") {
-          const status = await createStatusSnapshot({ worktreePath });
+          if (!["GET", "HEAD"].includes(request.method ?? "GET")) {
+            response.statusCode = 405;
+            response.setHeader("Allow", "GET, HEAD");
+            response.end("Method not allowed");
+            return;
+          }
+          const status = await readCalibrationStatus();
           response.statusCode = 200;
           response.setHeader(
             "Content-Type",
             "application/json; charset=utf-8",
           );
           response.setHeader("Cache-Control", "no-store");
-          response.end(JSON.stringify(status));
+          response.end(
+            request.method === "HEAD" ? undefined : JSON.stringify(status),
+          );
           return;
         }
 
@@ -74,11 +102,26 @@ function localReportApi(): Plugin {
           return;
         }
 
+        if (!["GET", "HEAD"].includes(request.method ?? "GET")) {
+          response.statusCode = 405;
+          response.setHeader("Allow", "GET, HEAD");
+          response.end("Method not allowed");
+          return;
+        }
+
         try {
-          await access(evidence.path);
+          const fileStat = await stat(evidence.path);
+          const etag = `W/"${fileStat.size}-${Math.trunc(fileStat.mtimeMs)}"`;
+          if (request.headers["if-none-match"] === etag) {
+            response.statusCode = 304;
+            response.end();
+            return;
+          }
           response.statusCode = 200;
           response.setHeader("Content-Type", evidence.contentType);
-          response.setHeader("Cache-Control", "no-store");
+          response.setHeader("Cache-Control", evidence.cacheControl);
+          response.setHeader("Content-Length", String(fileStat.size));
+          response.setHeader("ETag", etag);
           if (request.method === "HEAD") {
             response.end();
           } else {
@@ -130,7 +173,7 @@ export default defineConfig(async () => {
 
   return {
     server: {
-      host: "0.0.0.0",
+      host: process.env.MOVING_DET_LAN_HOST ?? "127.0.0.1",
       port: 8787,
       strictPort: true,
       ...(isCodexSeatbeltSandbox

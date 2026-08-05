@@ -1,10 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { createStatusSnapshot } from "./status.mjs";
+import {
+  createCachedStatusReader,
+  createStatusSnapshot,
+} from "./status.mjs";
 
 const FIXED_NOW = new Date("2026-08-05T10:15:00.000Z");
 
@@ -157,4 +167,59 @@ test("reports stopped when neither process nor artifacts exist", async (t) => {
   assert.equal(status.state, "stopped");
   assert.equal(status.completed_groups, 0);
   assert.equal(status.latest_frame, null);
+});
+
+test("reports unavailable when the runs directory cannot be read", async (t) => {
+  const fixture = await makeFixture();
+  const runsPath = join(fixture.worktreePath, "runs");
+  t.after(async () => {
+    await chmod(runsPath, 0o700);
+    await fixture.cleanup();
+  });
+  await chmod(runsPath, 0o000);
+
+  const status = await createStatusSnapshot({
+    worktreePath: fixture.worktreePath,
+    procRoot: fixture.procRoot,
+    now: FIXED_NOW,
+  });
+
+  assert.equal(status.state, "unavailable");
+  assert.match(status.message, /状态读取失败/);
+});
+
+test("deduplicates concurrent snapshots and reuses them within the TTL", async () => {
+  let calls = 0;
+  let currentTime = 1_000;
+  let releaseFirst;
+  const firstSnapshot = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const snapshotFactory = async () => {
+    calls += 1;
+    if (calls === 1) return firstSnapshot;
+    return { state: "running", generation: calls };
+  };
+  const readStatus = createCachedStatusReader({
+    worktreePath: "/fixture",
+    ttlMs: 8_000,
+    now: () => currentTime,
+    snapshotFactory,
+  });
+
+  const first = readStatus();
+  const concurrent = readStatus();
+  assert.equal(calls, 1);
+  releaseFirst({ state: "running", generation: 1 });
+  assert.deepEqual(await Promise.all([first, concurrent]), [
+    { state: "running", generation: 1 },
+    { state: "running", generation: 1 },
+  ]);
+
+  assert.equal((await readStatus()).generation, 1);
+  assert.equal(calls, 1);
+
+  currentTime += 8_001;
+  assert.equal((await readStatus()).generation, 2);
+  assert.equal(calls, 2);
 });

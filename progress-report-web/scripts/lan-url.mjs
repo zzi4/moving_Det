@@ -1,3 +1,4 @@
+import { isIPv4 } from "node:net";
 import { networkInterfaces } from "node:os";
 import { pathToFileURL } from "node:url";
 
@@ -9,35 +10,58 @@ const unusableAddress =
 
 export function chooseLanAddress(interfaces) {
   const physical = [];
-  const virtual = [];
-
   for (const [name, addresses] of Object.entries(interfaces)) {
     for (const item of addresses ?? []) {
       const isIpv4 = item.family === "IPv4" || item.family === 4;
       if (!isIpv4 || item.internal || unusableAddress.test(item.address)) {
         continue;
       }
-      const target = virtualInterface.test(name) ? virtual : physical;
-      target.push(item.address);
+      if (!virtualInterface.test(name)) physical.push(item.address);
     }
   }
 
   return (
-    physical.find((address) => privateIpv4.test(address)) ??
-    physical[0] ??
-    virtual.find((address) => privateIpv4.test(address)) ??
-    null
+    physical.find((address) => privateIpv4.test(address)) ?? null
   );
+}
+
+export function resolveLanAddress(interfaces, override) {
+  if (!override) return chooseLanAddress(interfaces);
+  if (!isIPv4(override)) {
+    throw new Error(`MOVING_DET_LAN_HOST=${override} 不是有效的 IPv4 地址`);
+  }
+  const assigned = Object.values(interfaces)
+    .flatMap((addresses) => addresses ?? [])
+    .some((item) => item.address === override);
+  if (!assigned) {
+    throw new Error(
+      `MOVING_DET_LAN_HOST=${override} 不属于本机任何网络接口`,
+    );
+  }
+  return override;
+}
+
+export function isPrivateLanAddress(address) {
+  return privateIpv4.test(address);
 }
 
 function printUrls() {
   const port = 8787;
-  const address = chooseLanAddress(networkInterfaces());
-  console.log(`本机访问：http://127.0.0.1:${port}`);
+  const address = resolveLanAddress(
+    networkInterfaces(),
+    process.env.MOVING_DET_LAN_HOST,
+  );
   if (address) {
-    console.log(`局域网访问：http://${address}:${port}`);
+    console.log(`本机与局域网访问：http://${address}:${port}`);
+    if (!isPrivateLanAddress(address)) {
+      console.log(
+        "警告：该地址不是 RFC1918 私有地址；请确认校园网/防火墙只允许可信设备访问。",
+      );
+    }
   } else {
-    console.log("未发现可用的局域网 IPv4 地址。");
+    console.log(
+      "未发现物理网卡上的 RFC1918 地址；如需使用校园网地址，请显式设置 MOVING_DET_LAN_HOST。",
+    );
   }
 }
 

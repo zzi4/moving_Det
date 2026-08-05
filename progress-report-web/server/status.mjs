@@ -13,13 +13,23 @@ const STALE_AFTER_SECONDS = 120;
 const SIZE_CACHE_TTL_MS = 60_000;
 
 const sizeCache = new Map();
+const maskInspectionCache = new Map();
+
+function isMissingError(error) {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    error.code === "ENOENT"
+  );
+}
 
 async function exists(path) {
   try {
     await access(path);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if (isMissingError(error)) return false;
+    throw error;
   }
 }
 
@@ -28,8 +38,9 @@ async function safeDirectories(path) {
     return (await readdir(path, { withFileTypes: true })).filter((entry) =>
       entry.isDirectory(),
     );
-  } catch {
-    return [];
+  } catch (error) {
+    if (isMissingError(error)) return [];
+    throw error;
   }
 }
 
@@ -59,8 +70,9 @@ async function directorySize(path, nowMs) {
     let entries;
     try {
       entries = await readdir(current, { withFileTypes: true });
-    } catch {
-      continue;
+    } catch (error) {
+      if (isMissingError(error)) continue;
+      throw error;
     }
     for (const entry of entries) {
       const child = join(current, entry.name);
@@ -69,8 +81,9 @@ async function directorySize(path, nowMs) {
       } else if (entry.isFile()) {
         try {
           bytes += (await stat(child)).size;
-        } catch {
+        } catch (error) {
           // A calibration writer may atomically replace a file during the scan.
+          if (!isMissingError(error)) throw error;
         }
       }
     }
@@ -94,6 +107,15 @@ async function inspectCache(cachePath, descriptor) {
     const masksPath = join(cachePath, entry.name);
     const directoryStat = await stat(masksPath);
     newestMtimeMs = Math.max(newestMtimeMs, directoryStat.mtimeMs);
+    const cached = maskInspectionCache.get(masksPath);
+    if (cached?.mtimeMs === directoryStat.mtimeMs) {
+      latestFrame = Math.max(
+        latestFrame ?? cached.latestFrame,
+        cached.latestFrame,
+      );
+      continue;
+    }
+    let directoryLatestFrame = null;
     let names = [];
     try {
       names = await readdir(masksPath);
@@ -104,7 +126,17 @@ async function inspectCache(cachePath, descriptor) {
       const match = /^(\d+)\.npz$/.exec(name);
       if (!match) continue;
       const frame = Number(match[1]);
-      latestFrame = Math.max(latestFrame ?? frame, frame);
+      directoryLatestFrame = Math.max(directoryLatestFrame ?? frame, frame);
+    }
+    if (directoryLatestFrame !== null) {
+      latestFrame = Math.max(
+        latestFrame ?? directoryLatestFrame,
+        directoryLatestFrame,
+      );
+      maskInspectionCache.set(masksPath, {
+        mtimeMs: directoryStat.mtimeMs,
+        latestFrame: directoryLatestFrame,
+      });
     }
   }
 
@@ -323,6 +355,34 @@ export async function createStatusSnapshot({
           : "状态读取失败",
     };
   }
+}
+
+export function createCachedStatusReader({
+  worktreePath,
+  ttlMs = 8_000,
+  now = () => Date.now(),
+  snapshotFactory = createStatusSnapshot,
+}) {
+  let cached = null;
+  let inFlight = null;
+
+  return async function readStatus() {
+    const currentTime = now();
+    if (cached && currentTime - cached.measuredAt < ttlMs) {
+      return cached.value;
+    }
+    if (inFlight) return inFlight;
+
+    inFlight = Promise.resolve(snapshotFactory({ worktreePath }))
+      .then((value) => {
+        cached = { measuredAt: now(), value };
+        return value;
+      })
+      .finally(() => {
+        inFlight = null;
+      });
+    return inFlight;
+  };
 }
 
 export async function streamFixedFile(path, response) {

@@ -393,7 +393,7 @@ main {
 
 .live-grid span {
   display: block;
-  color: rgba(255, 255, 255, 0.38);
+  color: rgba(255, 255, 255, 0.7);
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -414,7 +414,7 @@ main {
 .live-footnote {
   margin: 22px 0 0;
   padding-top: 15px;
-  color: rgba(255, 255, 255, 0.35);
+  color: rgba(255, 255, 255, 0.68);
   border-top: 1px solid rgba(255, 255, 255, 0.07);
   font-size: 10px;
 }
@@ -1081,6 +1081,33 @@ tbody th {
   border-radius: 10px;
 }
 
+.evidence-fallback {
+  display: grid;
+  min-height: 320px;
+  place-content: center;
+  padding: 34px;
+  color: white;
+  background: var(--night);
+  border-radius: 10px;
+  text-align: center;
+}
+
+.evidence-fallback p {
+  margin: 8px 0 20px;
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 12px;
+}
+
+.evidence-fallback code {
+  display: block;
+  max-width: 760px;
+  overflow: hidden;
+  color: var(--mint);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .evidence-figure figcaption {
   padding: 12px 6px 3px;
   color: var(--ink-soft);
@@ -1089,7 +1116,7 @@ tbody th {
 
 .artifact-links {
   display: grid;
-  grid-template-columns: 0.7fr 1.3fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
   margin-top: 18px;
 }
