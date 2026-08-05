@@ -34,7 +34,7 @@
 - Produces: `GET /api/status`，返回 `application/json; charset=utf-8`。
 - Produces: `GET /evidence/comparison.png` 和 `GET /evidence/report.md` 两个固定只读证据入口。
 
-- [ ] **Step 1: 写状态模块失败测试**
+- [x] **Step 1: 写状态模块失败测试**
 
 ```js
 test("reports a running multiscale staging directory", async () => {
@@ -56,13 +56,13 @@ test("reports completion when calibration.json exists", async () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试并确认缺少实现**
+- [x] **Step 2: 运行测试并确认缺少实现**
 
 Run: `node --test server/status.test.mjs`
 
 Expected: FAIL，提示无法导入 `server/status.mjs`。
 
-- [ ] **Step 3: 实现最小状态采集**
+- [x] **Step 3: 实现最小状态采集**
 
 ```js
 export async function createStatusSnapshot({
@@ -89,7 +89,7 @@ export async function createStatusSnapshot({
 - 当进程存在但最后 artifact 超过 120 秒未更新时返回 `stale`。
 - 任何读取异常转成 `unavailable` JSON，不让接口崩溃。
 
-- [ ] **Step 4: 接入本地 Vite 中间件**
+- [x] **Step 4: 接入本地 Vite 中间件**
 
 ```ts
 function localReportApi(): Plugin {
@@ -108,13 +108,13 @@ function localReportApi(): Plugin {
 
 同时为两个固定证据路径返回文件；拒绝所有其他 `/evidence/*` 路径。将 Vite server 配置为 `host: "0.0.0.0"`、`port: 8787`、`strictPort: true`。
 
-- [ ] **Step 5: 运行状态测试**
+- [x] **Step 5: 运行状态测试**
 
 Run: `node --test server/status.test.mjs`
 
 Expected: 全部 PASS。
 
-- [ ] **Step 6: 提交状态接口**
+- [x] **Step 6: 提交状态接口**
 
 ```bash
 git add progress-report-web/server progress-report-web/vite.config.ts progress-report-web/package.json
@@ -141,7 +141,7 @@ git commit -m "feat: add read-only calibration status feed"
 - Produces: `LiveCalibration` 客户端组件，每 10 秒轮询并保留最近一次成功状态。
 - Produces: 单页报告，锚点为 `overview`、`method`、`results`、`engineering`、`risks`、`next`、`evidence`。
 
-- [ ] **Step 1: 写页面内容失败测试**
+- [x] **Step 1: 写页面内容失败测试**
 
 ```js
 assert.match(html, /运动优先/);
@@ -151,13 +151,13 @@ assert.match(html, /evaluation 标注阻塞/);
 assert.doesNotMatch(html, /Your site is taking shape/);
 ```
 
-- [ ] **Step 2: 运行页面测试并确认 starter 不满足要求**
+- [x] **Step 2: 运行页面测试并确认 starter 不满足要求**
 
 Run: `npm test`
 
 Expected: FAIL，页面缺少项目标题和关键实验数字。
 
-- [ ] **Step 3: 实现状态组件**
+- [x] **Step 3: 实现状态组件**
 
 ```tsx
 "use client";
@@ -192,7 +192,7 @@ export function LiveCalibration() {
 }
 ```
 
-- [ ] **Step 4: 实现完整报告页面**
+- [x] **Step 4: 实现完整报告页面**
 
 页面必须写入以下已经验证的结果：
 
@@ -205,17 +205,17 @@ export function LiveCalibration() {
 
 同时实现固定目录、响应式表格、CSS 流程图、风险提示、证据图片和可复制绝对路径。
 
-- [ ] **Step 5: 清理 starter 内容与依赖**
+- [x] **Step 5: 清理 starter 内容与依赖**
 
 删除 `_sites-preview`，移除 `react-loading-skeleton`，更新 lockfile；把 metadata 改为“航拍运动目标检测 POC｜阶段进展”并移除 `codex-preview`。
 
-- [ ] **Step 6: 运行构建和页面测试**
+- [x] **Step 6: 运行构建和页面测试**
 
 Run: `npm run build && node --test tests/rendered-html.test.mjs`
 
 Expected: 构建成功，页面测试全部 PASS。
 
-- [ ] **Step 7: 提交报告页面**
+- [x] **Step 7: 提交报告页面**
 
 ```bash
 git add progress-report-web
@@ -235,7 +235,7 @@ git commit -m "feat: add LAN progress report dashboard"
 - Produces: `npm run lan`，启动监听 `0.0.0.0:8787` 的报告服务。
 - Produces: `npm run lan:url`，输出本机地址和可用的 RFC1918 局域网 URL。
 
-- [ ] **Step 1: 写局域网地址选择失败测试**
+- [x] **Step 1: 写局域网地址选择失败测试**
 
 ```js
 test("prefers a private IPv4 address", () => {
@@ -247,13 +247,13 @@ test("prefers a private IPv4 address", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试并确认缺少实现**
+- [x] **Step 2: 运行测试并确认缺少实现**
 
 Run: `node --test scripts/lan-url.test.mjs`
 
 Expected: FAIL，提示缺少 `lan-url.mjs`。
 
-- [ ] **Step 3: 实现地址输出与启动脚本**
+- [x] **Step 3: 实现地址输出与启动脚本**
 
 ```js
 export function chooseLanAddress(interfaces) {
@@ -270,7 +270,7 @@ export function chooseLanAddress(interfaces) {
 
 `npm run lan` 使用和开发服务相同的 `0.0.0.0:8787` 配置；README 只列出启动、停止和访问方式。
 
-- [ ] **Step 4: 运行完整验证**
+- [x] **Step 4: 运行完整验证**
 
 Run: `npm test`
 
@@ -284,13 +284,13 @@ Run: `curl -fsSI http://127.0.0.1:8787/evidence/comparison.png`
 
 Expected: HTTP 200 且 `Content-Type: image/png`。
 
-- [ ] **Step 5: 从本机与局域网地址验证页面**
+- [x] **Step 5: 从本机与局域网地址验证页面**
 
 Run: `npm run lan:url`
 
 Expected: 输出 `http://127.0.0.1:8787` 和一个 `http://<RFC1918 IPv4>:8787` 地址。
 
-- [ ] **Step 6: 提交启动与说明**
+- [x] **Step 6: 提交启动与说明**
 
 ```bash
 git add progress-report-web/scripts progress-report-web/package.json progress-report-web/README.md
