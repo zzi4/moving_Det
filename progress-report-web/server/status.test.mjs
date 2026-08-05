@@ -223,3 +223,60 @@ test("deduplicates concurrent snapshots and reuses them within the TTL", async (
   assert.equal((await readStatus()).generation, 2);
   assert.equal(calls, 2);
 });
+
+test("reports unavailable when a matched process resource is unreadable", async (t) => {
+  const fixture = await makeFixture();
+  const processStatusPath = join(fixture.procRoot, "4242", "status");
+  t.after(async () => {
+    await chmod(processStatusPath, 0o600);
+    await fixture.cleanup();
+  });
+
+  const maskPath = join(
+    fixture.worktreePath,
+    "runs",
+    ".poc-calibration.fixture",
+    "cache-multiscale-1.0",
+    "masks-4",
+    "000010.npz",
+  );
+  await mkdir(join(maskPath, ".."), { recursive: true });
+  await writeFile(maskPath, "fixture");
+  await addCalibrationProcess(fixture);
+  await chmod(processStatusPath, 0o000);
+
+  const status = await createStatusSnapshot({
+    worktreePath: fixture.worktreePath,
+    procRoot: fixture.procRoot,
+    now: FIXED_NOW,
+  });
+
+  assert.equal(status.state, "unavailable");
+  assert.match(status.message, /状态读取失败/);
+});
+
+test("reports unavailable when a discovered masks directory is unreadable", async (t) => {
+  const fixture = await makeFixture();
+  const masksPath = join(
+    fixture.worktreePath,
+    "runs",
+    ".poc-calibration.fixture",
+    "cache-multiscale-1.0",
+    "masks-4",
+  );
+  t.after(async () => {
+    await chmod(masksPath, 0o700);
+    await fixture.cleanup();
+  });
+  await mkdir(masksPath, { recursive: true });
+  await chmod(masksPath, 0o000);
+
+  const status = await createStatusSnapshot({
+    worktreePath: fixture.worktreePath,
+    procRoot: fixture.procRoot,
+    now: FIXED_NOW,
+  });
+
+  assert.equal(status.state, "unavailable");
+  assert.match(status.message, /状态读取失败/);
+});

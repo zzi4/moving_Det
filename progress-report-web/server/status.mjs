@@ -23,6 +23,14 @@ function isMissingError(error) {
   );
 }
 
+function hasErrorCode(error, codes) {
+  return (
+    error instanceof Error &&
+    "code" in error &&
+    codes.includes(error.code)
+  );
+}
+
 async function exists(path) {
   try {
     await access(path);
@@ -119,8 +127,9 @@ async function inspectCache(cachePath, descriptor) {
     let names = [];
     try {
       names = await readdir(masksPath);
-    } catch {
-      continue;
+    } catch (error) {
+      if (isMissingError(error)) continue;
+      throw error;
     }
     for (const name of names) {
       const match = /^(\d+)\.npz$/.exec(name);
@@ -216,25 +225,37 @@ async function findCalibrationProcess({
     uptimeSeconds = Number(
       (await readFile(join(procRoot, "uptime"), "utf8")).split(/\s+/)[0],
     );
-  } catch {
-    // Tests and restricted containers may not expose uptime.
+  } catch (error) {
+    // Test fixtures may omit uptime when no process exists.
+    if (!isMissingError(error)) throw error;
   }
 
   const candidates = await safeDirectories(procRoot);
   for (const entry of candidates) {
     if (!/^\d+$/.test(entry.name)) continue;
     const processPath = join(procRoot, entry.name);
+    let command;
     try {
-      const command = (await readFile(join(processPath, "cmdline"), "utf8"))
+      command = (await readFile(join(processPath, "cmdline"), "utf8"))
         .replaceAll("\0", " ")
         .trim();
-      if (
-        !command.includes("moving-det") ||
-        !command.includes("calibrate") ||
-        !command.includes(worktreePath)
-      ) {
+    } catch (error) {
+      // Unrelated processes may be hidden by /proc mount policy, and any
+      // process can exit between discovery and cmdline reading.
+      if (hasErrorCode(error, ["ENOENT", "ESRCH", "EACCES", "EPERM"])) {
         continue;
       }
+      throw error;
+    }
+    if (
+      !command.includes("moving-det") ||
+      !command.includes("calibrate") ||
+      !command.includes(worktreePath)
+    ) {
+      continue;
+    }
+
+    try {
       const [statusText, statText] = await Promise.all([
         readFile(join(processPath, "status"), "utf8"),
         readFile(join(processPath, "stat"), "utf8"),
@@ -246,8 +267,10 @@ async function findCalibrationProcess({
         elapsedSeconds: timing.elapsedSeconds ?? null,
         cpuPercent: timing.cpuPercent ?? null,
       };
-    } catch {
+    } catch (error) {
       // Processes may exit between directory discovery and file reads.
+      if (hasErrorCode(error, ["ENOENT", "ESRCH"])) continue;
+      throw error;
     }
   }
   return null;
