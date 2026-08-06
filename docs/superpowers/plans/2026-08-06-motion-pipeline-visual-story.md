@@ -35,7 +35,7 @@
 - Consumes: explicit `--data-root`, `--run-root`, `--config`, `--output`, `--frame`, and `--roi` CLI arguments.
 - Produces: `generate_pipeline_visuals(data_root: Path, run_root: Path, config_path: Path, output_dir: Path, frame_index: int, roi: Roi) -> dict[str, object]` and a manifest whose `assets` values are site-relative paths.
 
-- [ ] **Step 1: Write failing tests for ROI validation and synthetic asset generation**
+- [x] **Step 1: Write failing tests for ROI validation and synthetic asset generation**
 
 ```python
 from scripts.generate_report_pipeline_visuals import Roi, generate_pipeline_visuals
@@ -116,13 +116,13 @@ def test_generate_pipeline_visuals_rejects_invalid_jsonl(
         )
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `.venv/bin/pytest tests/test_report_pipeline_visuals.py -q`
 
 Expected: collection fails with `ModuleNotFoundError: No module named 'scripts.generate_report_pipeline_visuals'`.
 
-- [ ] **Step 3: Implement strict loading, rendering, and provenance**
+- [x] **Step 3: Implement strict loading, rendering, and provenance**
 
 ```python
 @dataclass(frozen=True)
@@ -167,13 +167,13 @@ The implementation must:
 - record ECC correlation, translation, rotation, fallback state, source paths, method, scale, threshold, metrics, and generated asset paths in `manifest.json`;
 - write `1x` assets at 640×360 and default `2x` assets at 1280×720.
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
 Run: `.venv/bin/pytest tests/test_report_pipeline_visuals.py -q`
 
 Expected: all tests in the file pass.
 
-- [ ] **Step 5: Generate the real report assets**
+- [x] **Step 5: Generate the real report assets**
 
 Run:
 
@@ -189,7 +189,7 @@ Run:
 
 Expected: eight default WebP files, eight `-1x.webp` files, and `manifest.json` are written; every image is under 1.5 MiB.
 
-- [ ] **Step 6: Commit the generator, tests, and evidence assets**
+- [x] **Step 6: Commit the generator, tests, and evidence assets**
 
 ```bash
 git add scripts/generate_report_pipeline_visuals.py tests/test_report_pipeline_visuals.py progress-report-web/public/evidence/pipeline

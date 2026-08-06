@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-08-06T02:19:16.375447+00:00",
+  "sequence_id": "motorway_fml_json_v1",
+  "frame_index": 20,
+  "support_frames": [
+    18,
+    19,
+    20,
+    21,
+    22
+  ],
+  "roi": {
+    "x": 0,
+    "y": 720,
+    "width": 1280,
+    "height": 720
+  },
+  "alignment": {
+    "correlation": 0.9967242394932998,
+    "translation_x": 0.3518325686454773,
+    "translation_y": -0.1034650206565857,
+    "rotation_degrees": 0.0028807975736047705,
+    "used_fallback": false,
+    "reason": null,
+    "mean_absolute_difference_before": 3.5610340711805555,
+    "mean_absolute_difference_after": 4.363206380208333
+  },
+  "methods": {
+    "motion_and_obb": {
+      "name": "frame_diff",
+      "scale": 0.7,
+      "threshold": 6.0
+    },
+    "tubelet_before": {
+      "name": "multiscale",
+      "scale": 1.0,
+      "threshold": 6.0
+    },
+    "tubelet_after": {
+      "name": "multiscale_tubelet",
+      "scale": 1.0,
+      "threshold": 6.0
+    }
+  },
+  "metrics": {
+    "frame_diff_0.7": {
+      "method": "frame_diff",
+      "scale": 0.7,
+      "threshold": 6.0,
+      "aggregate": {
+        "center_in_gt_recall": 0.9918658280922432,
+        "false_proposals_per_100_moving_gt": 727.7204751921734,
+        "mask_coverage_mean": 0.5616300013682692,
+        "proposal_count": 292992,
+        "recall_025": 0.9126484975541579,
+        "recall_050": 0.07740041928721174
+      }
+    },
+    "multiscale_1.0": {
+      "method": "multiscale",
+      "scale": 1.0,
+      "threshold": 6.0,
+      "aggregate": {
+        "center_in_gt_recall": 0.3903843466107617,
+        "false_proposals_per_100_moving_gt": 7747.751222921034,
+        "mask_coverage_mean": 0.9397047224349584,
+        "proposal_count": 2772669,
+        "recall_025": 0.02546470999301188,
+        "recall_050": 0.00044723969252271137
+      }
+    },
+    "multiscale_tubelet_1.0": {
+      "method": "multiscale_tubelet",
+      "scale": 1.0,
+      "threshold": 6.0,
+      "aggregate": {
+        "center_in_gt_recall": 0.3903843466107617,
+        "false_proposals_per_100_moving_gt": 7742.392732354997,
+        "mask_coverage_mean": 0.9397047224349584,
+        "proposal_count": 2770752,
+        "recall_025": 0.02546470999301188,
+        "recall_050": 0.00044723969252271137
+      }
+    }
+  },
+  "sources": {
+    "reference_frame": "/mnt/nas/Processing_data/mot_sequence/motorway_fml_json_v1/000020.jpg",
+    "moving_frame": "/mnt/nas/Processing_data/mot_sequence/motorway_fml_json_v1/000019.jpg",
+    "config": "/home/stu1/Projects/moving_Det/.worktrees/motion-evidence-poc/configs/poc.yaml",
+    "run_root": "/home/stu1/Projects/moving_Det/.worktrees/motion-evidence-poc/runs/.poc-calibration.suv1ene2"
+  },
+  "assets": {
+    "alignment_before": "/evidence/pipeline/alignment-before.webp",
+    "alignment_after": "/evidence/pipeline/alignment-after.webp",
+    "motion_heatmap": "/evidence/pipeline/motion-heatmap.webp",
+    "motion_overlay": "/evidence/pipeline/motion-overlay.webp",
+    "mask": "/evidence/pipeline/mask.webp",
+    "proposals": "/evidence/pipeline/proposals.webp",
+    "tubelets_before": "/evidence/pipeline/tubelets-before.webp",
+    "tubelets_after": "/evidence/pipeline/tubelets-after.webp"
+  }
+}
