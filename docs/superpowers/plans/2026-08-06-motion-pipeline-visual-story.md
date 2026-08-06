@@ -639,19 +639,19 @@ git commit -m "feat: explain planned classification and track lifecycle"
 - Consumes: the complete source tree and generated assets.
 - Produces: a verified LAN page at `http://59.72.89.57:8787`.
 
-- [ ] **Step 1: Run the complete Python suite**
+- [x] **Step 1: Run the complete Python suite**
 
 Run: `.venv/bin/pytest -q`
 
 Expected: all tests pass with zero failures.
 
-- [ ] **Step 2: Run the complete website suite**
+- [x] **Step 2: Run the complete website suite**
 
 Run: `cd progress-report-web && npm test && npm run lint`
 
 Expected: all Node tests, typecheck, build, rendered HTML tests, and lint pass.
 
-- [ ] **Step 3: Verify evidence budgets and provenance**
+- [x] **Step 3: Verify evidence budgets and provenance**
 
 Run:
 
@@ -667,7 +667,7 @@ jq -e '
 
 Expected: the `find` command prints nothing and `jq` exits 0.
 
-- [ ] **Step 4: Restart the detached LAN report process**
+- [x] **Step 4: Restart the detached LAN report process**
 
 Resolve the existing `59.72.89.57:8787` listener, terminate only that report process tree, then start:
 
@@ -678,7 +678,7 @@ setsid -f env MOVING_DET_LAN_HOST=59.72.89.57 npm run lan \
 
 Expected: `59.72.89.57:8787` listens again without changing the calibration process.
 
-- [ ] **Step 5: Verify the user-visible page and live status**
+- [x] **Step 5: Verify the user-visible page and live status**
 
 Run:
 
@@ -697,6 +697,6 @@ done
 
 Expected: the page and four representative assets return HTTP 200, and the API reports the calibration state without an error payload.
 
-- [ ] **Step 6: Commit any verification-only fixes, if required**
+- [x] **Step 6: Commit any verification-only fixes, if required**
 
 If Step 1–5 required no source changes, create no extra commit. If a defect was fixed through a failing regression test, stage only that test and fix and commit with a message describing the defect.

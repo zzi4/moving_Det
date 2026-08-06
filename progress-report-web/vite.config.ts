@@ -1,6 +1,6 @@
 import vinext from "vinext";
 import { stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import hostingConfig from "./.openai/hosting.json";
@@ -10,6 +10,7 @@ import {
   createStatusSnapshot,
   streamFixedFile,
 } from "./server/status.mjs";
+import { createEvidenceFiles } from "./server/evidence.mjs";
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   "00000000-0000-4000-8000-000000000000";
@@ -22,43 +23,7 @@ const readCalibrationStatus = createCachedStatusReader({
   snapshotFactory: createStatusSnapshot,
 });
 
-const evidenceFiles = new Map([
-  [
-    "/evidence/comparison.webp",
-    {
-      path: join(
-        projectPath,
-        "public",
-        "evidence",
-        "comparison.webp",
-      ),
-      contentType: "image/webp",
-      cacheControl: "private, max-age=3600",
-    },
-  ],
-  [
-    "/evidence/comparison-original.png",
-    {
-      path: join(worktreePath, "runs", "smoke", "overlays", "comparison.png"),
-      contentType: "image/png",
-      cacheControl: "private, max-age=3600",
-    },
-  ],
-  [
-    "/evidence/report.md",
-    {
-      path: join(
-        worktreePath,
-        ".superpowers",
-        "sdd",
-        "2026-08-03-motion-evidence-poc",
-        "motion-evidence-poc-progress-report-2026-08-05.md",
-      ),
-      contentType: "text/markdown; charset=utf-8",
-      cacheControl: "private, max-age=60",
-    },
-  ],
-]);
+const evidenceFiles = createEvidenceFiles({ projectPath, worktreePath });
 
 function localReportApi(): Plugin {
   return {

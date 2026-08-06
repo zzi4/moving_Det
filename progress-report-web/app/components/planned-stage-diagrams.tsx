@@ -40,12 +40,12 @@ export function TemporalClassifierDiagram() {
 }
 
 const lifecycleStates = [
-  { name: "进入", note: "边界出现" },
-  { name: "确认", note: "连续观测" },
+  { name: "进入", note: "边界出现", predicted: false },
+  { name: "确认", note: "连续观测", predicted: false },
   { name: "短时漏检 / 遮挡", note: "保留预测状态", predicted: true },
-  { name: "恢复", note: "重新匹配" },
-  { name: "停车", note: "运动弱但轨迹仍在" },
-  { name: "离场", note: "边界驶出后终止" },
+  { name: "恢复", note: "重新匹配", predicted: false },
+  { name: "停车", note: "运动弱但轨迹仍在", predicted: false },
+  { name: "离场", note: "边界驶出后终止", predicted: false },
 ] as const;
 
 export function TrackLifecycleDiagram() {
