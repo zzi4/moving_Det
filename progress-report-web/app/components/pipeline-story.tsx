@@ -1,32 +1,5 @@
 import { pipelineStory } from "../pipeline-story-data";
-
-function DefaultEvidence({
-  stageIndex,
-  layers,
-}: {
-  stageIndex: number;
-  layers: Extract<
-    (typeof pipelineStory)[number]["visual"],
-    { kind: "evidence" }
-  >["layers"];
-}) {
-  const layer = layers[0];
-  return (
-    <figure className="pipeline-story-visual">
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
-        src={layer.src}
-        srcSet={`${layer.src1x} 640w, ${layer.src} 1280w`}
-        sizes="(max-width: 900px) 100vw, 54vw"
-        alt={layer.alt}
-        width="1280"
-        height="720"
-        loading={stageIndex === 0 ? "eager" : "lazy"}
-      />
-      <figcaption>{layer.caption}</figcaption>
-    </figure>
-  );
-}
+import { PipelineVisual } from "./pipeline-visual";
 
 export function PipelineStory() {
   return (
@@ -90,9 +63,10 @@ export function PipelineStory() {
             </div>
 
             {stage.visual.kind === "evidence" ? (
-              <DefaultEvidence
-                stageIndex={stageIndex}
+              <PipelineVisual
                 layers={stage.visual.layers}
+                caption={stage.title}
+                eager={stageIndex === 0}
               />
             ) : (
               <div className="planned-placeholder" role="img">

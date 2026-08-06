@@ -399,7 +399,7 @@ git commit -m "feat: add motion pipeline visual narrative"
 - Consumes: the `PipelineLayer[]` for a real stage.
 - Produces: `selectPipelineLayer(layers, requestedId) -> PipelineLayer` and `<PipelineVisual layers caption />`.
 
-- [ ] **Step 1: Write the failing state-selection test**
+- [x] **Step 1: Write the failing state-selection test**
 
 ```javascript
 import { selectPipelineLayer } from "./pipeline-layer-state.mjs";
@@ -414,13 +414,13 @@ test("selects a requested layer and falls back to the first layer", () => {
 });
 ```
 
-- [ ] **Step 2: Run the client-state test and verify RED**
+- [x] **Step 2: Run the client-state test and verify RED**
 
 Run: `cd progress-report-web && node --test app/components/pipeline-layer-state.test.mjs`
 
 Expected: fails because `pipeline-layer-state.mjs` does not exist.
 
-- [ ] **Step 3: Implement minimal state selection**
+- [x] **Step 3: Implement minimal state selection**
 
 ```javascript
 export function selectPipelineLayer(layers, requestedId) {
@@ -431,7 +431,7 @@ export function selectPipelineLayer(layers, requestedId) {
 }
 ```
 
-- [ ] **Step 4: Implement the client comparison component**
+- [x] **Step 4: Implement the client comparison component**
 
 ```tsx
 "use client";
@@ -469,7 +469,7 @@ export function PipelineVisual({ layers, caption }: Props) {
 
 The component must show a readable fallback containing the failed asset path, use `loading="lazy"` below the first story item, and preserve the first layer in server HTML.
 
-- [ ] **Step 5: Add the new test to the full test command and verify GREEN**
+- [x] **Step 5: Add the new test to the full test command and verify GREEN**
 
 ```json
 "test:pipeline-state": "node --test app/components/pipeline-layer-state.test.mjs",
@@ -480,7 +480,7 @@ Run: `cd progress-report-web && npm run test:pipeline-state && npm run typecheck
 
 Expected: the layer state test and TypeScript check pass.
 
-- [ ] **Step 6: Commit the layer comparison**
+- [x] **Step 6: Commit the layer comparison**
 
 ```bash
 git add progress-report-web/app/components/pipeline-layer-state.mjs progress-report-web/app/components/pipeline-layer-state.d.mts progress-report-web/app/components/pipeline-layer-state.test.mjs progress-report-web/app/components/pipeline-visual.tsx progress-report-web/package.json

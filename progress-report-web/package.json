@@ -13,10 +13,11 @@
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test:status": "node --test server/status.test.mjs",
     "test:client-state": "node --test app/components/live-status-state.test.mjs",
+    "test:pipeline-state": "node --test app/components/pipeline-layer-state.test.mjs",
     "test:lan": "node --test scripts/lan-url.test.mjs",
     "typecheck": "tsc --noEmit",
     "audit:prod": "npm audit --omit=dev",
-    "test": "npm run test:status && npm run test:client-state && npm run test:lan && npm run typecheck && npm run build && node --test tests/rendered-html.test.mjs",
+    "test": "npm run test:status && npm run test:client-state && npm run test:pipeline-state && npm run test:lan && npm run typecheck && npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {
