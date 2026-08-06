@@ -65,6 +65,15 @@ test("server-renders the complete Chinese progress report", async () => {
     html,
     /src="\/evidence\/pipeline\/motion-overlay\.webp"/,
   );
+  assert.match(html, /9–17 帧 RGB/);
+  assert.match(html, /进入/);
+  assert.match(html, /短时漏检/);
+  assert.match(html, /离场/);
+  assert.match(html, /预期输出/);
+  assert.doesNotMatch(
+    html,
+    /不能比较尚未完成的 multiscale、tubelet 与 0\.7 尺度/,
+  );
 });
 
 test("ships a lightweight evidence preview", async () => {

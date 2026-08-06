@@ -339,7 +339,10 @@ export default function Home() {
               <h3>目前不能宣称</h3>
               <ul>
                 <li>不能宣称当前检测器已经满足 FP 约束。</li>
-                <li>不能比较尚未完成的 multiscale、tubelet 与 0.7 尺度。</li>
+                <li>
+                  多尺度与现有 Tubelet 已完成，但当前结果明显未达约束；0.7
+                  尺度帧差法是目前最有价值的降噪方向。
+                </li>
                 <li>不能给出 frozen evaluation 的六个最终 gate。</li>
                 <li>不能把当前车辆序列等同于最终 20 × 40 小目标 benchmark。</li>
               </ul>

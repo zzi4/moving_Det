@@ -1,5 +1,9 @@
 import { pipelineStory } from "../pipeline-story-data";
 import { PipelineVisual } from "./pipeline-visual";
+import {
+  TemporalClassifierDiagram,
+  TrackLifecycleDiagram,
+} from "./planned-stage-diagrams";
 
 export function PipelineStory() {
   return (
@@ -68,15 +72,10 @@ export function PipelineStory() {
                 caption={stage.title}
                 eager={stageIndex === 0}
               />
+            ) : stage.visual.kind === "classifier-plan" ? (
+              <TemporalClassifierDiagram />
             ) : (
-              <div className="planned-placeholder" role="img">
-                <span>机制示意</span>
-                <strong>
-                  {stage.visual.kind === "classifier-plan"
-                    ? "时序分类机制"
-                    : "轨迹生命周期"}
-                </strong>
-              </div>
+              <TrackLifecycleDiagram />
             )}
           </li>
         ))}

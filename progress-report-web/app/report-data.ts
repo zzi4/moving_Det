@@ -21,7 +21,7 @@ export const pipeline = [
   {
     number: "01",
     title: "残余稳像",
-    description: "ECC 两遍对齐，先消掉稳定后仍残留的亚像素抖动。",
+    description: "ECC 两遍估计残余抖动；真实结果表明还需增加静态残差门控。",
   },
   {
     number: "02",

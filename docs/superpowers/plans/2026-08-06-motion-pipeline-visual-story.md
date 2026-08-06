@@ -502,7 +502,7 @@ git commit -m "feat: add accessible pipeline evidence controls"
 - Consumes: `visual.kind` from `PipelineStage`.
 - Produces: `<TemporalClassifierDiagram />`, `<TrackLifecycleDiagram />`, and responsive styles for all six story stages.
 
-- [ ] **Step 1: Add failing assertions for truthful planned stages and corrected risk copy**
+- [x] **Step 1: Add failing assertions for truthful planned stages and corrected risk copy**
 
 ```javascript
 assert.match(html, /9–17 帧 RGB/);
@@ -513,13 +513,13 @@ assert.match(html, /预期输出/);
 assert.doesNotMatch(html, /不能比较尚未完成的 multiscale、tubelet 与 0\.7 尺度/);
 ```
 
-- [ ] **Step 2: Run the rendered page test and verify RED**
+- [x] **Step 2: Run the rendered page test and verify RED**
 
 Run: `cd progress-report-web && npm run build && node --test tests/rendered-html.test.mjs`
 
 Expected: fails because planned diagrams and corrected result boundary are not yet rendered.
 
-- [ ] **Step 3: Implement code-native diagrams without model-authored SVG**
+- [x] **Step 3: Implement code-native diagrams without model-authored SVG**
 
 ```tsx
 export function TemporalClassifierDiagram() {
@@ -548,7 +548,7 @@ export function TrackLifecycleDiagram() {
 }
 ```
 
-- [ ] **Step 4: Add responsive CSS and reduced-motion behavior**
+- [x] **Step 4: Add responsive CSS and reduced-motion behavior**
 
 Add the following structural rules, then extend their existing color variables for real, negative, and planned states:
 
@@ -606,7 +606,7 @@ The completed stylesheet must also:
 - use CSS boxes, borders, arrows, and pseudo-elements for planned diagrams;
 - disable transitions under `@media (prefers-reduced-motion: reduce)`.
 
-- [ ] **Step 5: Correct the stale risk statement**
+- [x] **Step 5: Correct the stale risk statement**
 
 Replace the obsolete claim that multiscale, Tubelet, and scale 0.7 cannot be compared with:
 
@@ -614,13 +614,13 @@ Replace the obsolete claim that multiscale, Tubelet, and scale 0.7 cannot be com
 "多尺度与现有 Tubelet 已完成，但当前结果明显未达约束；0.7 尺度帧差法是目前最有价值的降噪方向。"
 ```
 
-- [ ] **Step 6: Build and verify GREEN**
+- [x] **Step 6: Build and verify GREEN**
 
 Run: `cd progress-report-web && npm run build && node --test tests/rendered-html.test.mjs && npm run lint`
 
 Expected: build, rendered HTML tests, and lint all pass with no errors.
 
-- [ ] **Step 7: Commit the complete visual treatment**
+- [x] **Step 7: Commit the complete visual treatment**
 
 ```bash
 git add progress-report-web/app/components/planned-stage-diagrams.tsx progress-report-web/app/components/pipeline-story.tsx progress-report-web/app/globals.css progress-report-web/app/report-data.ts progress-report-web/tests/rendered-html.test.mjs
