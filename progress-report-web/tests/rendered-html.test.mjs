@@ -48,6 +48,23 @@ test("server-renders the complete Chinese progress report", async () => {
   assert.match(html, /id="evidence"/);
   assert.match(html, /src="\/evidence\/comparison\.webp"/);
   assert.match(html, /href="\/evidence\/comparison-original\.png"/);
+  assert.match(html, /同一场景，逐步收敛/);
+  assert.equal(
+    (html.match(/class="stage-status stage-status-real"/g) ?? []).length,
+    4,
+  );
+  assert.equal(
+    (html.match(/class="stage-status stage-status-planned"/g) ?? []).length,
+    2,
+  );
+  assert.match(html, /91\.26%/);
+  assert.match(html, /727\.72/);
+  assert.match(html, /只减少约 0\.07%/);
+  assert.match(html, /输入 → 处理 → 输出/);
+  assert.match(
+    html,
+    /src="\/evidence\/pipeline\/motion-overlay\.webp"/,
+  );
 });
 
 test("ships a lightweight evidence preview", async () => {

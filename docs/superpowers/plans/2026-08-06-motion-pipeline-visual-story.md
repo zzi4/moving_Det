@@ -210,7 +210,7 @@ git commit -m "feat: generate motion pipeline evidence visuals"
 - Consumes: static asset paths and exact metrics generated in Task 1.
 - Produces: `pipelineStory` and `<PipelineStory />`, with each stage carrying `status: "real" | "planned"`, `value`, `judgement`, `inputs`, `process`, and `output`.
 
-- [ ] **Step 1: Add failing rendered-HTML assertions**
+- [x] **Step 1: Add failing rendered-HTML assertions**
 
 ```javascript
 assert.match(html, /同一场景，逐步收敛/);
@@ -223,13 +223,13 @@ assert.match(html, /输入 → 处理 → 输出/);
 assert.match(html, /src="\/evidence\/pipeline\/motion-overlay\.webp"/);
 ```
 
-- [ ] **Step 2: Run the rendered page test and verify RED**
+- [x] **Step 2: Run the rendered page test and verify RED**
 
 Run: `cd progress-report-web && npm run build && node --test tests/rendered-html.test.mjs`
 
 Expected: the test fails because `同一场景，逐步收敛` and pipeline asset paths are absent.
 
-- [ ] **Step 3: Implement the typed content model and server component**
+- [x] **Step 3: Implement the typed content model and server component**
 
 ```ts
 export type PipelineLayer = {
@@ -360,7 +360,7 @@ export const pipelineStory: readonly PipelineStage[] = [
 
 `PipelineStory` must render an ordered list, status badge, question/answer, the `输入 → 处理 → 输出` strip, value cards, current judgement, and a visual slot for every stage.
 
-- [ ] **Step 4: Integrate beneath the existing six-card pipeline overview**
+- [x] **Step 4: Integrate beneath the existing six-card pipeline overview**
 
 ```tsx
 <div className="pipeline">
@@ -371,13 +371,13 @@ export const pipelineStory: readonly PipelineStage[] = [
 <PipelineStory />
 ```
 
-- [ ] **Step 5: Rebuild and verify GREEN**
+- [x] **Step 5: Rebuild and verify GREEN**
 
 Run: `cd progress-report-web && npm run build && node --test tests/rendered-html.test.mjs`
 
 Expected: all rendered HTML tests pass and the default evidence images are present in server HTML.
 
-- [ ] **Step 6: Commit the content structure**
+- [x] **Step 6: Commit the content structure**
 
 ```bash
 git add progress-report-web/app/pipeline-story-data.ts progress-report-web/app/components/pipeline-story.tsx progress-report-web/app/page.tsx progress-report-web/tests/rendered-html.test.mjs

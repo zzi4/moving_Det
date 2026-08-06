@@ -1,5 +1,6 @@
 import { LiveCalibration } from "./components/live-calibration";
 import { EvidenceImage } from "./components/evidence-image";
+import { PipelineStory } from "./components/pipeline-story";
 import {
   calibrationRows,
   conditions,
@@ -177,6 +178,8 @@ export default function Home() {
               ))}
             </div>
           </div>
+
+          <PipelineStory />
         </section>
 
         <section className="content-section" id="results">
