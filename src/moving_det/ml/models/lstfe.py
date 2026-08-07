@@ -197,9 +197,13 @@ class ShortTermAlign(nn.Module):
 
 
 class LongTermSelector(nn.Module):
-    """Select the valid long support with deterministic lowest cosine score."""
+    """Select a hard long support while training its cosine projection."""
 
-    def __init__(self, channels: int) -> None:
+    def __init__(
+        self,
+        channels: int,
+        temperature: float = 1.0,
+    ) -> None:
         super().__init__()
         if (
             isinstance(channels, bool)
@@ -207,7 +211,17 @@ class LongTermSelector(nn.Module):
             or channels <= 0
         ):
             raise ValueError("selector channels must be a positive integer")
+        if (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float))
+            or not math.isfinite(temperature)
+            or temperature <= 0
+        ):
+            raise ValueError(
+                "selector temperature must be a positive finite number"
+            )
         self.channels = channels
+        self.temperature = float(temperature)
         self.reduction = nn.Conv2d(
             channels,
             channels,
@@ -267,15 +281,33 @@ class LongTermSelector(nn.Module):
         selected_index = similarity.argmin(dim=1)
         all_invalid = ~valid.any(dim=1)
         selected_index = selected_index.masked_fill(all_invalid, -1)
-        gather_index = selected_index.clamp_min(0)
-        selected = candidates[
-            torch.arange(batch, device=current.device),
-            gather_index,
-        ]
-        selected = torch.where(
+
+        soft_logits = -similarity / self.temperature
+        safe_logits = torch.where(
+            all_invalid[:, None],
+            torch.zeros_like(soft_logits),
+            soft_logits,
+        )
+        soft_weights = torch.softmax(safe_logits, dim=1)
+        soft_weights = soft_weights.masked_fill(~valid, 0)
+        hard_weights = F.one_hot(
+            selected_index.clamp_min(0),
+            num_classes=4,
+        ).to(dtype=candidates.dtype)
+        hard_weights = hard_weights.masked_fill(~valid, 0)
+        selection_weights = hard_weights + (
+            soft_weights - soft_weights.detach()
+        )
+        safe_candidates = candidates.masked_fill(
+            ~valid[:, :, None, None, None],
+            0,
+        )
+        selected = (
+            selection_weights[:, :, None, None, None] * safe_candidates
+        ).sum(dim=1)
+        selected = selected.masked_fill(
             all_invalid[:, None, None, None],
-            torch.zeros_like(selected),
-            selected,
+            0,
         )
         return selected, selected_index
 

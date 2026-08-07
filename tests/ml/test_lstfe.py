@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 import torch
 from torch import Tensor, nn
+import torch.distributed as distributed
+from torch.nn.parallel import DistributedDataParallel
 
 from moving_det.ml.factory import create_model
 from moving_det.ml.models.baseline import BaselineOBB
@@ -203,6 +205,63 @@ def test_long_selector_masks_invalid_and_returns_zero_for_all_invalid():
     assert index[1].item() == -1
     assert torch.count_nonzero(selected[1]) == 0
     assert torch.isfinite(selected).all()
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_long_selector_preserves_hard_forward_and_trains_reduction(training):
+    torch.manual_seed(47)
+    selector = LongTermSelector(channels=4).train(training)
+    current = torch.randn(2, 4, 2, 2)
+    candidates = torch.randn(2, 4, 4, 2, 2, requires_grad=True)
+    valid = torch.tensor(
+        [[True, False, True, True], [False, True, True, False]],
+        dtype=torch.bool,
+    )
+
+    selected, index = selector(current, candidates, valid)
+    hard_selected = candidates[
+        torch.arange(current.shape[0]),
+        index,
+    ]
+    loss = selected.square().mean()
+    loss.backward()
+
+    assert torch.equal(selected.detach(), hard_selected.detach())
+    assert index.tolist() == [2, 2]
+    assert selector.reduction.weight.grad is not None
+    assert torch.isfinite(selector.reduction.weight.grad).all()
+    assert torch.count_nonzero(selector.reduction.weight.grad) > 0
+    assert candidates.grad is not None
+    assert torch.count_nonzero(candidates.grad[~valid]) == 0
+    chosen = torch.zeros_like(valid)
+    chosen[torch.arange(current.shape[0]), index] = True
+    assert torch.count_nonzero(candidates.grad[chosen]) > 0
+    assert torch.count_nonzero(candidates.grad[valid & ~chosen]) > 0
+
+
+def test_long_selector_all_invalid_backward_is_finite_and_exact_zero():
+    selector = LongTermSelector(channels=4).train()
+    current = torch.randn(2, 4, 2, 2)
+    candidates = torch.randn(2, 4, 4, 2, 2, requires_grad=True)
+    valid = torch.zeros(2, 4, dtype=torch.bool)
+
+    selected, index = selector(current, candidates, valid)
+    selected.sum().backward()
+
+    assert index.tolist() == [-1, -1]
+    assert torch.count_nonzero(selected) == 0
+    assert candidates.grad is not None
+    assert torch.count_nonzero(candidates.grad) == 0
+    reduction_gradient = selector.reduction.weight.grad
+    if reduction_gradient is not None:
+        assert torch.isfinite(reduction_gradient).all()
+        assert torch.count_nonzero(reduction_gradient) == 0
+
+
+@pytest.mark.parametrize("temperature", [0, -1.0, True, torch.inf])
+def test_long_selector_rejects_invalid_temperature(temperature):
+    with pytest.raises(ValueError, match="temperature"):
+        LongTermSelector(channels=4, temperature=temperature)
 
 
 @pytest.mark.parametrize("shape", [(16, 24), (13, 17)])
@@ -437,6 +496,10 @@ def test_model_forward_diagnostics_loss_and_gradients():
     }
     assert gradients["p2_align.offset.weight"] is not None
     assert any("position_projection" in name for name in gradients)
+    assert gradients["long_selector.reduction.weight"] is not None
+    assert torch.count_nonzero(
+        gradients["long_selector.reduction.weight"]
+    ) > 0
     assert any(name.startswith("detector.") for name in gradients)
     assert all(torch.isfinite(gradient).all() for gradient in gradients.values())
 
@@ -532,6 +595,43 @@ def test_factory_passes_configured_lstfe_offsets(monkeypatch):
     assert captured == {"weights": None, "offsets": configured}
 
 
+def test_two_lstfe_ddp_iterations_do_not_leave_reduction_unused(tmp_path):
+    init_file = tmp_path / "gloo-init"
+    distributed.init_process_group(
+        backend="gloo",
+        init_method=f"file://{init_file}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        model = LSTFEOBB(weights=None).train()
+        model.detector.criterion = model.detector.init_criterion()
+        wrapped = DistributedDataParallel(
+            model,
+            find_unused_parameters=False,
+        )
+        batch = _synthetic_batch(image_size=128)
+        gradients = []
+
+        for _ in range(2):
+            wrapped.zero_grad(set_to_none=True)
+            predictions = wrapped(batch)
+            loss_values, _ = model.detector.criterion(predictions, batch)
+            loss_values.sum().backward()
+            gradient = model.long_selector.reduction.weight.grad
+            gradients.append(
+                None if gradient is None else gradient.detach().clone()
+            )
+    finally:
+        if distributed.is_initialized():
+            distributed.destroy_process_group()
+
+    assert not distributed.is_initialized()
+    assert all(gradient is not None for gradient in gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert all(torch.count_nonzero(gradient) > 0 for gradient in gradients)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_cuda_forward_and_backward_are_finite():
     model = LSTFEOBB(weights=None).cuda().train()
@@ -547,3 +647,6 @@ def test_cuda_forward_and_backward_are_finite():
     assert torch.isfinite(total)
     assert model.p2_align.offset.weight.grad is not None
     assert torch.isfinite(model.p2_align.offset.weight.grad).all()
+    assert model.long_selector.reduction.weight.grad is not None
+    assert torch.isfinite(model.long_selector.reduction.weight.grad).all()
+    assert torch.count_nonzero(model.long_selector.reduction.weight.grad) > 0
