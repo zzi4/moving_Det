@@ -64,6 +64,9 @@ _FRACTION_FIELDS = ("negative_fraction", "ecc_min_correlation", "nms_iou")
 
 
 def _validate_exact_keys(values: dict) -> None:
+    if any(not isinstance(key, str) for key in values):
+        raise ValueError("configuration keys must be strings")
+
     expected_keys = {field.name for field in fields(TemporalOBBConfig)}
     actual_keys = set(values)
     missing_keys = expected_keys - actual_keys

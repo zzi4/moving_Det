@@ -22,6 +22,13 @@ def test_temporal_config_rejects_unknown_keys(tmp_path):
         load_temporal_config(path)
 
 
+def test_temporal_config_rejects_non_string_keys(tmp_path):
+    path = tmp_path / "bad.yaml"
+    path.write_text("1: true\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="keys must be strings"):
+        load_temporal_config(path)
+
+
 def _write_modified_config(tmp_path, **updates):
     with Path("configs/vrud-temporal-obb.yaml").open(encoding="utf-8") as stream:
         values = yaml.safe_load(stream)
