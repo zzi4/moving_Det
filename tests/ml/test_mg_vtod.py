@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
@@ -73,8 +74,56 @@ def _synthetic_mg_batch(*, moving: bool = True) -> dict[str, object]:
         "cls": torch.tensor([[2.0]], dtype=torch.float32),
         "batch_idx": torch.tensor([0.0], dtype=torch.float32),
         "transforms": _identity_transforms(1, 5),
-        "metadata": [{"sequence": "synthetic", "center_frame": 5}],
+        "metadata": [
+            {
+                "sequence": "synthetic",
+                "center_frame": 5,
+                "offsets": (-4, -2, 0, 2, 4),
+            }
+        ],
     }
+
+
+def _mixed_evidence_batch() -> dict[str, object]:
+    active = _synthetic_mg_batch(moving=True)
+    inactive = _synthetic_mg_batch(moving=True)
+    inactive["valid"] = torch.tensor(
+        [[False, False, True, False, False]],
+        dtype=torch.bool,
+    )
+    return {
+        "frames": torch.cat((active["frames"], inactive["frames"])),
+        "valid": torch.cat((active["valid"], inactive["valid"])),
+        "img": torch.cat((active["img"], inactive["img"])),
+        "bboxes": active["bboxes"],
+        "cls": active["cls"],
+        "batch_idx": active["batch_idx"],
+        "transforms": torch.cat(
+            (active["transforms"], inactive["transforms"])
+        ),
+        "metadata": [*active["metadata"], *inactive["metadata"]],
+    }
+
+
+def _batch_norm_state(module: nn.Module) -> dict[str, Tensor]:
+    state = {}
+    for name, child in module.named_modules():
+        if isinstance(child, nn.BatchNorm2d):
+            state[f"{name}.running_mean"] = child.running_mean.detach().clone()
+            state[f"{name}.running_var"] = child.running_var.detach().clone()
+            state[f"{name}.num_batches_tracked"] = (
+                child.num_batches_tracked.detach().clone()
+            )
+    return state
+
+
+def _assert_tensor_state_equal(
+    actual: dict[str, Tensor],
+    expected: dict[str, Tensor],
+) -> None:
+    assert actual.keys() == expected.keys()
+    for name, value in actual.items():
+        torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
 
 
 def _convert_network_inputs(
@@ -217,6 +266,136 @@ def test_model_derives_layer_two_channels_from_detector_graph(monkeypatch):
     assert last_motion_conv.out_channels == 37
 
 
+@pytest.mark.parametrize(
+    ("offsets", "message"),
+    [
+        ((-4, -2, 2, 4), "five"),
+        ((-4, 0, -2, 2, 4), "zero.*index 2"),
+        ((-4, -2, 0, 2, 2), "unique"),
+        ((-4, -2, 0, 2, True), "integers"),
+    ],
+)
+def test_constructor_rejects_invalid_offsets_before_detector_creation(
+    monkeypatch,
+    offsets,
+    message,
+):
+    def reject_detector_creation(*_args, **_kwargs):
+        raise AssertionError("invalid offsets must fail before detector creation")
+
+    monkeypatch.setattr(
+        "moving_det.ml.models.baseline.create_p2_obb_detector",
+        reject_detector_creation,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        MGVTODOBB(weights=None, offsets=offsets)
+
+
+def _break_temporal_contract(
+    defect: str,
+) -> dict[str, object]:
+    if defect == "mixed_offsets":
+        batch = _mixed_evidence_batch()
+    else:
+        batch = _synthetic_mg_batch()
+    if defect == "three_frames":
+        batch["frames"] = batch["frames"][:, 1:4]
+        batch["valid"] = batch["valid"][:, 1:4]
+        batch["transforms"] = batch["transforms"][:, 1:4]
+        batch["metadata"][0]["offsets"] = (-2, 0, 2)
+    elif defect == "misplaced_zero":
+        batch["metadata"][0]["offsets"] = (-4, 0, -2, 2, 4)
+    elif defect == "mixed_offsets":
+        batch["metadata"][1]["offsets"] = (-8, -4, 0, 4, 8)
+    elif defect == "missing_metadata":
+        batch.pop("metadata")
+    elif defect == "metadata_length":
+        batch["metadata"] = []
+    elif defect == "metadata_item":
+        batch["metadata"] = ["not-a-mapping"]
+    elif defect == "malformed_metadata":
+        batch["metadata"] = [{"offsets": "not-an-offset-sequence"}]
+    elif defect == "img_mismatch":
+        batch["img"] = batch["img"].clone()
+        batch["img"][0, 0, 0, 0] += 0.25
+    elif defect == "img_shape":
+        batch["img"] = batch["img"][:, :, :-1]
+    elif defect == "img_dtype":
+        batch["img"] = batch["img"].to(torch.float64)
+    elif defect == "center_invalid":
+        batch["valid"] = batch["valid"].clone()
+        batch["valid"][0, 2] = False
+    elif defect == "valid_dtype":
+        batch["valid"] = batch["valid"].to(torch.float32)
+    elif defect == "transform_shape":
+        batch["transforms"] = batch["transforms"][:, :, :, :2]
+    else:
+        raise AssertionError(f"unknown test defect: {defect}")
+    return batch
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    [
+        ("three_frames", "frames.*\\[B,5,3,H,W\\]"),
+        ("misplaced_zero", "zero.*index 2"),
+        ("mixed_offsets", "configured"),
+        ("missing_metadata", "metadata"),
+        ("metadata_length", "metadata.*one item"),
+        ("metadata_item", "metadata row 0.*mapping"),
+        ("malformed_metadata", "metadata.*offsets"),
+        ("img_mismatch", "center frame"),
+        ("img_shape", "img.*center frame shape"),
+        ("img_dtype", "img.*frames.*dtype"),
+        ("center_invalid", "center.*valid"),
+        ("valid_dtype", "valid.*boolean"),
+        ("transform_shape", "transforms.*\\[B,5,2,3\\]"),
+    ],
+)
+def test_invalid_temporal_contract_fails_before_graph_or_bn_mutation(
+    defect,
+    message,
+):
+    model = MGVTODOBB(weights=None).train()
+    batch = _break_temporal_contract(defect)
+    detector_before = _batch_norm_state(model.detector)
+    stem_before = _batch_norm_state(model.motion_stem)
+    detector_executions: list[int] = []
+    stem_inputs: list[Tensor] = []
+    handles = [
+        layer.register_forward_hook(
+            lambda module, _inputs, _output: detector_executions.append(
+                module.i
+            )
+        )
+        for layer in model.detector.model
+    ]
+    handles.append(
+        model.motion_stem.register_forward_pre_hook(
+            lambda _module, inputs: stem_inputs.append(inputs[0])
+        )
+    )
+
+    try:
+        with pytest.raises(ValueError, match=message):
+            model(batch)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert detector_executions == []
+    assert stem_inputs == []
+    _assert_tensor_state_equal(
+        _batch_norm_state(model.detector),
+        detector_before,
+    )
+    _assert_tensor_state_equal(
+        _batch_norm_state(model.motion_stem),
+        stem_before,
+    )
+
+
 def test_invalid_support_reduces_to_exact_rgb_detector_path():
     model = MGVTODOBB(weights=None).eval()
     batch = _synthetic_mg_batch(moving=True)
@@ -241,39 +420,88 @@ def test_invalid_support_reduces_to_exact_rgb_detector_path():
         torch.testing.assert_close(actual_feature, expected_feature)
 
 
-def test_invalid_support_stays_rgb_only_after_motion_bn_statistics_change():
+def test_invalid_support_skips_motion_bn_and_fuses_exact_rgb_after_bn_drift():
     model = MGVTODOBB(weights=None).train()
     moving = _synthetic_mg_batch(moving=True)
     with torch.no_grad():
         model(moving)
         model(moving)
-    model.eval()
     invalid = _synthetic_mg_batch(moving=True)
     invalid["img"] = moving["img"]
     invalid["valid"] = torch.tensor(
         [[False, False, True, False, False]],
         dtype=torch.bool,
     )
-
-    with torch.no_grad():
-        expected = _raw_training_output(
-            execute_yolo_graph(model.detector, invalid["img"])
+    before = _batch_norm_state(model.motion_stem)
+    stem_inputs: list[Tensor] = []
+    fusion_records: list[tuple[Tensor, Tensor, Tensor]] = []
+    stem_handle = model.motion_stem.register_forward_pre_hook(
+        lambda _module, inputs: stem_inputs.append(inputs[0].detach().clone())
+    )
+    fusion_handle = model.fusion.register_forward_hook(
+        lambda _module, inputs, output: fusion_records.append(
+            (
+                inputs[0].detach().clone(),
+                inputs[1].detach().clone(),
+                output.detach().clone(),
+            )
         )
-        actual = _raw_training_output(model(invalid))
+    )
 
+    try:
+        with torch.no_grad():
+            model(invalid)
+            model.eval()
+            expected = _raw_training_output(
+                execute_yolo_graph(model.detector, invalid["img"])
+            )
+            actual = _raw_training_output(model(invalid))
+    finally:
+        stem_handle.remove()
+        fusion_handle.remove()
+
+    assert stem_inputs == []
+    _assert_tensor_state_equal(_batch_norm_state(model.motion_stem), before)
+    assert len(fusion_records) == 2
+    for rgb_p2, motion_p2, fused_p2 in fusion_records:
+        assert torch.equal(motion_p2, torch.zeros_like(motion_p2))
+        assert torch.equal(fused_p2, rgb_p2)
     for key in ("boxes", "scores", "angle"):
         torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0)
-    for actual_feature, expected_feature in zip(
-        actual["feats"],
-        expected["feats"],
-        strict=True,
-    ):
-        torch.testing.assert_close(
-            actual_feature,
-            expected_feature,
-            rtol=0,
-            atol=0,
+
+
+def test_mixed_batch_excludes_inactive_row_from_motion_stem_and_fusion():
+    model = MGVTODOBB(weights=None).train()
+    batch = _mixed_evidence_batch()
+    stem_inputs: list[Tensor] = []
+    fusion_records: list[tuple[Tensor, Tensor, Tensor]] = []
+    stem_handle = model.motion_stem.register_forward_pre_hook(
+        lambda _module, inputs: stem_inputs.append(inputs[0].detach().clone())
+    )
+    fusion_handle = model.fusion.register_forward_hook(
+        lambda _module, inputs, output: fusion_records.append(
+            (
+                inputs[0].detach().clone(),
+                inputs[1].detach().clone(),
+                output.detach().clone(),
+            )
         )
+    )
+
+    try:
+        with torch.no_grad():
+            model(batch)
+    finally:
+        stem_handle.remove()
+        fusion_handle.remove()
+
+    assert len(stem_inputs) == 1
+    assert stem_inputs[0].shape[0] == 1
+    assert torch.count_nonzero(stem_inputs[0]) > 0
+    assert len(fusion_records) == 1
+    rgb_p2, motion_p2, fused_p2 = fusion_records[0]
+    assert torch.equal(motion_p2[1], torch.zeros_like(motion_p2[1]))
+    assert torch.equal(fused_p2[1], rgb_p2[1])
 
 
 def test_real_motion_changes_detector_output_for_same_center_frame():
@@ -335,8 +563,8 @@ def test_localized_alignment_suppresses_camera_motion_before_stem():
             )
         )
     batch = _synthetic_mg_batch(moving=False)
-    batch["img"] = center.unsqueeze(0)
     batch["frames"] = torch.stack(frames).unsqueeze(0)
+    batch["img"] = batch["frames"][:, 2].clone()
     aligned = torch.stack(transforms).unsqueeze(0)
     captured: list[Tensor] = []
     model = MGVTODOBB(weights=None).eval()
@@ -347,13 +575,14 @@ def test_localized_alignment_suppresses_camera_motion_before_stem():
         with torch.no_grad():
             batch["transforms"] = aligned
             model(batch)
+            assert captured == []
             batch["transforms"] = _identity_transforms(1, 5)
             model(batch)
     finally:
         handle.remove()
 
-    assert len(captured) == 2
-    assert float(captured[0].mean()) < float(captured[1].mean()) * 0.25
+    assert len(captured) == 1
+    assert torch.count_nonzero(captured[0]) > 0
 
 
 def test_partial_extraction_and_override_run_downstream_detector_once():
@@ -513,10 +742,13 @@ def test_factory_registration_is_lazy_and_weights_none_is_offline(
     cfg = load_temporal_config(
         Path("configs/vrud-temporal-obb.yaml")
     )
+    configured_offsets = (-8, -4, 0, 4, 8)
+    cfg = replace(cfg, mg_offsets=configured_offsets)
 
     model = create_model("mg_vtod", None, cfg)
 
     assert isinstance(model, MGVTODOBB)
+    assert model.offsets == configured_offsets
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

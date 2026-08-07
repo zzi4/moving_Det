@@ -15,6 +15,24 @@ from moving_det.ml.yolo_graph import (
 )
 
 
+_DEFAULT_OFFSETS = (-4, -2, 0, 2, 4)
+
+
+def _validate_offsets(offsets: tuple[int, ...]) -> tuple[int, ...]:
+    if not isinstance(offsets, tuple) or len(offsets) != 5:
+        raise ValueError("MG offsets must be a tuple of exactly five integers")
+    if any(
+        isinstance(offset, bool) or not isinstance(offset, int)
+        for offset in offsets
+    ):
+        raise ValueError("MG offsets must contain only integers")
+    if len(set(offsets)) != len(offsets):
+        raise ValueError("MG offsets must be unique")
+    if offsets.count(0) != 1 or offsets[2] != 0:
+        raise ValueError("MG offsets must place exactly one zero at index 2")
+    return offsets
+
+
 class MotionStem(nn.Module):
     """Encode a full-resolution scalar motion map as a stride-4 P2 tensor."""
 
@@ -123,34 +141,149 @@ class MGVTODOBB(BaselineOBB):
         self,
         weights: Path | str | None,
         nc: int = 4,
+        offsets: tuple[int, ...] = _DEFAULT_OFFSETS,
     ) -> None:
+        self.offsets = _validate_offsets(offsets)
         super().__init__(weights=weights, nc=nc)
         self.layer2_channels = _infer_layer2_channels(self.detector)
         self.motion_stem = MotionStem(self.layer2_channels)
         self.fusion = GatedMotionFusion(self.layer2_channels)
 
+    def _validate_batch(
+        self,
+        batch: Mapping[str, Any],
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if not isinstance(batch, Mapping):
+            raise ValueError("MG batch must be a mapping")
+
+        frames = batch.get("frames")
+        if (
+            not isinstance(frames, Tensor)
+            or frames.ndim != 5
+            or frames.shape[0] <= 0
+            or frames.shape[1] != 5
+            or frames.shape[2] != 3
+            or frames.shape[3] <= 0
+            or frames.shape[4] <= 0
+            or not frames.is_floating_point()
+        ):
+            raise ValueError(
+                "frames must be a floating tensor with shape [B,5,3,H,W]"
+            )
+        batch_size, _, _, height, width = frames.shape
+
+        valid = batch.get("valid")
+        if not isinstance(valid, Tensor) or valid.dtype != torch.bool:
+            raise ValueError("valid must be a boolean tensor")
+        if valid.shape != (batch_size, 5):
+            raise ValueError("valid must have shape [B,5]")
+        if valid.device != frames.device:
+            raise ValueError("valid and frames must be on the same device")
+        if not bool(valid[:, 2].all()):
+            raise ValueError("center frame at index 2 must be valid")
+
+        transforms = batch.get("transforms")
+        if (
+            not isinstance(transforms, Tensor)
+            or transforms.shape != (batch_size, 5, 2, 3)
+            or not transforms.is_floating_point()
+        ):
+            raise ValueError(
+                "transforms must be a floating tensor with shape [B,5,2,3]"
+            )
+        if transforms.device != frames.device:
+            raise ValueError(
+                "transforms and frames must be on the same device"
+            )
+
+        current = batch.get("img")
+        if (
+            not isinstance(current, Tensor)
+            or current.shape != (batch_size, 3, height, width)
+            or not current.is_floating_point()
+        ):
+            raise ValueError(
+                "img must match the center frame shape [B,3,H,W]"
+            )
+        if current.dtype != frames.dtype or current.device != frames.device:
+            raise ValueError(
+                "img and frames must share dtype and device"
+            )
+        if not torch.equal(current, frames[:, 2]):
+            raise ValueError(
+                "img must be tensor-equal to the center frame at index 2"
+            )
+
+        metadata = batch.get("metadata")
+        if not isinstance(metadata, list) or len(metadata) != batch_size:
+            raise ValueError(
+                "metadata must be a list with one item per batch row"
+            )
+        for row, item in enumerate(metadata):
+            if not isinstance(item, Mapping):
+                raise ValueError(f"metadata row {row} must be a mapping")
+            observed = item.get("offsets")
+            if (
+                not isinstance(observed, (tuple, list))
+                or len(observed) != 5
+                or any(
+                    isinstance(offset, bool)
+                    or not isinstance(offset, int)
+                    for offset in observed
+                )
+            ):
+                raise ValueError(
+                    f"metadata row {row} offsets must be a five-integer "
+                    "sequence"
+                )
+            observed_offsets = tuple(observed)
+            if (
+                observed_offsets.count(0) != 1
+                or observed_offsets[2] != 0
+            ):
+                raise ValueError(
+                    f"metadata row {row} offsets must place exactly one "
+                    "zero at index 2"
+                )
+            if observed_offsets != self.offsets:
+                raise ValueError(
+                    f"metadata row {row} offsets do not match configured "
+                    f"MG offsets {self.offsets}"
+                )
+        return current, frames, valid, transforms
+
     def forward(self, batch: Mapping[str, Any]) -> Any:
-        current = batch["img"]
-        if not isinstance(current, Tensor):
-            raise ValueError("batch img must be a tensor")
+        current, frames, valid, transforms = self._validate_batch(batch)
+        motion = compute_motion_strength(
+            frames,
+            valid,
+            transforms,
+        )
+        has_motion = (
+            motion.flatten(start_dim=1)
+            .amax(dim=1)
+            .gt(0)
+        )
         rgb_p2 = extract_backbone_features(
             self.detector,
             current,
             (2,),
         )[2]
-        motion = compute_motion_strength(
-            batch["frames"],
-            batch["valid"],
-            batch["transforms"],
-        )
-        motion_p2 = self.motion_stem(motion)
-        has_motion = (
-            motion.flatten(start_dim=1)
-            .amax(dim=1)
-            .gt(0)
-            .reshape(-1, 1, 1, 1)
-        )
-        motion_p2 = motion_p2 * has_motion.to(dtype=motion_p2.dtype)
+        motion_p2 = torch.zeros_like(rgb_p2)
+        active_indices = has_motion.nonzero(as_tuple=False).flatten()
+        if active_indices.numel() > 0:
+            active_motion = self.motion_stem(
+                motion.index_select(0, active_indices)
+            )
+            if active_motion.shape[1:] != rgb_p2.shape[1:]:
+                raise RuntimeError(
+                    "motion stem output does not match detector layer 2"
+                )
+            motion_p2 = motion_p2.index_copy(
+                0,
+                active_indices,
+                active_motion,
+            )
         fused_p2 = self.fusion(rgb_p2, motion_p2)
         return execute_yolo_graph(
             self.detector,

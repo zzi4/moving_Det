@@ -22,7 +22,7 @@ def create_model(
             raise RuntimeError(
                 "MG-VTOD is not available; implement the temporal model first"
             ) from exc
-        return MGVTODOBB(weights=weights)
+        return MGVTODOBB(weights=weights, offsets=cfg.mg_offsets)
     if name == "lstfe":
         try:
             from moving_det.ml.models.lstfe import LSTFEOBB
