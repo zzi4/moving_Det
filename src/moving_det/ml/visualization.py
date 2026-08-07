@@ -190,6 +190,7 @@ class PanelSample:
 
     frames: tuple[np.ndarray, ...]
     frame_offsets: tuple[int, ...]
+    long_candidate_offsets: tuple[int, int, int, int]
     ground_truth: tuple[PanelOBB, ...]
     baseline: tuple[PanelOBB, ...]
     mg_vtod: tuple[PanelOBB, ...]
@@ -232,6 +233,26 @@ class PanelSample:
         ):
             raise ValueError(
                 "frame_offsets must align with frames and contain one zero"
+            )
+        if (
+            not isinstance(self.long_candidate_offsets, tuple)
+            or len(self.long_candidate_offsets) != 4
+            or any(
+                isinstance(offset, bool) or not isinstance(offset, int)
+                for offset in self.long_candidate_offsets
+            )
+            or len(set(self.long_candidate_offsets)) != 4
+            or tuple(sorted(self.long_candidate_offsets))
+            != self.long_candidate_offsets
+            or 0 in self.long_candidate_offsets
+            or any(
+                offset not in self.frame_offsets
+                for offset in self.long_candidate_offsets
+            )
+        ):
+            raise ValueError(
+                "long_candidate_offsets must be four unique increasing "
+                "nonzero frame offsets"
             )
 
         height, width = shape[:2]
@@ -506,6 +527,13 @@ def _comparison_crop(sample: PanelSample) -> tuple[int, int, int, int]:
     return (x1, y1, x2, y2)
 
 
+def _selected_long_label(sample: PanelSample) -> str:
+    if sample.selected_long_index == -1:
+        return "none"
+    offset = sample.long_candidate_offsets[sample.selected_long_index]
+    return f"candidate {sample.selected_long_index} (t{offset:+d})"
+
+
 def _render_canvas(sample: PanelSample) -> Image.Image:
     canvas = Image.new("RGB", _CANVAS_SIZE, (9, 12, 17))
     draw = ImageDraw.Draw(canvas)
@@ -536,23 +564,7 @@ def _render_canvas(sample: PanelSample) -> Image.Image:
     column_width = (
         _CANVAS_SIZE[0] - 2 * margin - 2 * gap
     ) // 3
-    long_candidates = tuple(
-        offset
-        for offset in sample.frame_offsets
-        if abs(offset) >= 15
-    )
-    selected = (
-        "none"
-        if sample.selected_long_index == -1
-        else (
-            f"candidate {sample.selected_long_index}"
-            + (
-                f" (t{long_candidates[sample.selected_long_index]:+d})"
-                if sample.selected_long_index < len(long_candidates)
-                else ""
-            )
-        )
-    )
+    selected = _selected_long_label(sample)
     specifications = (
         (
             "Baseline",

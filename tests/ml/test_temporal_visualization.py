@@ -79,6 +79,7 @@ def panel_sample(tmp_path) -> PanelSample:
     return PanelSample(
         frames=frames,
         frame_offsets=(-30, -15, -2, 0, 2, 15, 30),
+        long_candidate_offsets=(-30, -15, 15, 30),
         ground_truth=(gt,),
         baseline=(miss, fp),
         mg_vtod=(tp,),
@@ -135,6 +136,35 @@ def test_temporal_panel_is_byte_deterministic(tmp_path, panel_sample):
     assert first.read_bytes() == second.read_bytes()
 
 
+def test_panel_uses_explicit_lstfe_long_candidates_not_union_magnitude(
+    panel_sample,
+):
+    import moving_det.ml.visualization as visualization
+
+    union_offsets = (-20, -16, -15, -4, -2, 0, 1, 2, 3, 4)
+    values = {
+        name: getattr(panel_sample, name)
+        for name in PanelSample.__dataclass_fields__
+    }
+    values.update(
+        {
+            "frames": tuple(
+                panel_sample.frames[index % len(panel_sample.frames)]
+                for index in range(len(union_offsets))
+            ),
+            "frame_offsets": union_offsets,
+            "long_candidate_offsets": (-20, -16, 2, 3),
+            "selected_long_index": 2,
+        }
+    )
+
+    sample = PanelSample(**values)
+
+    assert visualization._selected_long_label(sample) == (
+        "candidate 2 (t+2)"
+    )
+
+
 def test_panel_sample_owns_immutable_cpu_arrays(panel_sample):
     original = panel_sample.frames[0][0, 0].copy()
 
@@ -173,6 +203,11 @@ def test_panel_sample_owns_immutable_cpu_arrays(panel_sample):
                 )
             },
             "non-negative",
+        ),
+        ({"long_candidate_offsets": (-30, -15, 15)}, "long_candidate"),
+        (
+            {"long_candidate_offsets": (-30, -15, 15, 999)},
+            "long_candidate",
         ),
         ({"selected_long_index": 4}, "selected"),
         ({"center_frame": True}, "center_frame"),

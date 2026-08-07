@@ -1670,6 +1670,47 @@ def _valid_diagnostic(tmp_path: Path) -> dict[str, object]:
     }
 
 
+def _lstfe_diagnostic_bundle(
+    tmp_path: Path,
+    *,
+    selected_long_index: int,
+    missing_support_indices: frozenset[int] = frozenset(),
+) -> tuple[EvaluationRequest, EvaluationArtifacts]:
+    request = replace(
+        _evaluation_request(tmp_path),
+        model_name="lstfe",
+        alignment_cache=tmp_path / "alignment-cache",
+    )
+    offsets = tuple(request.cfg.lstfe_offsets)
+    diagnostic = _valid_diagnostic(tmp_path)
+    diagnostic["offsets"] = list(offsets)
+    diagnostic["support_paths"] = [
+        (
+            None
+            if index in missing_support_indices
+            else str(
+                (tmp_path / "images").resolve()
+                / "site19_sequence"
+                / "sequence_a"
+                / f"{31 + offset:06d}.jpg"
+            )
+        )
+        for index, offset in enumerate(offsets)
+    ]
+    diagnostic["selected_long_index"] = selected_long_index
+    base = _evaluation_bundle(validation=True)
+    bundle = replace(
+        base,
+        threshold_evidence={
+            **dict(base.threshold_evidence),
+            "model_name": "lstfe",
+        },
+        diagnostics=(diagnostic,),
+        alignment_cache_sha256="d" * 64,
+    )
+    return request, bundle
+
+
 @pytest.mark.parametrize(
     ("section", "mutation"),
     [
@@ -1919,6 +1960,92 @@ def test_evaluation_rejects_lstfe_long_index_outside_four_candidates(tmp_path):
 
     with pytest.raises(WorkflowError, match="selected_long_index"):
         _validate_evaluation_artifacts(bundle, request)
+
+
+def test_lstfe_diagnostic_allows_no_selection_only_when_all_long_slots_missing(
+    tmp_path,
+):
+    request, bundle = _lstfe_diagnostic_bundle(
+        tmp_path,
+        selected_long_index=-1,
+        missing_support_indices=frozenset({0, 1, 5, 6}),
+    )
+
+    validated = _validate_evaluation_artifacts(bundle, request)
+
+    assert validated.diagnostics[0]["selected_long_index"] == -1
+
+
+@pytest.mark.parametrize(
+    ("selected_long_index", "missing_support_indices"),
+    [
+        (-1, frozenset({1, 5, 6})),
+        (2, frozenset({5})),
+        (0, frozenset({0, 1, 5, 6})),
+    ],
+    ids=[
+        "negative-one-with-valid-candidate",
+        "selected-candidate-missing",
+        "selection-when-all-invalid",
+    ],
+)
+def test_lstfe_diagnostic_rejects_impossible_long_selection(
+    tmp_path,
+    selected_long_index,
+    missing_support_indices,
+):
+    request, bundle = _lstfe_diagnostic_bundle(
+        tmp_path,
+        selected_long_index=selected_long_index,
+        missing_support_indices=missing_support_indices,
+    )
+
+    with pytest.raises(WorkflowError, match="selected_long_index"):
+        _validate_evaluation_artifacts(bundle, request)
+
+
+@pytest.mark.parametrize(
+    "wrong_path",
+    [
+        "site22_sequence/sequence_a/000031.jpg",
+        "site19_sequence/sequence_b/000031.jpg",
+        "site19_sequence/sequence_a/000032.jpg",
+    ],
+    ids=["wrong-site", "wrong-sequence", "wrong-frame"],
+)
+def test_diagnostic_support_path_must_match_exact_frame_identity(
+    tmp_path,
+    wrong_path,
+):
+    request = _evaluation_request(tmp_path)
+    diagnostic = _valid_diagnostic(tmp_path)
+    diagnostic["support_paths"] = [
+        str((tmp_path / "images" / wrong_path).resolve())
+    ]
+    bundle = replace(
+        _evaluation_bundle(validation=True),
+        diagnostics=(diagnostic,),
+    )
+
+    with pytest.raises(WorkflowError, match="support path"):
+        _validate_evaluation_artifacts(bundle, request)
+
+
+def test_diagnostic_rejects_repeated_path_for_different_offsets(tmp_path):
+    request, bundle = _lstfe_diagnostic_bundle(
+        tmp_path,
+        selected_long_index=0,
+    )
+    diagnostic = dict(bundle.diagnostics[0])
+    paths = list(diagnostic["support_paths"])
+    paths[1] = paths[0]
+    diagnostic["support_paths"] = paths
+
+    with pytest.raises(WorkflowError, match="support path"):
+        _validate_evaluation_artifacts(
+            replace(bundle, diagnostics=(diagnostic,)),
+            request,
+        )
 
 
 def test_lstfe_diagnostic_accepts_four_relative_long_indices_independent_of_offsets(
@@ -3163,8 +3290,15 @@ def test_visualize_saved_runs_renders_real_three_model_temporal_panel(
     source = source_parent / "images"
     source.mkdir(parents=True)
     support_paths = {}
-    for index, offset in enumerate((-30, -15, -4, -2, 0, 2, 4, 15, 30)):
-        path = source / f"{index:02d}.jpg"
+    union_offsets = (-20, -16, -15, -4, -2, 0, 1, 2, 3, 4)
+    for index, offset in enumerate(union_offsets):
+        path = (
+            source
+            / "site19_sequence"
+            / "sequence_a"
+            / f"{31 + offset:06d}.jpg"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
         Image.new(
             "RGB",
             (640, 360),
@@ -3214,7 +3348,7 @@ def test_visualize_saved_runs_renders_real_three_model_temporal_panel(
         offsets = {
             "baseline": (0,),
             "mg_vtod": (-4, -2, 0, 2, 4),
-            "lstfe": (-30, -15, -2, 0, 2, 15, 30),
+            "lstfe": (-20, -16, -15, 0, 1, 2, 3),
         }[model]
         diagnostic = {
             "schema_version": 1,
@@ -3226,7 +3360,7 @@ def test_visualize_saved_runs_renders_real_three_model_temporal_panel(
             "offsets": list(offsets),
             "support_paths": [support_paths[offset] for offset in offsets],
             "motion_map": [[0.2] * 320 for _ in range(180)],
-            "selected_long_index": 1 if model == "lstfe" else -1,
+            "selected_long_index": 2 if model == "lstfe" else -1,
             "short_alignment_magnitude": [
                 [0.1] * 320 for _ in range(180)
             ],
@@ -3267,16 +3401,12 @@ def test_visualize_saved_runs_renders_real_three_model_temporal_panel(
     index = json.loads((output / "index.json").read_text(encoding="utf-8"))
     assert index["mode"] == "three-model-temporal-evidence"
     assert len(index["panels"]) == 1
-    assert index["panels"][0]["frame_offsets"] == [
-        -30,
-        -15,
-        -4,
-        -2,
-        0,
+    assert index["panels"][0]["frame_offsets"] == list(union_offsets)
+    assert index["panels"][0]["long_candidate_offsets"] == [
+        -20,
+        -16,
         2,
-        4,
-        15,
-        30,
+        3,
     ]
     assert index["panels"][0]["diagnostic_tile_xywh"] == [
         160,

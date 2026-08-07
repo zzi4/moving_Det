@@ -108,6 +108,7 @@ _DIAGNOSTIC_FIELDS = frozenset(
     }
 )
 _DIAGNOSTIC_MAP_SHAPE = (180, 320)
+_LSTFE_LONG_SLOTS = (0, 1, 5, 6)
 _EVALUATION_RUN_FIELDS = frozenset(
     {
         "schema_version",
@@ -1751,6 +1752,7 @@ def _validate_diagnostic_rows(
             raise WorkflowError(
                 f"{model_name} diagnostic temporal structure is invalid"
             )
+        site, sequence, frame = identity
         for offset, path_value in zip(offsets, paths, strict=True):
             if path_value is None:
                 if offset == 0:
@@ -1760,8 +1762,17 @@ def _validate_diagnostic_rows(
                 path_value,
                 field="diagnostic support path",
             )
-            if not support.is_relative_to(expected_root):
-                raise WorkflowError("diagnostic support path escapes image_root")
+            support_frame = frame + offset
+            expected_support = (
+                expected_root
+                / f"{site}_sequence"
+                / sequence
+                / f"{support_frame:06d}.jpg"
+            ).resolve(strict=False)
+            if support_frame <= 0 or support != expected_support:
+                raise WorkflowError(
+                    "diagnostic support path does not match its frame identity"
+                )
         _validate_diagnostic_map(raw["motion_map"], field="motion_map")
         _validate_diagnostic_map(
             raw["short_alignment_magnitude"],
@@ -1771,7 +1782,15 @@ def _validate_diagnostic_rows(
         if isinstance(selected, bool) or not isinstance(selected, int):
             raise WorkflowError("diagnostic selected_long_index is invalid")
         if model_name == "lstfe":
-            if selected < 0 or selected >= 4:
+            long_paths = tuple(paths[index] for index in _LSTFE_LONG_SLOTS)
+            if selected == -1:
+                selection_valid = all(path is None for path in long_paths)
+            else:
+                selection_valid = (
+                    0 <= selected < len(_LSTFE_LONG_SLOTS)
+                    and long_paths[selected] is not None
+                )
+            if not selection_valid:
                 raise WorkflowError("LSTFE selected_long_index is invalid")
         elif selected != -1:
             raise WorkflowError(
@@ -4917,6 +4936,16 @@ def _render_saved_run_panels(
         offsets = tuple(sorted(support_by_offset))
         if offsets.count(0) != 1:
             raise WorkflowError("saved diagnostic union requires one center")
+        lstfe_offsets_raw = lstfe_diagnostic.get("offsets")
+        if (
+            not isinstance(lstfe_offsets_raw, list)
+            or len(lstfe_offsets_raw) != 7
+        ):
+            raise WorkflowError("saved LSTFE diagnostic offsets are invalid")
+        long_candidate_offsets = tuple(
+            int(lstfe_offsets_raw[index])
+            for index in _LSTFE_LONG_SLOTS
+        )
         paths_raw = tuple(support_by_offset[offset] for offset in offsets)
         current_index = offsets.index(0)
         current_path_value = paths_raw[current_index]
@@ -4972,6 +5001,7 @@ def _render_saved_run_panels(
         sample = PanelSample(
             frames=tuple(frames),
             frame_offsets=offsets,
+            long_candidate_offsets=long_candidate_offsets,
             ground_truth=ground_truth,
             baseline=_matched_panel_rows(
                 local_predictions["baseline"],
@@ -5021,6 +5051,7 @@ def _render_saved_run_panels(
                 "frame": frame,
                 "path": str(relative),
                 "frame_offsets": list(offsets),
+                "long_candidate_offsets": list(long_candidate_offsets),
                 "diagnostic_tile_xywh": [
                     diagnostic_tile.x,
                     diagnostic_tile.y,
