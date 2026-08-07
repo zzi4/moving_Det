@@ -27,6 +27,7 @@ from moving_det.temporal_config import load_temporal_config
 
 
 OFFSETS = (-30, -15, -2, 0, 2, 15, 30)
+SAFE_SELECTOR_TEMPERATURE = 1e-4
 _MANIFEST_CHILDREN = (
     "train.jsonl",
     "validation.jsonl",
@@ -262,6 +263,87 @@ def test_long_selector_all_invalid_backward_is_finite_and_exact_zero():
 def test_long_selector_rejects_invalid_temperature(temperature):
     with pytest.raises(ValueError, match="temperature"):
         LongTermSelector(channels=4, temperature=temperature)
+
+
+@pytest.mark.parametrize(
+    "temperature",
+    [
+        1e-40,
+        torch.nextafter(
+            torch.tensor(SAFE_SELECTOR_TEMPERATURE, dtype=torch.float64),
+            torch.tensor(0.0, dtype=torch.float64),
+        ).item(),
+    ],
+)
+def test_long_selector_rejects_temperature_below_safe_minimum(temperature):
+    with pytest.raises(ValueError, match=r"temperature.*at least 0\.0001"):
+        LongTermSelector(channels=4, temperature=temperature)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("temperature", [None, SAFE_SELECTOR_TEMPERATURE])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="CUDA unavailable",
+            ),
+        ),
+    ],
+)
+def test_safe_and_default_temperature_keep_hard_selection_and_gradients_finite(
+    device,
+    dtype,
+    temperature,
+):
+    kwargs = {} if temperature is None else {"temperature": temperature}
+    selector = (
+        LongTermSelector(channels=4, **kwargs)
+        .to(device=device, dtype=dtype)
+        .train()
+    )
+    current = torch.tensor(
+        [[[[1.0]], [[0.0]], [[0.0]], [[0.0]]]],
+        dtype=dtype,
+        device=device,
+    )
+    candidates = torch.tensor(
+        [
+            [
+                [[[0.5]], [[0.866]], [[0.0]], [[0.0]]],
+                [[[2.5025]], [[4.3285]], [[0.0]], [[0.0]]],
+                [[[1000.0]], [[-1000.0]], [[0.0]], [[0.0]]],
+                [[[-1000.0]], [[1000.0]], [[0.0]], [[0.0]]],
+            ]
+        ],
+        dtype=dtype,
+        device=device,
+        requires_grad=True,
+    )
+    valid = torch.tensor(
+        [[True, True, False, False]],
+        device=device,
+    )
+
+    selected, index = selector(current, candidates, valid)
+    hard_selected = candidates[
+        torch.arange(current.shape[0], device=device),
+        index,
+    ]
+    selected[:, 1].sum().backward()
+
+    assert index.item() in {0, 1}
+    assert torch.equal(selected.detach(), hard_selected.detach())
+    assert torch.isfinite(selected).all()
+    assert selector.reduction.weight.grad is not None
+    assert torch.isfinite(selector.reduction.weight.grad).all()
+    assert torch.count_nonzero(selector.reduction.weight.grad) > 0
+    assert candidates.grad is not None
+    assert torch.count_nonzero(candidates.grad[:, 2:]) == 0
 
 
 @pytest.mark.parametrize("shape", [(16, 24), (13, 17)])

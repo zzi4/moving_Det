@@ -21,6 +21,9 @@ _DEFAULT_OFFSETS = (-30, -15, -2, 0, 2, 15, 30)
 _CURRENT_INDEX = 3
 _SHORT_INDICES = (2, 4)
 _LONG_INDICES = (0, 1, 5, 6)
+# Keeps the worst-case cosine logit magnitude (1 / T) below 10,000,
+# safely inside float16 while softmax and cosine math run in float32.
+MIN_SELECTOR_TEMPERATURE = 1e-4
 
 
 def _validate_offsets(offsets: tuple[int, ...]) -> tuple[int, ...]:
@@ -215,10 +218,11 @@ class LongTermSelector(nn.Module):
             isinstance(temperature, bool)
             or not isinstance(temperature, (int, float))
             or not math.isfinite(temperature)
-            or temperature <= 0
+            or temperature < MIN_SELECTOR_TEMPERATURE
         ):
             raise ValueError(
-                "selector temperature must be a positive finite number"
+                "selector temperature must be finite and at least "
+                f"{MIN_SELECTOR_TEMPERATURE:g}"
             )
         self.channels = channels
         self.temperature = float(temperature)
@@ -233,6 +237,8 @@ class LongTermSelector(nn.Module):
     def _embed(self, features: Tensor) -> Tensor:
         reduced = self.reduction(features)
         pooled = F.adaptive_max_pool2d(reduced, output_size=1).flatten(1)
+        if pooled.dtype in (torch.float16, torch.bfloat16):
+            pooled = pooled.float()
         return F.normalize(pooled, dim=-1, eps=1e-12)
 
     def forward(
@@ -253,7 +259,7 @@ class LongTermSelector(nn.Module):
             )
 
         current_embedding = self._embed(current)
-        candidate_embeddings = current.new_zeros(
+        candidate_embeddings = current_embedding.new_zeros(
             (batch, 4, self.channels)
         )
         flattened_valid = valid.reshape(-1)
@@ -298,6 +304,7 @@ class LongTermSelector(nn.Module):
         selection_weights = hard_weights + (
             soft_weights - soft_weights.detach()
         )
+        selection_weights = selection_weights.to(dtype=candidates.dtype)
         safe_candidates = candidates.masked_fill(
             ~valid[:, :, None, None, None],
             0,
