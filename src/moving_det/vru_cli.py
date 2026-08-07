@@ -4,14 +4,20 @@ import argparse
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 import csv
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, is_dataclass, replace
+from datetime import datetime, timezone
 import hashlib
+import importlib.metadata
 import io
 import json
+import math
 import os
 from pathlib import Path
+import platform
 import shutil
+import subprocess
 import tempfile
+import time
 from types import MappingProxyType
 from typing import Any
 
@@ -38,11 +44,99 @@ _EVALUATION_TABLES = (
     "per_speed",
     "per_track",
 )
-_EVALUATION_ARTIFACT_SCHEMA = {
-    "metrics": 1,
-    "predictions": 1,
-    "ground_truth": 2,
+_EVALUATION_ARTIFACT_VERSIONS = {
+    "metrics.json": 1,
+    "predictions.jsonl": 1,
+    "ground-truth.jsonl": 2,
+    "per_class.csv": 1,
+    "per_size.csv": 1,
+    "per_speed.csv": 1,
+    "per_track.csv": 1,
+    "threshold.json": 1,
+    "diagnostics.jsonl": 1,
 }
+_EVALUATION_REQUIRED_ARTIFACTS = frozenset(
+    {
+        "metrics.json",
+        "predictions.jsonl",
+        "ground-truth.jsonl",
+        "per_class.csv",
+        "per_size.csv",
+        "per_speed.csv",
+        "per_track.csv",
+    }
+)
+_PREDICTION_FIELDS = frozenset(
+    {
+        "schema_version",
+        "site",
+        "sequence",
+        "frame",
+        "class_id",
+        "confidence",
+        "obb",
+        "tile_xywh",
+    }
+)
+_GROUND_TRUTH_FIELDS = frozenset(
+    {
+        "schema_version",
+        "site",
+        "sequence",
+        "frame",
+        "class_id",
+        "track_id",
+        "mean_speed_mps",
+        "frame_speed_mps",
+        "obb",
+    }
+)
+_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "schema_version",
+        "site",
+        "sequence",
+        "frame",
+        "frame_shape",
+        "image_root",
+        "offsets",
+        "support_paths",
+        "motion_map",
+        "selected_long_index",
+        "short_alignment_magnitude",
+        "diagnostic_tile_xywh",
+    }
+)
+_DIAGNOSTIC_MAP_SHAPE = (180, 320)
+_EVALUATION_RUN_FIELDS = frozenset(
+    {
+        "schema_version",
+        "model_name",
+        "evaluation_split",
+        "manifest_sha256",
+        "checkpoint_sha256",
+        "config_sha256",
+        "class_schema",
+        "detection_frame_keys",
+        "continuity_frame_keys",
+        "audit",
+        "image_root",
+        "metadata_root",
+        "seed",
+        "alignment_cache",
+        "alignment_cache_sha256",
+        "threshold_source",
+        "threshold_sha256",
+        "git_commit",
+        "git_dirty",
+        "environment",
+        "started_at_utc",
+        "finished_at_utc",
+        "duration_seconds",
+        "artifact_schema",
+        "artifact_sha256",
+    }
+)
 _AUDIT_FIELDS = (
     "site",
     "sequence",
@@ -390,10 +484,8 @@ def _validate_output(
     destination = Path(output)
     _reject_symlink_components(destination)
     for source in source_roots:
-        source_resolved = Path(source).resolve(strict=False)
-        output_resolved = destination.resolve(strict=False)
-        if output_resolved == source_resolved or source_resolved in output_resolved.parents:
-            raise WorkflowError(f"output must not be inside source root: {source}")
+        if _paths_overlap(destination, Path(source)):
+            raise WorkflowError(f"output overlaps source root: {source}")
     for input_path in inputs:
         if _paths_overlap(destination, Path(input_path)):
             raise WorkflowError(f"output overlaps an input artifact: {input_path}")
@@ -1340,6 +1432,360 @@ def _threshold_payload(
     return payload
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _safe_evidence_identity(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value not in {".", ".."}
+        and "/" not in value
+        and "\\" not in value
+        and all(
+            character.isprintable() and ord(character) >= 32
+            for character in value
+        )
+    )
+
+
+def _evidence_frame_identity(
+    row: Mapping[str, object],
+    *,
+    artifact: str,
+) -> tuple[str, str, int]:
+    site = row.get("site")
+    sequence = row.get("sequence")
+    frame = row.get("frame")
+    if (
+        not _safe_evidence_identity(site)
+        or not _safe_evidence_identity(sequence)
+        or isinstance(frame, bool)
+        or not isinstance(frame, int)
+        or frame <= 0
+    ):
+        raise WorkflowError(f"{artifact} row identity is invalid")
+    return str(site), str(sequence), frame
+
+
+def _validate_canonical_obb(value: object, *, artifact: str) -> list[float]:
+    if not isinstance(value, list) or len(value) != 5:
+        raise WorkflowError(f"{artifact} OBB schema is invalid")
+    if any(
+        isinstance(item, bool)
+        or not isinstance(item, (int, float))
+        or not math.isfinite(float(item))
+        for item in value
+    ):
+        raise WorkflowError(f"{artifact} OBB values are invalid")
+    cx, cy, width, height, theta = (float(item) for item in value)
+    if (
+        height <= 0
+        or width < height
+        or not -math.pi / 2 <= theta < math.pi / 2
+    ):
+        raise WorkflowError(f"{artifact} OBB is not canonical")
+    return [cx, cy, width, height, theta]
+
+
+def _validate_tile(
+    value: object,
+    *,
+    artifact: str,
+    frame_shape: tuple[int, int] | None = None,
+) -> list[int]:
+    if (
+        not isinstance(value, list)
+        or len(value) != 4
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+    ):
+        raise WorkflowError(f"{artifact} tile schema is invalid")
+    x, y, width, height = value
+    if x < 0 or y < 0 or width <= 0 or height <= 0:
+        raise WorkflowError(f"{artifact} tile values are invalid")
+    if frame_shape is not None:
+        frame_height, frame_width = frame_shape
+        if x + width > frame_width or y + height > frame_height:
+            raise WorkflowError(f"{artifact} tile lies outside its frame")
+    return list(value)
+
+
+def _frame_universe(
+    detection_frames: Sequence[Mapping[str, object]],
+    continuity_frames: Sequence[Mapping[str, object]],
+) -> frozenset[tuple[str, str, int]]:
+    return frozenset(
+        (str(row["site"]), str(row["sequence"]), int(row["frame"]))
+        for row in (*detection_frames, *continuity_frames)
+    )
+
+
+def _validate_prediction_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    universe: frozenset[tuple[str, str, int]],
+) -> tuple[dict[str, object], ...]:
+    normalized = []
+    seen: set[str] = set()
+    for raw in rows:
+        version = raw.get("schema_version")
+        if (
+            set(raw) != _PREDICTION_FIELDS
+            or type(version) is not int
+            or version != 1
+        ):
+            raise WorkflowError("prediction row schema is invalid")
+        identity = _evidence_frame_identity(raw, artifact="prediction")
+        if identity not in universe:
+            raise WorkflowError("prediction row escapes the frozen frame universe")
+        class_id = raw["class_id"]
+        confidence = raw["confidence"]
+        if (
+            isinstance(class_id, bool)
+            or not isinstance(class_id, int)
+            or class_id not in {0, 1, 2, 3}
+            or isinstance(confidence, bool)
+            or not isinstance(confidence, (int, float))
+            or not math.isfinite(float(confidence))
+            or not 0.0 <= float(confidence) <= 1.0
+        ):
+            raise WorkflowError("prediction row values are invalid")
+        obb = _validate_canonical_obb(raw["obb"], artifact="prediction")
+        tile = _validate_tile(raw["tile_xywh"], artifact="prediction")
+        if not (
+            tile[0] <= obb[0] <= tile[0] + tile[2]
+            and tile[1] <= obb[1] <= tile[1] + tile[3]
+        ):
+            raise WorkflowError("prediction OBB center lies outside its tile")
+        row = dict(raw)
+        canonical = json.dumps(
+            row,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if canonical in seen:
+            raise WorkflowError("duplicate prediction row")
+        seen.add(canonical)
+        normalized.append(row)
+    return tuple(normalized)
+
+
+def _safe_track_id(value: object) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value >= 0
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and ":" not in value
+        and all(
+            character.isprintable() and ord(character) >= 32
+            for character in value
+        )
+    )
+
+
+def _validate_ground_truth_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    universe: frozenset[tuple[str, str, int]],
+) -> tuple[dict[str, object], ...]:
+    normalized = []
+    seen: set[tuple[str, str, int, str, object]] = set()
+    for raw in rows:
+        version = raw.get("schema_version")
+        if (
+            set(raw) != _GROUND_TRUTH_FIELDS
+            or type(version) is not int
+            or version != 2
+        ):
+            raise WorkflowError("ground-truth row schema is invalid")
+        site, sequence, frame = _evidence_frame_identity(
+            raw,
+            artifact="ground-truth",
+        )
+        if (site, sequence, frame) not in universe:
+            raise WorkflowError("ground-truth row escapes the frozen frame universe")
+        class_id = raw["class_id"]
+        track_id = raw["track_id"]
+        if (
+            isinstance(class_id, bool)
+            or not isinstance(class_id, int)
+            or class_id not in {0, 1, 2, 3}
+            or not _safe_track_id(track_id)
+        ):
+            raise WorkflowError("ground-truth row identity values are invalid")
+        for field in ("mean_speed_mps", "frame_speed_mps"):
+            value = raw[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise WorkflowError(f"ground-truth {field} is invalid")
+        _validate_canonical_obb(raw["obb"], artifact="ground-truth")
+        typed_identity = (
+            site,
+            sequence,
+            frame,
+            type(track_id).__name__,
+            track_id,
+        )
+        if typed_identity in seen:
+            raise WorkflowError("duplicate typed ground-truth state")
+        seen.add(typed_identity)
+        normalized.append(dict(raw))
+    return tuple(normalized)
+
+
+def _validate_diagnostic_map(value: object, *, field: str) -> None:
+    if not isinstance(value, list) or len(value) != _DIAGNOSTIC_MAP_SHAPE[0]:
+        raise WorkflowError(f"diagnostic {field} shape is invalid")
+    for row in value:
+        if (
+            not isinstance(row, list)
+            or len(row) != _DIAGNOSTIC_MAP_SHAPE[1]
+            or any(
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+                or float(item) < 0
+                for item in row
+            )
+        ):
+            raise WorkflowError(f"diagnostic {field} values are invalid")
+
+
+def _absolute_resolved_path(value: object, *, field: str) -> Path:
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise WorkflowError(f"{field} must be an absolute resolved path")
+    path = Path(value)
+    if not path.is_absolute() or str(path.resolve(strict=False)) != value:
+        raise WorkflowError(f"{field} must be an absolute resolved path")
+    return path
+
+
+def _validate_diagnostic_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    universe: frozenset[tuple[str, str, int]],
+    model_name: str,
+    image_root: Path,
+    expected_offsets: tuple[int, ...] | None,
+) -> tuple[dict[str, object], ...]:
+    normalized = []
+    seen: set[tuple[str, str, int]] = set()
+    expected_root = image_root.resolve(strict=False)
+    for raw in rows:
+        version = raw.get("schema_version")
+        if (
+            set(raw) != _DIAGNOSTIC_FIELDS
+            or type(version) is not int
+            or version != 1
+        ):
+            raise WorkflowError("diagnostic row schema is invalid")
+        identity = _evidence_frame_identity(raw, artifact="diagnostic")
+        if identity not in universe:
+            raise WorkflowError("diagnostic row escapes the frozen frame universe")
+        if identity in seen:
+            raise WorkflowError("duplicate diagnostic frame identity")
+        seen.add(identity)
+        frame_shape = raw["frame_shape"]
+        if (
+            not isinstance(frame_shape, list)
+            or len(frame_shape) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in frame_shape
+            )
+        ):
+            raise WorkflowError("diagnostic frame shape is invalid")
+        row_root = _absolute_resolved_path(
+            raw["image_root"],
+            field="diagnostic image_root",
+        )
+        if row_root != expected_root:
+            raise WorkflowError("diagnostic image_root provenance is mismatched")
+        offsets = raw["offsets"]
+        paths = raw["support_paths"]
+        if (
+            not isinstance(offsets, list)
+            or not offsets
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in offsets)
+            or len(set(offsets)) != len(offsets)
+            or offsets.count(0) != 1
+            or (
+                expected_offsets is not None
+                and offsets != list(expected_offsets)
+            )
+            or not isinstance(paths, list)
+            or len(paths) != len(offsets)
+        ):
+            raise WorkflowError("diagnostic temporal support schema is invalid")
+        if (
+            (model_name == "baseline" and offsets != [0])
+            or (
+                model_name == "mg_vtod"
+                and (len(offsets) != 5 or offsets[2] != 0)
+            )
+            or (
+                model_name == "lstfe"
+                and (
+                    len(offsets) != 7
+                    or offsets[3] != 0
+                    or offsets != sorted(offsets)
+                )
+            )
+        ):
+            raise WorkflowError(
+                f"{model_name} diagnostic temporal structure is invalid"
+            )
+        for offset, path_value in zip(offsets, paths, strict=True):
+            if path_value is None:
+                if offset == 0:
+                    raise WorkflowError("diagnostic center support path is missing")
+                continue
+            support = _absolute_resolved_path(
+                path_value,
+                field="diagnostic support path",
+            )
+            if not support.is_relative_to(expected_root):
+                raise WorkflowError("diagnostic support path escapes image_root")
+        _validate_diagnostic_map(raw["motion_map"], field="motion_map")
+        _validate_diagnostic_map(
+            raw["short_alignment_magnitude"],
+            field="short_alignment_magnitude",
+        )
+        selected = raw["selected_long_index"]
+        if isinstance(selected, bool) or not isinstance(selected, int):
+            raise WorkflowError("diagnostic selected_long_index is invalid")
+        if model_name == "lstfe":
+            if selected < 0 or selected >= 4:
+                raise WorkflowError("LSTFE selected_long_index is invalid")
+        elif selected != -1:
+            raise WorkflowError(
+                "non-LSTFE diagnostic must not select a long-term frame"
+            )
+        _validate_tile(
+            raw["diagnostic_tile_xywh"],
+            artifact="diagnostic",
+            frame_shape=(frame_shape[0], frame_shape[1]),
+        )
+        normalized.append(dict(raw))
+    return tuple(normalized)
+
+
 def _validate_evaluation_artifacts(
     value: object,
     request: EvaluationRequest,
@@ -1367,6 +1813,15 @@ def _validate_evaluation_artifacts(
         raise WorkflowError("prediction rows must be mappings")
     if not all(isinstance(row, Mapping) for row in ground_truth):
         raise WorkflowError("ground-truth rows must be mappings")
+    universe = _frame_universe(detection_frames, continuity_frames)
+    predictions = _validate_prediction_rows(
+        predictions,
+        universe=universe,
+    )
+    ground_truth = _validate_ground_truth_rows(
+        ground_truth,
+        universe=universe,
+    )
     audit = _validate_audit(value.audit)
     threshold = value.threshold_evidence
     if request.split == "validation":
@@ -1378,15 +1833,18 @@ def _validate_evaluation_artifacts(
     diagnostics = tuple(value.diagnostics)
     if not all(isinstance(row, Mapping) for row in diagnostics):
         raise WorkflowError("diagnostic rows must be mappings")
+    diagnostics = _validate_diagnostic_rows(
+        diagnostics,
+        universe=universe,
+        model_name=request.model_name,
+        image_root=Path(getattr(request.cfg, "image_root")),
+        expected_offsets=_model_offsets(request.model_name, request.cfg),
+    )
     cache_sha256 = value.alignment_cache_sha256
     if request.model_name == "baseline":
         if cache_sha256 is not None:
             raise WorkflowError("baseline evaluation must not claim alignment cache")
-    elif (
-        not isinstance(cache_sha256, str)
-        or len(cache_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in cache_sha256)
-    ):
+    elif not _is_sha256(cache_sha256):
         raise WorkflowError(
             "temporal evaluation must record alignment cache SHA-256"
         )
@@ -1407,13 +1865,170 @@ def _validate_evaluation_artifacts(
     )
 
 
+def _canonical_config_value(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value.resolve(strict=False))
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise WorkflowError("effective config keys must be strings")
+        return {
+            key: _canonical_config_value(item)
+            for key, item in sorted(value.items())
+        }
+    if isinstance(value, (tuple, list)):
+        return [_canonical_config_value(item) for item in value]
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    raise WorkflowError("effective config contains an unsupported value")
+
+
+def _config_fingerprint(cfg: object) -> str:
+    if is_dataclass(cfg) and not isinstance(cfg, type):
+        payload = asdict(cfg)
+    elif isinstance(cfg, Mapping):
+        payload = dict(cfg)
+    elif hasattr(cfg, "__dict__"):
+        payload = dict(vars(cfg))
+    else:
+        raise WorkflowError("effective config cannot be fingerprinted")
+    canonical = _canonical_config_value(payload)
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _utc_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(
+        timespec="microseconds"
+    ).replace("+00:00", "Z")
+
+
+def _dependency_versions() -> dict[str, str | None]:
+    distributions = {
+        "numpy": "numpy",
+        "pillow": "Pillow",
+        "torch": "torch",
+        "torchvision": "torchvision",
+        "ultralytics": "ultralytics",
+    }
+    versions = {}
+    for key, distribution in distributions.items():
+        try:
+            versions[key] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            versions[key] = None
+    return versions
+
+
+def _environment_provenance() -> dict[str, object]:
+    cuda_available = False
+    cuda_version = None
+    devices = []
+    try:
+        import torch
+
+        cuda_available = bool(torch.cuda.is_available())
+        cuda_version_value = getattr(torch.version, "cuda", None)
+        if cuda_version_value is not None:
+            cuda_version = str(cuda_version_value)
+        if cuda_available:
+            devices = [
+                {
+                    "index": index,
+                    "name": str(torch.cuda.get_device_name(index)),
+                }
+                for index in range(int(torch.cuda.device_count()))
+            ]
+    except (ImportError, RuntimeError):
+        cuda_available = False
+        cuda_version = None
+        devices = []
+    return {
+        "schema_version": 1,
+        "python_version": platform.python_version(),
+        "dependencies": _dependency_versions(),
+        "cuda": {
+            "available": cuda_available,
+            "version": cuda_version,
+            "gpu_count": len(devices),
+            "devices": devices,
+        },
+    }
+
+
+def _git_provenance() -> tuple[str, bool]:
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain",
+                "--untracked-files=normal",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise WorkflowError("git provenance is unavailable") from exc
+    if (
+        len(commit) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in commit)
+    ):
+        raise WorkflowError("git commit provenance is invalid")
+    return commit, bool(status)
+
+
+def _runtime_provenance(
+    started_utc: datetime,
+    started_monotonic: float,
+) -> dict[str, object]:
+    commit, dirty = _git_provenance()
+    environment = _environment_provenance()
+    finished_utc = datetime.now(timezone.utc)
+    duration = time.monotonic() - started_monotonic
+    return {
+        "git_commit": commit,
+        "git_dirty": dirty,
+        "environment": environment,
+        "started_at_utc": _utc_timestamp(started_utc),
+        "finished_at_utc": _utc_timestamp(finished_utc),
+        "duration_seconds": duration,
+    }
+
+
 def run_evaluate(
     args: argparse.Namespace,
     *,
     config_loader: Callable[[Path], object] | None = None,
     evaluator: Callable[[EvaluationRequest], EvaluationArtifacts] | None = None,
+    provenance_collector: (
+        Callable[[datetime, float], Mapping[str, object]] | None
+    ) = None,
 ) -> int:
+    started_utc = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
     cfg = _load_config(args.config, config_loader)
+    config_sha256 = _config_fingerprint(cfg)
     manifest = Path(args.manifest)
     checkpoint = Path(args.checkpoint)
     manifest_sha256 = _manifest_fingerprint(manifest)
@@ -1474,36 +2089,76 @@ def run_evaluate(
                 )
             ),
         )
+        artifacts = replace(
+            artifacts,
+            predictions=_validate_prediction_rows(
+                artifacts.predictions,
+                universe=_frame_universe(
+                    artifacts.detection_frame_keys,
+                    artifacts.continuity_frame_keys,
+                ),
+            ),
+        )
+    if provenance_collector is None:
+        provenance_collector = _runtime_provenance
+    runtime = dict(provenance_collector(started_utc, started_monotonic))
+    if set(runtime) != {
+        "git_commit",
+        "git_dirty",
+        "environment",
+        "started_at_utc",
+        "finished_at_utc",
+        "duration_seconds",
+    }:
+        raise WorkflowError("runtime provenance schema is invalid")
 
     def writer(stage: Path) -> Path:
-        _write_bytes(stage / "metrics.json", _json_bytes(dict(artifacts.metrics)))
-        _write_bytes(stage / "predictions.jsonl", _jsonl_bytes(artifacts.predictions))
-        _write_bytes(stage / "ground-truth.jsonl", _jsonl_bytes(artifacts.ground_truth))
+        artifact_bytes = {
+            "metrics.json": _json_bytes(dict(artifacts.metrics)),
+            "predictions.jsonl": _jsonl_bytes(artifacts.predictions),
+            "ground-truth.jsonl": _jsonl_bytes(artifacts.ground_truth),
+        }
         for section in _EVALUATION_TABLES:
-            _write_bytes(
-                stage / f"{section}.csv",
-                _metric_table_bytes(section, artifacts.metrics),
+            artifact_bytes[f"{section}.csv"] = _metric_table_bytes(
+                section,
+                artifacts.metrics,
             )
         if artifacts.threshold_evidence is not None:
-            _write_bytes(
-                stage / "threshold.json",
-                _json_bytes(dict(artifacts.threshold_evidence)),
+            artifact_bytes["threshold.json"] = _json_bytes(
+                dict(artifacts.threshold_evidence)
             )
         if artifacts.diagnostics:
-            _write_bytes(
-                stage / "diagnostics.jsonl",
-                _jsonl_bytes(artifacts.diagnostics),
+            artifact_bytes["diagnostics.jsonl"] = _jsonl_bytes(
+                artifacts.diagnostics
             )
+        for name, content in artifact_bytes.items():
+            _write_bytes(stage / name, content)
+        artifact_schema = {
+            name: _EVALUATION_ARTIFACT_VERSIONS[name]
+            for name in artifact_bytes
+        }
+        artifact_sha256 = {
+            name: hashlib.sha256(content).hexdigest()
+            for name, content in artifact_bytes.items()
+        }
         run = {
-            "schema_version": 1,
+            "schema_version": 2,
             "model_name": request.model_name,
             "evaluation_split": request.split,
             "manifest_sha256": request.manifest_sha256,
             "checkpoint_sha256": request.checkpoint_sha256,
+            "config_sha256": config_sha256,
             "class_schema": _CLASS_SCHEMA,
             "detection_frame_keys": list(artifacts.detection_frame_keys),
             "continuity_frame_keys": list(artifacts.continuity_frame_keys),
             "audit": dict(artifacts.audit),
+            "image_root": str(
+                Path(getattr(cfg, "image_root")).resolve(strict=False)
+            ),
+            "metadata_root": str(
+                Path(getattr(cfg, "metadata_root")).resolve(strict=False)
+            ),
+            "seed": getattr(cfg, "seed"),
             "alignment_cache": (
                 str(request.alignment_cache.resolve(strict=False))
                 if request.alignment_cache is not None
@@ -1520,8 +2175,11 @@ def run_evaluate(
                 if request.threshold_path is not None
                 else None
             ),
-            "artifact_schema": _EVALUATION_ARTIFACT_SCHEMA,
+            **runtime,
+            "artifact_schema": artifact_schema,
+            "artifact_sha256": artifact_sha256,
         }
+        _validate_evaluation_run_schema(run)
         _write_bytes(stage / "run.json", _json_bytes(run))
         return Path("metrics.json")
 
@@ -1589,13 +2247,148 @@ def _comparison_table(
     return stream.getvalue().encode("utf-8")
 
 
+def _validate_run_environment(value: object) -> None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version",
+        "python_version",
+        "dependencies",
+        "cuda",
+    }:
+        raise WorkflowError("evaluation environment schema is invalid")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or not isinstance(value["python_version"], str)
+        or not value["python_version"]
+    ):
+        raise WorkflowError("evaluation environment values are invalid")
+    dependencies = value["dependencies"]
+    if not isinstance(dependencies, Mapping) or set(dependencies) != {
+        "numpy",
+        "pillow",
+        "torch",
+        "torchvision",
+        "ultralytics",
+    }:
+        raise WorkflowError("evaluation dependency schema is invalid")
+    if any(
+        item is not None and (not isinstance(item, str) or not item)
+        for item in dependencies.values()
+    ):
+        raise WorkflowError("evaluation dependency versions are invalid")
+    cuda = value["cuda"]
+    if not isinstance(cuda, Mapping) or set(cuda) != {
+        "available",
+        "version",
+        "gpu_count",
+        "devices",
+    }:
+        raise WorkflowError("evaluation CUDA schema is invalid")
+    available = cuda["available"]
+    version = cuda["version"]
+    count = cuda["gpu_count"]
+    devices = cuda["devices"]
+    if (
+        not isinstance(available, bool)
+        or (version is not None and (not isinstance(version, str) or not version))
+        or isinstance(count, bool)
+        or not isinstance(count, int)
+        or count < 0
+        or not isinstance(devices, list)
+        or len(devices) != count
+    ):
+        raise WorkflowError("evaluation CUDA values are invalid")
+    for index, device in enumerate(devices):
+        if (
+            not isinstance(device, Mapping)
+            or set(device) != {"index", "name"}
+            or isinstance(device["index"], bool)
+            or not isinstance(device["index"], int)
+            or device["index"] != index
+            or not isinstance(device["name"], str)
+            or not device["name"]
+        ):
+            raise WorkflowError("evaluation GPU device schema is invalid")
+    if available != (count > 0):
+        raise WorkflowError("evaluation CUDA availability is inconsistent")
+
+
+def _parse_utc_timestamp(value: object, *, field: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise WorkflowError(f"evaluation {field} must be a UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+    except ValueError as exc:
+        raise WorkflowError(f"evaluation {field} must be a UTC timestamp") from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != timezone.utc.utcoffset(parsed)
+        or _utc_timestamp(parsed) != value
+    ):
+        raise WorkflowError(f"evaluation {field} must be a canonical UTC timestamp")
+    return parsed
+
+
+def _validate_artifact_declarations(
+    schema: object,
+    digests: object,
+    *,
+    split: str,
+) -> tuple[dict[str, int], dict[str, str]]:
+    if not isinstance(schema, Mapping) or not isinstance(digests, Mapping):
+        raise WorkflowError("evaluation artifact declarations must be mappings")
+    if set(schema) != set(digests):
+        raise WorkflowError("evaluation artifact schema and hash sets differ")
+    names = set(schema)
+    if not _EVALUATION_REQUIRED_ARTIFACTS.issubset(names):
+        raise WorkflowError("evaluation required artifact declarations are missing")
+    if not names.issubset(_EVALUATION_ARTIFACT_VERSIONS):
+        raise WorkflowError("evaluation artifact declaration is unknown")
+    if split == "validation":
+        if "threshold.json" not in names:
+            raise WorkflowError("validation threshold artifact is missing")
+    elif "threshold.json" in names:
+        raise WorkflowError("test run must not emit a threshold artifact")
+    normalized_schema = {}
+    normalized_digests = {}
+    for name in sorted(names):
+        version = schema[name]
+        digest = digests[name]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != _EVALUATION_ARTIFACT_VERSIONS[name]
+        ):
+            raise WorkflowError(f"evaluation artifact schema is unsupported: {name}")
+        if not _is_sha256(digest):
+            raise WorkflowError(f"evaluation artifact hash is invalid: {name}")
+        normalized_schema[name] = version
+        normalized_digests[name] = str(digest)
+    return normalized_schema, normalized_digests
+
+
 def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
-    if run.get("schema_version") != 1:
+    if set(run) != _EVALUATION_RUN_FIELDS:
+        raise WorkflowError("evaluation run schema fields are invalid")
+    if (
+        type(run.get("schema_version")) is not int
+        or run.get("schema_version") != 2
+    ):
         raise WorkflowError("evaluation run schema version is unsupported")
+    model_name = run.get("model_name")
+    if model_name not in _MODEL_NAMES:
+        raise WorkflowError("evaluation model name is unsupported")
     if run.get("class_schema") != _CLASS_SCHEMA:
         raise WorkflowError("evaluation class schema is unsupported")
-    if run.get("artifact_schema") != _EVALUATION_ARTIFACT_SCHEMA:
-        raise WorkflowError("evaluation artifact schema is unsupported")
+    for field in (
+        "manifest_sha256",
+        "checkpoint_sha256",
+        "config_sha256",
+    ):
+        if not _is_sha256(run.get(field)):
+            raise WorkflowError(
+                f"evaluation {field.replace('_', ' ')} is invalid"
+            )
     normalized = {}
     for field in ("detection_frame_keys", "continuity_frame_keys"):
         rows = _normalize_frame_keys(run.get(field))
@@ -1617,6 +2410,156 @@ def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
             raise WorkflowError("test continuity frame universe is empty")
     else:
         raise WorkflowError("evaluation run split is unsupported")
+    _validate_audit(run.get("audit"))
+    _absolute_resolved_path(
+        run.get("image_root"),
+        field="evaluation image_root",
+    )
+    _absolute_resolved_path(
+        run.get("metadata_root"),
+        field="evaluation metadata_root",
+    )
+    seed = run.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed <= 0:
+        raise WorkflowError("evaluation seed is invalid")
+    alignment_cache = run.get("alignment_cache")
+    alignment_digest = run.get("alignment_cache_sha256")
+    if model_name == "baseline":
+        if alignment_cache is not None or alignment_digest is not None:
+            raise WorkflowError(
+                "baseline run alignment cache provenance must be null"
+            )
+    else:
+        _absolute_resolved_path(
+            alignment_cache,
+            field="evaluation alignment_cache",
+        )
+        if not _is_sha256(alignment_digest):
+            raise WorkflowError("temporal alignment cache hash is invalid")
+    threshold_source = run.get("threshold_source")
+    threshold_digest = run.get("threshold_sha256")
+    if split == "validation":
+        if threshold_source is not None or threshold_digest is not None:
+            raise WorkflowError(
+                "validation threshold source provenance must be null"
+            )
+    else:
+        _absolute_resolved_path(
+            threshold_source,
+            field="evaluation threshold_source",
+        )
+        if not _is_sha256(threshold_digest):
+            raise WorkflowError("test threshold hash is invalid")
+    commit = run.get("git_commit")
+    if (
+        not isinstance(commit, str)
+        or len(commit) not in {40, 64}
+        or any(character not in "0123456789abcdef" for character in commit)
+        or not isinstance(run.get("git_dirty"), bool)
+    ):
+        raise WorkflowError("evaluation git provenance is invalid")
+    _validate_run_environment(run.get("environment"))
+    started = _parse_utc_timestamp(
+        run.get("started_at_utc"),
+        field="started_at_utc",
+    )
+    finished = _parse_utc_timestamp(
+        run.get("finished_at_utc"),
+        field="finished_at_utc",
+    )
+    duration = run.get("duration_seconds")
+    if (
+        finished < started
+        or isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(float(duration))
+        or float(duration) < 0
+    ):
+        raise WorkflowError("evaluation timing provenance is invalid")
+    _validate_artifact_declarations(
+        run.get("artifact_schema"),
+        run.get("artifact_sha256"),
+        split=str(split),
+    )
+
+
+def _load_verified_evaluation_run(
+    root_value: Path,
+) -> tuple[dict[str, object], dict[str, object], Path]:
+    root = Path(root_value)
+    _reject_symlink_components(root)
+    if root.is_symlink() or not root.is_dir():
+        raise WorkflowError(f"evaluation run is missing or unsafe: {root}")
+    run = _read_json(root / "run.json")
+    if not isinstance(run, dict):
+        raise WorkflowError("evaluation run metadata must be an object")
+    _validate_evaluation_run_schema(run)
+    schema, digests = _validate_artifact_declarations(
+        run["artifact_schema"],
+        run["artifact_sha256"],
+        split=str(run["evaluation_split"]),
+    )
+    expected_names = {"run.json", *schema}
+    actual_names = {path.name for path in root.iterdir()}
+    if actual_names != expected_names:
+        missing = sorted(expected_names - actual_names)
+        extra = sorted(actual_names - expected_names)
+        details = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if extra:
+            details.append(f"extra: {', '.join(extra)}")
+        raise WorkflowError(
+            "evaluation run artifact set is invalid"
+            + (f" ({'; '.join(details)})" if details else "")
+        )
+    for name in sorted(schema):
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            raise WorkflowError(f"evaluation artifact is missing or unsafe: {name}")
+        if _sha256_file(path) != digests[name]:
+            raise WorkflowError(f"evaluation artifact hash mismatch: {name}")
+    metrics = _read_json(root / "metrics.json")
+    if not isinstance(metrics, dict):
+        raise WorkflowError("evaluation metrics must be an object")
+    detection_frames = _normalize_frame_keys(run["detection_frame_keys"])
+    continuity_frames = _normalize_frame_keys(run["continuity_frame_keys"])
+    universe = _frame_universe(detection_frames, continuity_frames)
+    _validate_prediction_rows(
+        _read_jsonl(root / "predictions.jsonl"),
+        universe=universe,
+    )
+    _validate_ground_truth_rows(
+        _read_jsonl(root / "ground-truth.jsonl"),
+        universe=universe,
+    )
+    if "diagnostics.jsonl" in schema:
+        _validate_diagnostic_rows(
+            _read_jsonl(root / "diagnostics.jsonl"),
+            universe=universe,
+            model_name=str(run["model_name"]),
+            image_root=Path(str(run["image_root"])),
+            expected_offsets=None,
+        )
+    if "threshold.json" in schema:
+        threshold = _read_json(root / "threshold.json")
+        if not isinstance(threshold, Mapping):
+            raise WorkflowError("validation threshold artifact must be an object")
+        _threshold_payload(
+            threshold,
+            EvaluationRequest(
+                cfg=None,
+                model_name=str(run["model_name"]),
+                checkpoint=Path("unused"),
+                manifest_dir=Path("unused"),
+                split="validation",
+                threshold_path=None,
+                alignment_cache=None,
+                manifest_sha256=str(run["manifest_sha256"]),
+                checkpoint_sha256=str(run["checkpoint_sha256"]),
+            ),
+        )
+    return run, metrics, root
 
 
 def _compatible_ground_truth_sha256(
@@ -1624,21 +2567,15 @@ def _compatible_ground_truth_sha256(
         str,
         tuple[Mapping[str, object], Mapping[str, object], Path],
     ],
-) -> str | None:
+) -> str:
     paths = {
         model: records[model][2] / "ground-truth.jsonl"
         for model in _MODEL_NAMES
     }
-    presence = {
-        model: path.exists() or path.is_symlink()
-        for model, path in paths.items()
-    }
-    if any(presence.values()) and not all(presence.values()):
+    if any(path.is_symlink() or not path.is_file() for path in paths.values()):
         raise WorkflowError(
-            "comparison ground-truth evidence is incomplete across models"
+            "comparison ground-truth evidence is incomplete or unsafe"
         )
-    if not any(presence.values()):
-        return None
     digests = {
         model: _sha256_file(path)
         for model, path in paths.items()
@@ -1659,19 +2596,13 @@ def run_compare(
     output = _validate_output(Path(args.output), inputs=run_dirs)
     records: dict[str, tuple[dict[str, object], dict[str, object], Path]] = {}
     for root in run_dirs:
-        if root.is_symlink() or not root.is_dir():
-            raise WorkflowError(f"comparison input is not a safe run directory: {root}")
-        run = _read_json(root / "run.json")
-        metrics = _read_json(root / "metrics.json")
-        if not isinstance(run, dict) or not isinstance(metrics, dict):
-            raise WorkflowError("comparison run and metrics must be objects")
-        _validate_evaluation_run_schema(run)
+        run, metrics, verified_root = _load_verified_evaluation_run(root)
         model = run.get("model_name")
         if model not in _MODEL_NAMES or model in records:
             raise WorkflowError(
                 "comparison requires exactly one run for each model"
             )
-        records[str(model)] = (run, metrics, root)
+        records[str(model)] = (run, metrics, verified_root)
     if set(records) != set(_MODEL_NAMES):
         raise WorkflowError("comparison requires exactly baseline, mg_vtod and lstfe")
 
@@ -1679,9 +2610,13 @@ def run_compare(
         "schema_version",
         "evaluation_split",
         "manifest_sha256",
+        "config_sha256",
         "class_schema",
         "detection_frame_keys",
         "continuity_frame_keys",
+        "image_root",
+        "metadata_root",
+        "seed",
     )
     baseline_run = records["baseline"][0]
     for model in _MODEL_NAMES[1:]:
@@ -1697,6 +2632,14 @@ def run_compare(
     for model in _MODEL_NAMES[1:]:
         if _validate_audit(records[model][0].get("audit")) != baseline_audit:
             raise WorkflowError("comparison audit provenance is incompatible")
+    _validate_output(
+        Path(args.output),
+        inputs=run_dirs,
+        source_roots=(
+            Path(str(baseline_run["image_root"])),
+            Path(str(baseline_run["metadata_root"])),
+        ),
+    )
     ground_truth_sha256 = _compatible_ground_truth_sha256(records)
 
     if gate_evaluator is None:
@@ -1719,22 +2662,17 @@ def run_compare(
     }
 
     def writer(stage: Path) -> Path:
-        evidence_names = (
-            "predictions.jsonl",
-            "ground-truth.jsonl",
-            "diagnostics.jsonl",
-        )
-        evidence_presence = [
-            all((records[model][2] / name).is_file() for name in evidence_names)
+        diagnostics_presence = [
+            "diagnostics.jsonl" in records[model][0]["artifact_schema"]
             for model in _MODEL_NAMES
         ]
-        if any(evidence_presence) and not all(evidence_presence):
+        if any(diagnostics_presence) and not all(diagnostics_presence):
             raise WorkflowError(
-                "comparison evidence artifacts are incomplete across models"
+                "comparison diagnostic evidence is incomplete across models"
             )
         evidence_panels = (
             _render_saved_run_panels(records, stage)
-            if all(evidence_presence)
+            if all(diagnostics_presence)
             else []
         )
         payload = {
@@ -2805,12 +3743,29 @@ def run_visualize(
     manifest = Path(args.manifest)
     manifest_sha256 = _manifest_fingerprint(manifest)
     run_dirs = tuple(Path(path) for path in (args.runs or ()))
+    preloaded_records = (
+        _load_compatible_run_records(run_dirs)
+        if run_dirs
+        else None
+    )
+    stored_source_roots: tuple[Path, ...] = ()
+    if preloaded_records is not None:
+        baseline_run = preloaded_records["baseline"][0]
+        if baseline_run.get("manifest_sha256") != manifest_sha256:
+            raise WorkflowError(
+                "saved-run manifest provenance does not match --manifest"
+            )
+        stored_source_roots = (
+            Path(str(baseline_run["image_root"])),
+            Path(str(baseline_run["metadata_root"])),
+        )
     output = _validate_output(
         Path(args.output),
         inputs=(manifest, *run_dirs),
         source_roots=(
             Path(getattr(cfg, "image_root")),
             Path(getattr(cfg, "metadata_root")),
+            *stored_source_roots,
         ),
     )
     request = VisualizationRequest(
@@ -2820,8 +3775,12 @@ def run_visualize(
         manifest_sha256=manifest_sha256,
     )
     if visualizer is None:
-        if run_dirs:
-            visualizer = _visualize_saved_runs
+        if preloaded_records is not None:
+            visualizer = lambda request, stage: _visualize_saved_run_records(
+                request,
+                stage,
+                preloaded_records,
+            )
         else:
             visualizer = _visualize_gt_workflow
 
@@ -3425,7 +4384,7 @@ def _downsample_diagnostic(tensor: object) -> list[list[float]]:
         raise WorkflowError("diagnostic tensor must reduce to [1,1,H,W]")
     resized = functional.interpolate(
         value,
-        size=(180, 320),
+        size=_DIAGNOSTIC_MAP_SHAPE,
         mode="bilinear",
         align_corners=False,
     )[0, 0]
@@ -3508,8 +4467,14 @@ def _extract_model_diagnostic(
         device=device,
         dtype=dtype,
     )
-    motion_map = [[0.0]]
-    alignment_map = [[0.0]]
+    motion_map = [
+        [0.0] * _DIAGNOSTIC_MAP_SHAPE[1]
+        for _ in range(_DIAGNOSTIC_MAP_SHAPE[0])
+    ]
+    alignment_map = [
+        [0.0] * _DIAGNOSTIC_MAP_SHAPE[1]
+        for _ in range(_DIAGNOSTIC_MAP_SHAPE[0])
+    ]
     selected_long_index = -1
     module_states = tuple(
         (module, module.training)
@@ -3551,7 +4516,14 @@ def _extract_model_diagnostic(
         "frame_shape": list(metadata["frame_shape"]),
         "image_root": str(Path(getattr(cfg, "image_root")).resolve()),
         "offsets": list(metadata["offsets"]),
-        "support_paths": list(metadata["support_paths"]),
+        "support_paths": [
+            (
+                str(Path(value).resolve(strict=False))
+                if value is not None
+                else None
+            )
+            for value in metadata["support_paths"]
+        ],
         "motion_map": motion_map,
         "selected_long_index": selected_long_index,
         "short_alignment_magnitude": alignment_map,
@@ -3624,14 +4596,7 @@ def _load_compatible_run_records(
         raise WorkflowError("saved-run visualization requires exactly three runs")
     records: dict[str, tuple[dict[str, object], dict[str, object], Path]] = {}
     for root_value in run_dirs:
-        root = Path(root_value)
-        if root.is_symlink() or not root.is_dir():
-            raise WorkflowError(f"saved run is missing or unsafe: {root}")
-        run = _read_json(root / "run.json")
-        metrics = _read_json(root / "metrics.json")
-        if not isinstance(run, dict) or not isinstance(metrics, dict):
-            raise WorkflowError("saved run metadata must be JSON objects")
-        _validate_evaluation_run_schema(run)
+        run, metrics, root = _load_verified_evaluation_run(Path(root_value))
         model = run.get("model_name")
         if model not in _MODEL_NAMES or model in records:
             raise WorkflowError("saved runs must contain each model exactly once")
@@ -3645,9 +4610,13 @@ def _load_compatible_run_records(
             "schema_version",
             "evaluation_split",
             "manifest_sha256",
+            "config_sha256",
             "class_schema",
             "detection_frame_keys",
             "continuity_frame_keys",
+            "image_root",
+            "metadata_root",
+            "seed",
         ):
             if candidate.get(field) != baseline.get(field):
                 raise WorkflowError(f"saved-run {field} provenance is incompatible")
@@ -4068,11 +5037,14 @@ def _render_saved_run_panels(
     return panels
 
 
-def _visualize_saved_runs(
+def _visualize_saved_run_records(
     request: VisualizationRequest,
     stage: Path,
+    records: Mapping[
+        str,
+        tuple[dict[str, object], dict[str, object], Path],
+    ],
 ) -> Path:
-    records = _load_compatible_run_records(request.run_dirs)
     if records["baseline"][0].get("manifest_sha256") != request.manifest_sha256:
         raise WorkflowError(
             "saved-run manifest provenance does not match --manifest"
@@ -4090,6 +5062,17 @@ def _visualize_saved_runs(
         ),
     )
     return Path("index.json")
+
+
+def _visualize_saved_runs(
+    request: VisualizationRequest,
+    stage: Path,
+) -> Path:
+    return _visualize_saved_run_records(
+        request,
+        stage,
+        _load_compatible_run_records(request.run_dirs),
+    )
 
 
 def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:

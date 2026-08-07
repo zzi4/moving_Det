@@ -26,6 +26,8 @@ from moving_det.vru_cli import (
     _select_data_smoke_records,
     _serialize_ground_truth,
     _stage_overfit_manifest,
+    _validate_evaluation_artifacts,
+    _validate_evaluation_run_schema,
     _verify_checkpoint_alignment_provenance,
     build_parser,
     main,
@@ -1596,6 +1598,7 @@ def _evaluation_bundle(
         },
         predictions=(
             {
+                "schema_version": 1,
                 "site": "site19",
                 "sequence": "sequence_a",
                 "frame": 31,
@@ -1626,6 +1629,373 @@ def _evaluation_bundle(
         threshold_evidence=threshold,
         diagnostics=(),
     )
+
+
+def _evaluation_request(tmp_path: Path) -> EvaluationRequest:
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        metadata_root=tmp_path / "metadata",
+        output_root=tmp_path / "runs",
+    )
+    return EvaluationRequest(
+        cfg=cfg,
+        model_name="baseline",
+        checkpoint=tmp_path / "best.pt",
+        manifest_dir=tmp_path / "manifest",
+        split="validation",
+        threshold_path=None,
+        alignment_cache=None,
+        manifest_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+    )
+
+
+def _valid_diagnostic(tmp_path: Path) -> dict[str, object]:
+    image_root = (tmp_path / "images").resolve()
+    center = image_root / "site19_sequence" / "sequence_a" / "000031.jpg"
+    return {
+        "schema_version": 1,
+        "site": "site19",
+        "sequence": "sequence_a",
+        "frame": 31,
+        "frame_shape": [2160, 3840],
+        "image_root": str(image_root),
+        "offsets": [0],
+        "support_paths": [str(center)],
+        "motion_map": [[0.0] * 320 for _ in range(180)],
+        "selected_long_index": -1,
+        "short_alignment_magnitude": [[0.0] * 320 for _ in range(180)],
+        "diagnostic_tile_xywh": [0, 0, 1024, 1024],
+    }
+
+
+@pytest.mark.parametrize(
+    ("section", "mutation"),
+    [
+        (
+            "predictions",
+            lambda row: {**row, "unexpected": 1},
+        ),
+        (
+            "predictions",
+            lambda row: {key: value for key, value in row.items() if key != "schema_version"},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "schema_version": 2},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "schema_version": True},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "confidence": float("nan")},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "class_id": 4},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "frame": 0},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "obb": [64.0, 48.0, 8.0, 20.0, 0.2]},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "obb": [64.0, 48.0, 20.0, 8.0, 1.5707963267948966]},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "tile_xywh": [0, 0, 0, 96]},
+        ),
+        (
+            "predictions",
+            lambda row: {**row, "frame": 32},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "unexpected": 1},
+        ),
+        (
+            "ground_truth",
+            lambda row: {key: value for key, value in row.items() if key != "track_id"},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "schema_version": 1},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "schema_version": 2.0},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "mean_speed_mps": float("inf")},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "frame_speed_mps": -0.1},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "track_id": True},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "track_id": "unsafe:track"},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "obb": [64.0, 48.0, 8.0, 20.0, 0.2]},
+        ),
+        (
+            "ground_truth",
+            lambda row: {**row, "frame": 32},
+        ),
+    ],
+    ids=[
+        "prediction-extra",
+        "prediction-missing",
+        "prediction-version",
+        "prediction-bool-version",
+        "prediction-nan",
+        "prediction-class",
+        "prediction-frame",
+        "prediction-noncanonical-dimensions",
+        "prediction-noncanonical-angle",
+        "prediction-tile",
+        "prediction-universe",
+        "gt-extra",
+        "gt-missing",
+        "gt-version",
+        "gt-float-version",
+        "gt-infinite-speed",
+        "gt-negative-speed",
+        "gt-bool-track",
+        "gt-unsafe-track",
+        "gt-noncanonical-obb",
+        "gt-universe",
+    ],
+)
+def test_evaluation_rejects_non_exact_prediction_and_ground_truth_rows(
+    tmp_path,
+    section,
+    mutation,
+):
+    request = _evaluation_request(tmp_path)
+    bundle = _evaluation_bundle(validation=True)
+    row = mutation(dict(getattr(bundle, section)[0]))
+    malformed = replace(bundle, **{section: (row,)})
+
+    with pytest.raises(WorkflowError):
+        _validate_evaluation_artifacts(malformed, request)
+
+
+@pytest.mark.parametrize("section", ["predictions", "ground_truth"])
+def test_evaluation_rejects_duplicate_evidence_rows(tmp_path, section):
+    request = _evaluation_request(tmp_path)
+    bundle = _evaluation_bundle(validation=True)
+    duplicated = (*getattr(bundle, section), *getattr(bundle, section))
+
+    with pytest.raises(WorkflowError, match="duplicate"):
+        _validate_evaluation_artifacts(
+            replace(bundle, **{section: duplicated}),
+            request,
+        )
+
+
+def test_evaluation_rejects_same_typed_track_frame_with_conflicting_class(
+    tmp_path,
+):
+    request = _evaluation_request(tmp_path)
+    bundle = _evaluation_bundle(validation=True)
+    conflicting = {
+        **dict(bundle.ground_truth[0]),
+        "class_id": 1,
+    }
+
+    with pytest.raises(WorkflowError, match="duplicate"):
+        _validate_evaluation_artifacts(
+            replace(
+                bundle,
+                ground_truth=(*bundle.ground_truth, conflicting),
+            ),
+            request,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda row: {**row, "unexpected": 1},
+        lambda row: {key: value for key, value in row.items() if key != "motion_map"},
+        lambda row: {**row, "schema_version": 2},
+        lambda row: {**row, "schema_version": True},
+        lambda row: {**row, "frame": 32},
+        lambda row: {**row, "frame_shape": [2160, 0]},
+        lambda row: {**row, "image_root": "relative/images"},
+        lambda row: {**row, "offsets": [0, 0]},
+        lambda row: {**row, "support_paths": [None]},
+        lambda row: {**row, "motion_map": [[float("nan")] * 320 for _ in range(180)]},
+        lambda row: {**row, "motion_map": [[0.0, 1.0]]},
+        lambda row: {**row, "short_alignment_magnitude": [[-0.1] * 320 for _ in range(180)]},
+        lambda row: {**row, "selected_long_index": 0},
+        lambda row: {**row, "diagnostic_tile_xywh": [3500, 1800, 1024, 1024]},
+    ],
+    ids=[
+        "extra",
+        "missing",
+        "version",
+        "bool-version",
+        "universe",
+        "frame-shape",
+        "image-root",
+        "offsets",
+        "center-support",
+        "non-finite-map",
+        "wrong-map-shape",
+        "negative-map",
+        "baseline-long-index",
+        "tile-outside-frame",
+    ],
+)
+def test_evaluation_rejects_malformed_diagnostic_rows(tmp_path, mutation):
+    request = _evaluation_request(tmp_path)
+    bundle = replace(
+        _evaluation_bundle(validation=True),
+        diagnostics=(mutation(_valid_diagnostic(tmp_path)),),
+    )
+
+    with pytest.raises(WorkflowError):
+        _validate_evaluation_artifacts(bundle, request)
+
+
+def test_evaluation_rejects_duplicate_diagnostic_frame_identity(tmp_path):
+    request = _evaluation_request(tmp_path)
+    diagnostic = _valid_diagnostic(tmp_path)
+    bundle = replace(
+        _evaluation_bundle(validation=True),
+        diagnostics=(diagnostic, dict(diagnostic)),
+    )
+
+    with pytest.raises(WorkflowError, match="duplicate"):
+        _validate_evaluation_artifacts(bundle, request)
+
+
+def test_evaluation_rejects_lstfe_long_index_outside_four_candidates(tmp_path):
+    request = replace(
+        _evaluation_request(tmp_path),
+        model_name="lstfe",
+        alignment_cache=tmp_path / "alignment-cache",
+    )
+    diagnostic = _valid_diagnostic(tmp_path)
+    offsets = list(request.cfg.lstfe_offsets)
+    diagnostic["offsets"] = offsets
+    diagnostic["support_paths"] = [
+        str(
+            (tmp_path / "images").resolve()
+            / "site19_sequence"
+            / "sequence_a"
+            / f"{31 + offset:06d}.jpg"
+        )
+        for offset in offsets
+    ]
+    diagnostic["selected_long_index"] = 4
+    bundle = _evaluation_bundle(validation=True)
+    bundle = replace(
+        bundle,
+        threshold_evidence={
+            **dict(bundle.threshold_evidence),
+            "model_name": "lstfe",
+        },
+        diagnostics=(diagnostic,),
+        alignment_cache_sha256="d" * 64,
+    )
+
+    with pytest.raises(WorkflowError, match="selected_long_index"):
+        _validate_evaluation_artifacts(bundle, request)
+
+
+def test_lstfe_diagnostic_accepts_four_relative_long_indices_independent_of_offsets(
+    tmp_path,
+):
+    custom_offsets = (-9, -8, -2, 0, 2, 8, 9)
+    base_request = _evaluation_request(tmp_path)
+    request = replace(
+        base_request,
+        cfg=replace(base_request.cfg, lstfe_offsets=custom_offsets),
+        model_name="lstfe",
+        alignment_cache=tmp_path / "alignment-cache",
+    )
+    diagnostic = _valid_diagnostic(tmp_path)
+    diagnostic["offsets"] = list(custom_offsets)
+    diagnostic["support_paths"] = [
+        str(
+            (tmp_path / "images").resolve()
+            / "site19_sequence"
+            / "sequence_a"
+            / f"{31 + offset:06d}.jpg"
+        )
+        for offset in custom_offsets
+    ]
+    diagnostic["selected_long_index"] = 3
+    bundle = _evaluation_bundle(validation=True)
+    bundle = replace(
+        bundle,
+        threshold_evidence={
+            **dict(bundle.threshold_evidence),
+            "model_name": "lstfe",
+        },
+        diagnostics=(diagnostic,),
+        alignment_cache_sha256="d" * 64,
+    )
+
+    validated = _validate_evaluation_artifacts(bundle, request)
+
+    assert validated.diagnostics[0]["selected_long_index"] == 3
+
+
+def test_mg_diagnostic_accepts_unique_custom_order_with_center_at_index_two(
+    tmp_path,
+):
+    custom_offsets = (4, -2, 0, 2, -4)
+    base_request = _evaluation_request(tmp_path)
+    request = replace(
+        base_request,
+        cfg=replace(base_request.cfg, mg_offsets=custom_offsets),
+        model_name="mg_vtod",
+        alignment_cache=tmp_path / "alignment-cache",
+    )
+    diagnostic = _valid_diagnostic(tmp_path)
+    diagnostic["offsets"] = list(custom_offsets)
+    diagnostic["support_paths"] = [
+        str(
+            (tmp_path / "images").resolve()
+            / "site19_sequence"
+            / "sequence_a"
+            / f"{31 + offset:06d}.jpg"
+        )
+        for offset in custom_offsets
+    ]
+    bundle = _evaluation_bundle(validation=True)
+    bundle = replace(
+        bundle,
+        threshold_evidence={
+            **dict(bundle.threshold_evidence),
+            "model_name": "mg_vtod",
+        },
+        diagnostics=(diagnostic,),
+        alignment_cache_sha256="d" * 64,
+    )
+
+    validated = _validate_evaluation_artifacts(bundle, request)
+
+    assert validated.diagnostics[0]["offsets"] == list(custom_offsets)
 
 
 def test_temporal_evaluation_rejects_output_equal_to_alignment_cache(tmp_path):
@@ -1709,6 +2079,14 @@ def test_evaluate_validation_writes_deterministic_strict_artifact_schema(
         ]
     )
     cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    fixed_provenance = lambda *_: {
+        "git_commit": "f" * 40,
+        "git_dirty": False,
+        "environment": _strict_run_environment(),
+        "started_at_utc": "2026-08-07T02:00:00.000000Z",
+        "finished_at_utc": "2026-08-07T02:00:01.000000Z",
+        "duration_seconds": 1.0,
+    }
 
     result = run_evaluate(
         args,
@@ -1718,6 +2096,7 @@ def test_evaluate_validation_writes_deterministic_strict_artifact_schema(
             manifest_sha256=request.manifest_sha256,
             checkpoint_sha256=request.checkpoint_sha256,
         ),
+        provenance_collector=fixed_provenance,
     )
     first = {
         path.relative_to(output): path.read_bytes()
@@ -1732,6 +2111,7 @@ def test_evaluate_validation_writes_deterministic_strict_artifact_schema(
             manifest_sha256=request.manifest_sha256,
             checkpoint_sha256=request.checkpoint_sha256,
         ),
+        provenance_collector=fixed_provenance,
     )
     second = {
         path.relative_to(output): path.read_bytes()
@@ -1753,15 +2133,37 @@ def test_evaluate_validation_writes_deterministic_strict_artifact_schema(
         Path("threshold.json"),
     }
     run = json.loads((output / "run.json").read_text(encoding="utf-8"))
-    assert run["schema_version"] == 1
+    assert run["schema_version"] == 2
     assert run["model_name"] == "baseline"
     assert run["evaluation_split"] == "validation"
     assert run["manifest_sha256"]
     assert run["checkpoint_sha256"] == hashlib.sha256(
         checkpoint.read_bytes()
     ).hexdigest()
+    assert len(run["config_sha256"]) == 64
+    assert run["image_root"] == str(cfg.image_root.resolve())
+    assert run["metadata_root"] == str(cfg.metadata_root.resolve())
+    assert run["seed"] == cfg.seed
     assert run["alignment_cache"] is None
     assert run["alignment_cache_sha256"] is None
+    assert run["threshold_source"] is None
+    assert run["threshold_sha256"] is None
+    assert set(run["artifact_schema"]) == {
+        path.name for path in set(first) - {Path("run.json")}
+    }
+    assert run["artifact_schema"]["ground-truth.jsonl"] == 2
+    assert run["artifact_schema"]["predictions.jsonl"] == 1
+    assert run["artifact_schema"]["threshold.json"] == 1
+    assert run["artifact_sha256"] == {
+        path.name: hashlib.sha256(content).hexdigest()
+        for path, content in first.items()
+        if path != Path("run.json")
+    }
+    assert run["git_commit"] == "f" * 40
+    assert run["environment"] == _strict_run_environment()
+    assert run["started_at_utc"] == "2026-08-07T02:00:00.000000Z"
+    assert run["finished_at_utc"] == "2026-08-07T02:00:01.000000Z"
+    assert run["duration_seconds"] == 1.0
     assert run["class_schema"] == {
         "0": "pedestrian",
         "1": "bicycle",
@@ -1869,13 +2271,110 @@ def _write_evaluation_run(
     *,
     manifest_sha256: str = "a" * 64,
 ) -> None:
-    root.mkdir()
-    run = {
+    _write_strict_evaluation_run(
+        root,
+        model,
+        source_parent=root.parent / "source-roots",
+        manifest_sha256=manifest_sha256,
+    )
+
+
+def _strict_run_environment() -> dict[str, object]:
+    return {
         "schema_version": 1,
+        "python_version": "3.11.0",
+        "dependencies": {
+            "numpy": "1.26.0",
+            "pillow": "10.0.0",
+            "torch": None,
+            "torchvision": None,
+            "ultralytics": None,
+        },
+        "cuda": {
+            "available": False,
+            "version": None,
+            "gpu_count": 0,
+            "devices": [],
+        },
+    }
+
+
+def _write_strict_evaluation_run(
+    root: Path,
+    model: str,
+    *,
+    source_parent: Path,
+    manifest_sha256: str = "a" * 64,
+) -> None:
+    root.mkdir(parents=True)
+    prediction = {
+        "schema_version": 1,
+        "site": "site19",
+        "sequence": "sequence_a",
+        "frame": 31,
+        "class_id": 0,
+        "confidence": 0.9,
+        "obb": [32.0, 24.0, 12.0, 6.0, 0.1],
+        "tile_xywh": [0, 0, 128, 96],
+    }
+    truth = {
+        "schema_version": 2,
+        "site": "site19",
+        "sequence": "sequence_a",
+        "frame": 31,
+        "class_id": 0,
+        "track_id": 7,
+        "mean_speed_mps": 1.0,
+        "frame_speed_mps": 0.5,
+        "obb": [32.0, 24.0, 12.0, 6.0, 0.1],
+    }
+    artifacts = {
+        "metrics.json": (
+            json.dumps(
+                _gate_metrics(improved=model != "baseline"),
+                allow_nan=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+        "predictions.jsonl": (
+            json.dumps(
+                prediction,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+        "ground-truth.jsonl": (
+            json.dumps(
+                truth,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+        "per_class.csv": b"identity,recall_riou_025\n0,0.5\n",
+        "per_size.csv": b"identity,recall_riou_025\n<16,0.5\n",
+        "per_speed.csv": b"identity,recall_riou_025\n<1,0.5\n",
+        "per_track.csv": b"identity,stopped_recall\ntrack,0.8\n",
+    }
+    for name, content in artifacts.items():
+        (root / name).write_bytes(content)
+    alignment_cache = (
+        None
+        if model == "baseline"
+        else str((source_parent / "alignment-cache" / model).resolve())
+    )
+    run = {
+        "schema_version": 2,
         "model_name": model,
         "evaluation_split": "test",
         "manifest_sha256": manifest_sha256,
         "checkpoint_sha256": hashlib.sha256(model.encode()).hexdigest(),
+        "config_sha256": "c" * 64,
         "class_schema": {
             "0": "pedestrian",
             "1": "bicycle",
@@ -1893,28 +2392,429 @@ def _write_evaluation_run(
             "matched_positive_count": 1,
             "class_mapping_errors": 0,
         },
-        "threshold_source": "/frozen/threshold.json",
+        "image_root": str((source_parent / "images").resolve()),
+        "metadata_root": str((source_parent / "metadata").resolve()),
+        "seed": 20260806,
+        "alignment_cache": alignment_cache,
+        "alignment_cache_sha256": None if model == "baseline" else "d" * 64,
+        "threshold_source": str((source_parent / "threshold.json").resolve()),
         "threshold_sha256": "e" * 64,
+        "git_commit": "f" * 40,
+        "git_dirty": False,
+        "environment": _strict_run_environment(),
+        "started_at_utc": "2026-08-07T02:00:00.000000Z",
+        "finished_at_utc": "2026-08-07T02:00:01.000000Z",
+        "duration_seconds": 1.0,
         "artifact_schema": {
-            "metrics": 1,
-            "predictions": 1,
-            "ground_truth": 2,
+            "metrics.json": 1,
+            "predictions.jsonl": 1,
+            "ground-truth.jsonl": 2,
+            "per_class.csv": 1,
+            "per_size.csv": 1,
+            "per_speed.csv": 1,
+            "per_track.csv": 1,
+        },
+        "artifact_sha256": {
+            name: hashlib.sha256(content).hexdigest()
+            for name, content in artifacts.items()
         },
     }
     (root / "run.json").write_text(
         json.dumps(run, allow_nan=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    (root / "metrics.json").write_text(
+
+
+def _refresh_declared_artifact_hash(root: Path, name: str) -> None:
+    run = json.loads((root / "run.json").read_text(encoding="utf-8"))
+    run["artifact_sha256"][name] = hashlib.sha256(
+        (root / name).read_bytes()
+    ).hexdigest()
+    (root / "run.json").write_text(
+        json.dumps(run, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _read_strict_run(root: Path) -> dict[str, object]:
+    return json.loads((root / "run.json").read_text(encoding="utf-8"))
+
+
+def _write_strict_run_json(root: Path, run: dict[str, object]) -> None:
+    (root / "run.json").write_text(
+        json.dumps(run, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _strict_compare_args(tmp_path: Path) -> tuple[argparse.Namespace, dict[str, Path]]:
+    roots = {
+        model: tmp_path / "runs" / model
+        for model in ("baseline", "mg_vtod", "lstfe")
+    }
+    source_parent = tmp_path / "scope"
+    for model, root in roots.items():
+        _write_strict_evaluation_run(
+            root,
+            model,
+            source_parent=source_parent,
+        )
+    args = build_parser().parse_args(
+        [
+            "compare",
+            "--runs",
+            *(str(roots[model]) for model in ("baseline", "mg_vtod", "lstfe")),
+            "--output",
+            str(tmp_path / "comparison"),
+        ]
+    )
+    return args, roots
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("schema_version", 3),
+        ("schema_version", 2.0),
+        ("config_sha256", "C" * 64),
+        ("image_root", "relative/images"),
+        ("seed", True),
+        ("git_commit", "F" * 40),
+        ("git_dirty", 0),
+        ("started_at_utc", "2026-08-07T02:00:00"),
+        ("finished_at_utc", "2026-08-07T01:59:59.000000Z"),
+        ("duration_seconds", -1.0),
+        ("alignment_cache", "/unexpected/baseline-cache"),
+        ("threshold_source", None),
+    ],
+)
+def test_evaluation_run_rejects_malformed_provenance(
+    tmp_path,
+    field,
+    replacement,
+):
+    root = tmp_path / "baseline"
+    _write_strict_evaluation_run(
+        root,
+        "baseline",
+        source_parent=tmp_path / "scope",
+    )
+    run = _read_strict_run(root)
+    run[field] = replacement
+
+    with pytest.raises(WorkflowError):
+        _validate_evaluation_run_schema(run)
+
+
+def test_evaluation_run_rejects_extra_field_and_malformed_environment(tmp_path):
+    root = tmp_path / "baseline"
+    _write_strict_evaluation_run(
+        root,
+        "baseline",
+        source_parent=tmp_path / "scope",
+    )
+    run = _read_strict_run(root)
+    run["unexpected"] = True
+    with pytest.raises(WorkflowError, match="fields"):
+        _validate_evaluation_run_schema(run)
+
+    run.pop("unexpected")
+    run.pop("git_dirty")
+    with pytest.raises(WorkflowError, match="fields"):
+        _validate_evaluation_run_schema(run)
+
+    run["git_dirty"] = False
+    del run["environment"]["cuda"]
+    with pytest.raises(WorkflowError, match="environment"):
+        _validate_evaluation_run_schema(run)
+
+    run["environment"] = _strict_run_environment()
+    run["environment"]["schema_version"] = True
+    with pytest.raises(WorkflowError, match="environment"):
+        _validate_evaluation_run_schema(run)
+
+
+def test_evaluation_run_rejects_temporal_cache_nullability(tmp_path):
+    root = tmp_path / "mg"
+    _write_strict_evaluation_run(
+        root,
+        "mg_vtod",
+        source_parent=tmp_path / "scope",
+    )
+    run = _read_strict_run(root)
+    run["alignment_cache_sha256"] = None
+
+    with pytest.raises(WorkflowError, match="alignment"):
+        _validate_evaluation_run_schema(run)
+
+
+def test_evaluation_run_enforces_validation_threshold_nullability(tmp_path):
+    root = tmp_path / "baseline"
+    _write_strict_evaluation_run(
+        root,
+        "baseline",
+        source_parent=tmp_path / "scope",
+    )
+    run = _read_strict_run(root)
+    run["evaluation_split"] = "validation"
+    run["continuity_frame_keys"] = []
+    run["threshold_source"] = None
+    run["threshold_sha256"] = None
+    run["artifact_schema"]["threshold.json"] = 1
+    run["artifact_sha256"]["threshold.json"] = "a" * 64
+
+    _validate_evaluation_run_schema(run)
+
+    run["threshold_source"] = str((tmp_path / "threshold.json").resolve())
+    with pytest.raises(WorkflowError, match="must be null"):
+        _validate_evaluation_run_schema(run)
+
+
+def test_compare_rejects_missing_declared_ground_truth(tmp_path):
+    args, roots = _strict_compare_args(tmp_path)
+    (roots["mg_vtod"] / "ground-truth.jsonl").unlink()
+
+    with pytest.raises(WorkflowError, match="ground-truth"):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+def test_compare_rejects_all_three_missing_ground_truth_files(tmp_path):
+    args, roots = _strict_compare_args(tmp_path)
+    for root in roots.values():
+        (root / "ground-truth.jsonl").unlink()
+
+    with pytest.raises(WorkflowError, match="ground-truth"):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+def test_compare_rejects_hash_valid_legacy_ground_truth_schema(tmp_path):
+    args, roots = _strict_compare_args(tmp_path)
+    legacy = json.loads(
+        (roots["baseline"] / "ground-truth.jsonl").read_text(encoding="utf-8")
+    )
+    legacy["schema_version"] = 1
+    (roots["baseline"] / "ground-truth.jsonl").write_text(
         json.dumps(
-            _gate_metrics(improved=model != "baseline"),
+            legacy,
             allow_nan=False,
-            indent=2,
+            separators=(",", ":"),
             sort_keys=True,
         )
         + "\n",
         encoding="utf-8",
     )
+    _refresh_declared_artifact_hash(roots["baseline"], "ground-truth.jsonl")
+
+    with pytest.raises(WorkflowError, match="ground-truth row schema"):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+def test_compare_rejects_three_identical_hash_valid_legacy_ground_truth_rows(
+    tmp_path,
+):
+    args, roots = _strict_compare_args(tmp_path)
+    for root in roots.values():
+        legacy = json.loads(
+            (root / "ground-truth.jsonl").read_text(encoding="utf-8")
+        )
+        legacy["schema_version"] = 1
+        (root / "ground-truth.jsonl").write_text(
+            json.dumps(
+                legacy,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        _refresh_declared_artifact_hash(root, "ground-truth.jsonl")
+
+    with pytest.raises(WorkflowError, match="ground-truth row schema"):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+def test_compare_rejects_changed_declared_artifact_content(tmp_path):
+    args, roots = _strict_compare_args(tmp_path)
+    (roots["lstfe"] / "metrics.json").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(WorkflowError, match="hash"):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+@pytest.mark.parametrize("failure", ["missing", "symlink", "extra", "unknown-hash"])
+def test_compare_rejects_unsafe_or_undeclared_artifact_set(tmp_path, failure):
+    args, roots = _strict_compare_args(tmp_path)
+    root = roots["mg_vtod"]
+    if failure == "missing":
+        (root / "per_class.csv").unlink()
+    elif failure == "symlink":
+        external = tmp_path / "external-metrics.json"
+        external.write_bytes((root / "metrics.json").read_bytes())
+        (root / "metrics.json").unlink()
+        (root / "metrics.json").symlink_to(external)
+    elif failure == "extra":
+        (root / "undeclared.txt").write_text("extra\n", encoding="utf-8")
+    else:
+        run = _read_strict_run(root)
+        run["artifact_schema"]["unknown.bin"] = 1
+        run["artifact_sha256"]["unknown.bin"] = "a" * 64
+        _write_strict_run_json(root, run)
+
+    with pytest.raises(WorkflowError):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+def test_compare_rejects_symlinked_run_json(tmp_path):
+    args, roots = _strict_compare_args(tmp_path)
+    root = roots["baseline"]
+    external = tmp_path / "external-run.json"
+    external.write_bytes((root / "run.json").read_bytes())
+    (root / "run.json").unlink()
+    (root / "run.json").symlink_to(external)
+
+    with pytest.raises(WorkflowError, match="unsafe"):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+@pytest.mark.parametrize("field", ["config_sha256", "image_root", "metadata_root"])
+def test_compare_rejects_config_and_source_root_mismatch(tmp_path, field):
+    args, roots = _strict_compare_args(tmp_path)
+    root = roots["lstfe"]
+    run = _read_strict_run(root)
+    run[field] = (
+        "9" * 64
+        if field == "config_sha256"
+        else str((tmp_path / "other-source" / field).resolve())
+    )
+    _write_strict_run_json(root, run)
+
+    with pytest.raises(WorkflowError, match=field.replace("_", " ")):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+@pytest.mark.parametrize("direction", ["inside", "contains"])
+def test_compare_rejects_bidirectional_stored_source_root_overlap(
+    tmp_path,
+    direction,
+):
+    args, _ = _strict_compare_args(tmp_path)
+    source_parent = tmp_path / "scope"
+    args.output = (
+        source_parent / "images" / "comparison"
+        if direction == "inside"
+        else source_parent
+    )
+
+    with pytest.raises(WorkflowError, match="source root"):
+        run_compare(args, gate_evaluator=lambda *values: {})
+
+
+def test_visualize_rejects_changed_artifact_before_rendering(tmp_path):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    roots = {
+        model: tmp_path / "runs" / model
+        for model in ("baseline", "mg_vtod", "lstfe")
+    }
+    manifest_sha256 = _manifest_fingerprint(manifest)
+    for model, root in roots.items():
+        _write_strict_evaluation_run(
+            root,
+            model,
+            source_parent=tmp_path / "scope",
+            manifest_sha256=manifest_sha256,
+        )
+    (roots["mg_vtod"] / "predictions.jsonl").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--manifest",
+            str(manifest),
+            "--runs",
+            *(str(roots[model]) for model in ("baseline", "mg_vtod", "lstfe")),
+            "--output",
+            str(tmp_path / "visualization"),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="hash"):
+        run_visualize(
+            args,
+            config_loader=lambda path: load_temporal_config(
+                Path("configs/vrud-temporal-obb.yaml")
+            ),
+        )
+
+
+@pytest.mark.parametrize("direction", ["inside", "contains"])
+def test_visualize_preflights_stored_source_roots_before_writer(
+    tmp_path,
+    direction,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    stored_parent = tmp_path / "stored-source"
+    stored_image_root = stored_parent / "images"
+    stored_metadata_root = stored_parent / "metadata"
+    stored_image_root.mkdir(parents=True)
+    stored_metadata_root.mkdir()
+    sentinel = stored_image_root / "sentinel.txt"
+    sentinel.write_text("preserve\n", encoding="utf-8")
+    roots = {
+        model: tmp_path / "runs" / model
+        for model in ("baseline", "mg_vtod", "lstfe")
+    }
+    for model, root in roots.items():
+        _write_strict_evaluation_run(
+            root,
+            model,
+            source_parent=stored_parent,
+            manifest_sha256=_manifest_fingerprint(manifest),
+        )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "config-images",
+        metadata_root=tmp_path / "config-metadata",
+        output_root=tmp_path / "config-runs",
+    )
+    output = (
+        stored_image_root / "visualization"
+        if direction == "inside"
+        else stored_parent
+    )
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--manifest",
+            str(manifest),
+            "--runs",
+            *(str(roots[model]) for model in ("baseline", "mg_vtod", "lstfe")),
+            "--output",
+            str(output),
+        ]
+    )
+    writer_calls = []
+
+    def forbidden_writer(request, stage):
+        writer_calls.append(stage)
+        (stage / "index.json").write_text("{}\n", encoding="utf-8")
+        return Path("index.json")
+
+    with pytest.raises(WorkflowError, match="source root"):
+        run_visualize(
+            args,
+            config_loader=lambda path: cfg,
+            visualizer=forbidden_writer,
+        )
+
+    assert writer_calls == []
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+    if direction == "inside":
+        assert not output.exists()
 
 
 def test_compare_requires_exact_model_set_and_compatible_provenance(
@@ -2024,7 +2924,7 @@ def test_compare_rejects_consistently_unknown_artifact_schema(tmp_path):
     for model, root in roots.items():
         _write_evaluation_run(root, model)
         run = json.loads((root / "run.json").read_text(encoding="utf-8"))
-        run["schema_version"] = 2
+        run["schema_version"] = 3
         (root / "run.json").write_text(
             json.dumps(run, allow_nan=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -2085,6 +2985,7 @@ def test_compare_rejects_equal_count_but_different_ground_truth_content(
             + "\n",
             encoding="utf-8",
         )
+        _refresh_declared_artifact_hash(root, "ground-truth.jsonl")
     args = build_parser().parse_args(
         [
             "compare",
@@ -2152,6 +3053,7 @@ def test_compare_writes_two_real_gate_results_and_primary_metrics(
             b'"frame_speed_mps":0.5,"mean_speed_mps":1.0,"schema_version":2,'
             b'"sequence":"sequence_a","site":"site19","track_id":7}\n'
         )
+        _refresh_declared_artifact_hash(root, "ground-truth.jsonl")
     output = tmp_path / "comparison"
     args = build_parser().parse_args(
         [
@@ -2257,8 +3159,9 @@ def test_visualize_saved_runs_renders_real_three_model_temporal_panel(
             )
         )
     ).hexdigest()
-    source = tmp_path / "source"
-    source.mkdir()
+    source_parent = tmp_path / "scope"
+    source = source_parent / "images"
+    source.mkdir(parents=True)
     support_paths = {}
     for index, offset in enumerate((-30, -15, -4, -2, 0, 2, 4, 15, 30)):
         path = source / f"{index:02d}.jpg"
@@ -2294,9 +3197,10 @@ def test_visualize_saved_runs_renders_real_three_model_temporal_panel(
         "obb": [320.0, 180.0, 40.0, 20.0, 0.2],
     }
     for model, root in roots.items():
-        _write_evaluation_run(
+        _write_strict_evaluation_run(
             root,
             model,
+            source_parent=source_parent,
             manifest_sha256=manifest_sha256,
         )
         (root / "predictions.jsonl").write_text(
@@ -2321,15 +3225,25 @@ def test_visualize_saved_runs_renders_real_three_model_temporal_panel(
             "image_root": str(source),
             "offsets": list(offsets),
             "support_paths": [support_paths[offset] for offset in offsets],
-            "motion_map": [[0.0, 1.0], [0.5, 0.2]],
+            "motion_map": [[0.2] * 320 for _ in range(180)],
             "selected_long_index": 1 if model == "lstfe" else -1,
-            "short_alignment_magnitude": [[0.1, 0.2], [0.3, 0.4]],
+            "short_alignment_magnitude": [
+                [0.1] * 320 for _ in range(180)
+            ],
             "diagnostic_tile_xywh": [160, 90, 320, 180],
         }
         (root / "diagnostics.jsonl").write_text(
             json.dumps(diagnostic, allow_nan=False, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        _refresh_declared_artifact_hash(root, "predictions.jsonl")
+        _refresh_declared_artifact_hash(root, "ground-truth.jsonl")
+        run = _read_strict_run(root)
+        run["artifact_schema"]["diagnostics.jsonl"] = 1
+        run["artifact_sha256"]["diagnostics.jsonl"] = hashlib.sha256(
+            (root / "diagnostics.jsonl").read_bytes()
+        ).hexdigest()
+        _write_strict_run_json(root, run)
     output = tmp_path / "visualization"
     args = build_parser().parse_args(
         [
