@@ -21,6 +21,7 @@ ml = ["ultralytics==8.4.115"]
 
 [project.scripts]
 moving-det = "moving_det.cli:main"
+moving-det-vru = "moving_det.vru_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

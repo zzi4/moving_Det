@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from pathlib import Path
 
@@ -9,6 +10,32 @@ from PIL import Image
 from moving_det.config import load_config
 from moving_det.models import FrameSample, SequenceData
 from tests.helpers import ann
+
+
+_TORCH_ONLY_ML_TESTS = frozenset(
+    {
+        "test_baseline_model.py",
+        "test_dataset.py",
+        "test_inference.py",
+        "test_lstfe.py",
+        "test_mg_vtod.py",
+        "test_motion_strength.py",
+        "test_temporal_evaluation.py",
+        "test_training.py",
+        "test_yolo_graph.py",
+    }
+)
+
+
+def pytest_ignore_collect(collection_path, config):
+    """Keep the original CPU environment from importing Torch-only suites."""
+    del config
+    if importlib.util.find_spec("torch") is not None:
+        return None
+    path = Path(str(collection_path))
+    if path.parent.name == "ml" and path.name in _TORCH_ONLY_ML_TESTS:
+        return True
+    return None
 
 
 def _rectangle_points(

@@ -1,136 +1,219 @@
-# Moving Det：航拍运动目标 OBB 论证工具
+# Moving Det：VRUD 多帧小目标 OBB 检测
 
-本项目实现一个无需训练的第一阶段论证：先利用稳定航拍视频的相邻帧运动证据发现交通参与者，再把持续运动区域连接成带旋转框（OBB）的短时轨迹候选。它用于比较单帧差分、MOG2、时间中值、多尺度运动证据和多尺度 tubelet，不包含最终分类器或学习式跟踪器。
+本项目当前主线是在只读 VRUD 航拍序列上公平比较三个逐帧旋转框检测器：
 
-## 环境安装
+- `baseline`：带 stride-4 P2 检测层的单帧 YOLO11m-OBB。
+- `mg_vtod`：用 `t-4, t-2, t, t+2, t+4` 的配准软运动强度增强 P2。
+- `lstfe`：对齐 `t-2, t+2`，并从 `t-30, t-15, t+15, t+30`
+  选择长期上下文增强 P2/P3。
 
-要求 Python 3.12。推荐在项目根目录创建独立环境：
+训练类别固定为：
+
+```text
+0 pedestrian
+1 bicycle
+2 tricycle
+3 motorcycle
+```
+
+类别只通过 `(site, sequence_name, group_id)` 与 VRUD 元数据类号 3–6
+恢复。原 Labelme JSON 中写成 `car` 的标签不决定训练类别。完整设计见
+[`docs/superpowers/specs/2026-08-06-vrud-temporal-obb-detection-design.md`](docs/superpowers/specs/2026-08-06-vrud-temporal-obb-detection-design.md)。
+
+## 两个独立环境
+
+传统运动证据 PoC 仍使用 CPU `.venv`：
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 ```
 
-默认配置为 `configs/poc.yaml`。源数据位于 `/mnt/nas/Processing_data/mot_sequence`，程序只读取该目录；运行结果写入调用者指定的 `runs/` 子目录。不要在源数据目录生成缓存、修复标注或跳过非法标注。
-
-## 常用流程
-
-检查标定序列和评估序列的文件、尺寸及标注：
+VRUD 模型使用单独的 Python 3.11 / CUDA 环境，不向 `.venv` 引入
+Torch、TorchVision 或 Ultralytics：
 
 ```bash
-.venv/bin/moving-det inspect-data --config configs/poc.yaml
+conda env create -f environment/temporal-obb.yml
+conda run -n moving-det-vru python -c \
+  "import torch, torchvision, ultralytics; print(torch.__version__, torchvision.__version__, ultralytics.__version__)"
 ```
 
-运行一个方法。`frame-start` 与 `frame-end` 必须同时给出：
+固定版本为 PyTorch 2.5.1、TorchVision 0.20.1、Ultralytics 8.4.115。
+`moving-det-vru --help` 和 CPU 面板渲染采用延迟导入，不会加载上述模型依赖。
+
+## VRUD 完整工作流
+
+源 JPG/JSON 和 CSV 永远只读；manifest、缓存、checkpoint、预测、指标和面板均写到
+`runs/`。
+
+先冻结 6/3/3 序列 manifest：
 
 ```bash
-.venv/bin/moving-det run \
-  --config configs/poc.yaml \
-  --sequence calibration \
-  --method multiscale_tubelet \
-  --scale 1.0 \
-  --threshold 4 \
-  --frame-start 16 \
-  --frame-end 25 \
-  --output runs/smoke
+conda run -n moving-det-vru moving-det-vru build-manifest \
+  --config configs/vrud-temporal-obb.yaml \
+  --output runs/vrud-pilot/manifest
 ```
 
-只在标定序列搜索固定候选阈值：
+为 MG 和 LSTFE 预计算支持帧到中心帧的全局 ECC 变换。默认位置是配置
+`output_root/alignment-cache`：
 
 ```bash
-.venv/bin/moving-det calibrate \
-  --config configs/poc.yaml \
-  --output runs/poc-calibration
+conda run -n moving-det-vru moving-det-vru cache-alignments \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest
 ```
 
-用已经冻结的 `calibration.json` 评估另一个序列。评估阶段不会重新选阈值：
+训练单帧基线：
 
 ```bash
-.venv/bin/moving-det evaluate \
-  --config configs/poc.yaml \
-  --calibration runs/poc-calibration/calibration.json \
-  --output runs/poc-evaluation
+conda run -n moving-det-vru moving-det-vru train \
+  --model baseline \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/baseline \
+  --weights yolo11m-obb.pt
 ```
 
-把评估指标整理成 Markdown：
+MG 和 LSTFE 从同一个内部基线 checkpoint 初始化。`--baseline-init` 是明确写法；
+为兼容冻结的 Task 13 命令，时序模型的 `--weights <internal-best.pt>` 具有相同含义：
 
 ```bash
-.venv/bin/moving-det report \
-  --metrics runs/poc-evaluation/metrics.json \
-  --output docs/experiments/poc-results.md
+conda run -n moving-det-vru moving-det-vru train \
+  --model mg_vtod \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/mg_vtod \
+  --baseline-init runs/vrud-pilot/baseline/checkpoints/best.pt
+
+conda run -n moving-det-vru moving-det-vru train \
+  --model lstfe \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/lstfe \
+  --baseline-init runs/vrud-pilot/baseline/checkpoints/best.pt
 ```
 
-为已有单方法 run 生成三张逐帧 PNG 和一张竖向三帧对比图：
+64 样本 gate 必须同时给出固定样本数和最大 step。CLI 从原 manifest
+确定性地派生恰好 64 行的新 manifest，不修改源 artifact：
 
 ```bash
-.venv/bin/moving-det visualize \
-  --run runs/smoke \
-  --frames 20,21,22
+conda run -n moving-det-vru moving-det-vru train \
+  --model baseline \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/baseline-overfit \
+  --weights yolo11m-obb.pt \
+  --overfit-samples 64 \
+  --max-steps 300
 ```
 
-输出写入 `runs/smoke/overlays/000020.png`、`000021.png`、`000022.png` 和 `comparison.png`。可视化不会覆盖已有 `overlays/`，也不会修改 run 内的源 artifact。
+训练输出的主 checkpoint 是 `<output>/checkpoints/best.pt`。恢复同一 run
+使用 `--resume <output>/checkpoints/last.pt`。非默认缓存可通过
+`--alignment-cache /safe/path/alignment-cache` 显式指定。
 
-## Artifact 含义
+评测必须先在 validation 选择并冻结阈值，再应用到 test：
 
-每个单方法 run 目录包含：
+```bash
+conda run -n moving-det-vru moving-det-vru evaluate \
+  --model baseline \
+  --checkpoint runs/vrud-pilot/baseline/checkpoints/best.pt \
+  --manifest runs/vrud-pilot/manifest \
+  --split validation \
+  --output runs/vrud-pilot/baseline-validation
 
-- `config.yaml`：完整解析后的配置，以及序列、方法、处理尺度和阈值。
-- `metrics.json`：总体、分层、边界帧、阈值候选和 gate 字段。
-- `per_frame.csv`：每帧移动 GT、TP、FP、召回和 mask 覆盖。
-- `per_track.csv`：首次检出、移动帧覆盖和 tubelet 碎片数。
-- `proposals.jsonl`：每个候选的帧号、规范 OBB、运动分数和 tubelet ID。
-- `frames/<frame>.npz`：最大 960×540 的 `uint8 preview_score` 和 `preview_mask`，只用于诊断显示。
-- `run.json`：Git 提交、UTC 时间、依赖版本、输入路径、帧范围和随机种子。
-- `overlays/`：GT、候选、忽略区、运动 inset 和竖向三帧对比图。
+conda run -n moving-det-vru moving-det-vru evaluate \
+  --model baseline \
+  --checkpoint runs/vrud-pilot/baseline/checkpoints/best.pt \
+  --manifest runs/vrud-pilot/manifest \
+  --split test \
+  --threshold runs/vrud-pilot/baseline-validation/threshold.json \
+  --output runs/vrud-pilot/baseline-eval
+```
 
-标定目录额外包含 `calibration.json`。其中保存全部五种方法、两个尺度、完整固定候选、选中值和可审计配置指纹。评估目录的组合 `metrics.json` 会列出每个子 gate 的实测值和布尔结果。
+三个 test run 的 manifest、split、类别 schema 和逐帧评测全集必须完全兼容，
+否则拒绝比较：
 
-## 图例与 OBB 约定
+```bash
+conda run -n moving-det-vru moving-det-vru compare \
+  --runs runs/vrud-pilot/baseline-eval \
+         runs/vrud-pilot/mg_vtod-eval \
+         runs/vrud-pilot/lstfe-eval \
+  --output runs/vrud-pilot/comparison
+```
 
-可视化中 GT OBB 为青色，已匹配候选为橙色，未匹配候选为红色，忽略区域为黄色虚线。标签分别使用 `GT #<track_id>` 和 `P #<tubelet_id>`。右下角 inset 显示运动分数，并用青色边界标出二值 mask。
+数据 smoke 与独立 GT 审计：
 
-OBB 使用唯一的长边约定：
+```bash
+conda run -n moving-det-vru moving-det-vru visualize \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/data-smoke
+
+conda run -n moving-det-vru moving-det-vru audit-sample \
+  --manifest runs/vrud-pilot/manifest \
+  --count 20 \
+  --output runs/vrud-pilot/manual-audit
+```
+
+`audit-sample` 只读取冻结 manifest、原始 GT 和类别元数据，固定种子
+`20260806`，在可用时覆盖四类和两个站点；它不打开 prediction 或 checkpoint。
+`visualize` 的 data-smoke 同样不读取模型产物：它从 train manifest 确定性选择
+一个 site19 与一个 site22 序列，覆盖四个修正类别、至少一个背景 tile 和一个
+边缘锚定 tile，并把 MG/LSTFE 支持帧有效性、局部/全图 OBB、类别修正与一次固定
+增强一并写入 `index.json` 和面板。
+
+## VRUD artifact 含义
+
+- `manifest/{train,validation,test}.jsonl`：冻结的同位置 tile/中心帧全集。
+- `manifest/manifest.json`：子文件 SHA-256 和固定种子。
+- `alignment-cache/index.json` 与 `*.npz`：按
+  `(site, sequence, center_frame, support_frame)` 索引的严格仿射变换。ECC
+  接收原分辨率帧并在内部下采样，缓存矩阵仍使用原图像素坐标；训练与评测冻结同一
+  内容指纹。
+- `<train-output>/checkpoints/{best,last}.pt`：包含 manifest 指纹、模型名、
+  优化器和恢复状态的内部实验 checkpoint；不能当作公开 YOLO 权重读取。
+- `<evaluation>/run.json`：模型、split、manifest/checkpoint SHA-256、类别 schema、
+  冻结逐帧全集、阈值和缓存来源。
+- `<evaluation>/predictions.jsonl` 与 `ground-truth.jsonl`：带站点、序列、帧号的
+  逐目标 OBB；test prediction 与指标使用同一个冻结阈值，不导出低于阈值的候选。
+- `<evaluation>/metrics.json`：mAP、rIoU 召回、每帧误检、分层和连续性指标。
+- `<evaluation>/per_{class,size,speed,track}.csv`：可审计的展开表。
+- `<validation>/threshold.json`：validation 上在每帧误检不超过 5 时最大化
+  `F1@rIoU 0.25` 的全局阈值；test 只加载，不重新选择。
+- `<comparison>/metrics.json`：基线、MG、LSTFE 指标和两个五条件 gate。
+- `<comparison>/overlays/*.jpg`：同一帧三模型 OBB、MG 软运动图和 LSTFE
+  长短期诊断面板。支持帧、GT、预测与热图统一裁到同一个代表性
+  `diagnostic_tile_xywh`，避免把 tile 诊断图拉伸为整张 4K。
+
+所有 JSON 禁止 NaN/Infinity；文件写入采用同目录临时文件或完整 staging 目录后
+原子替换。输出路径不得覆盖 manifest、run 或 NAS 源数据，也不得通过符号链接逃逸。
+
+## OBB、NMS 与阈值约定
+
+内部旋转框唯一约定为：
 
 ```text
 width >= height
 theta ∈ [-π/2, π/2)
 ```
 
-角度表示车辆长轴，按 π 周期比较。运动连通域的朝向不是车辆最终航向；车头/车尾方向也不能仅由 OBB 推断。
+tile 映射、监督、匹配、NMS 和面板均使用旋转多边形，不能退化为水平框。全图 tile
+为 1024×1024、重叠 256 像素，跨 tile 合并采用 rotated NMS，IoU 固定为 0.5。
+检测 AP 使用完整置信度排序；test 视频指标只能使用对应模型冻结的 validation 阈值。
+训练期 validation 与 64 样本 gate 也通过 Task-11 解码和 rotated NMS，推理置信度
+从 0.0 开始，避免在计算 mAP/召回前提前丢弃低分候选。
 
-## 当前 10 帧论证结果
+## 2026-08-03 传统运动 PoC：保留的负面结果历史
 
-以下结果来自标定序列第 16–25 帧、原始 3840×2160 分辨率、
-`multiscale_tubelet`、scale 1.0、阈值 4。完整运行耗时
-39 分 58.53 秒，峰值 RSS 2,009,648 KiB；产生 137,749 个候选。由于
-10 帧窗口全部属于评估代码定义的边界区，这里引用 `metrics.json` 的
-`all_*` 字段：
+旧 `moving-det` 命令仍保留，用于复现无训练的差分、MOG2、时间中值、多尺度运动证据
+和 tubelet 对照。它不是当前主检测器，也不再作为“二值运动前景生成候选后拟合 OBB”
+的主路线。
 
-- 移动 GT 共 1,320 个，rIoU 0.25 匹配 14 个，召回率约 1.06%。
-- rIoU 0.5 匹配 0 个，召回率为 0。
-- 未匹配候选 137,735 个，每 100 个移动 GT 约有 10,434 个误报。
-- GT 内 mask 平均覆盖率约 96.81%。
+当时在标定序列第 16–25 帧、3840×2160、`multiscale_tubelet`、scale 1.0、
+阈值 4 上得到：
 
-可视化显示，大量未匹配红框来自道路纹理、树木和建筑边缘。这说明当前
-运动证据对目标像素的覆盖较高，但阈值 4 与现有连通/持久化规则缺乏选择性，
-不能把这次结果当作可用检测器或正向精度结论。`runs/` 是本地忽略目录，
-不随 Git 提交。
+- 移动 GT 1,320 个，`rIoU 0.25` 匹配 14 个，召回约 1.06%。
+- `rIoU 0.5` 匹配 0 个。
+- 未匹配候选 137,735 个，每 100 个移动 GT 约 10,434 个误报。
+- GT 内 mask 平均覆盖约 96.81%。
 
-这次 smoke 是在 Task 10 尚未提交、工作区含未提交修改时产生的开发期证据。
-其 `run.json` 只记录了当时的 HEAD
-`e062040d50e0b850ebf2bb31d58bb996245a405c`，而产生上述结果的最终 Task 10
-实现提交为 `961f7b7f52afb6249cc9532b87ef5149595f027b`。因此，不能声称从
-干净的 `e062040` checkout 可以复现这些耗时和指标。未来可在独立 provenance
-ledger 中记录 dirty 状态或补丁摘要；该增强留作后续事项，本轮不改变 artifact
-schema，也不为此重跑约 40 分钟的实验。
-
-## 数据边界
-
-当前两个序列主要是车辆，规模约 460 帧，目标尺寸和场景多样性都不足以代表最终的 4 小时小目标数据，因此这里只能回答“多帧运动证据是否值得继续”的工程问题，不能作为最终小目标 benchmark。
-
-当前评估序列 `motorway_sequence2` 含有不满足严格矩形约束的四点 OBB。
-严格读取在
-`motorway_sequence2/000001.json: shape[2] label='car'` 处报告
-`OBB points must form a non-degenerate rectangle` 并以退出码 2 停止。依照
-既定数据策略，程序不会拟合、修复或跳过该标注。在源标注修正或数据策略
-明确改变前，不能声称该序列完成了冻结评估。
+这证明运动响应能覆盖目标像素，但不能提供可用检测选择性。旧 run 来自开发期 dirty
+工作区，不能宣称由记录的 `e062040` 干净 checkout 完整复现。相关 CPU 命令和测试
+作为日期明确的负面对照继续保留；“当前数据只有车辆、约 460 帧”的限制只描述该旧
+PoC，不描述当前覆盖两个站点、四类 VRU、固定 6/3/3 序列的 benchmark。
