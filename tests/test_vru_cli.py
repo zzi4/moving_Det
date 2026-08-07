@@ -16,6 +16,8 @@ from moving_det.vru_cli import (
     EvaluationArtifacts,
     EvaluationRequest,
     WorkflowError,
+    _evaluate_real,
+    _extract_model_diagnostic,
     _loader_task11_metrics,
     _manifest_fingerprint,
     _predictions_for_artifact,
@@ -165,7 +167,7 @@ def test_parser_rejects_unknown_models_invalid_counts_and_malformed_paths():
     assert malformed.value.code == 2
 
 
-def test_main_rejects_unpaired_overfit_and_test_threshold_arguments():
+def test_main_rejects_unpaired_overfit_threshold_and_baseline_cache_arguments():
     with pytest.raises(SystemExit) as overfit:
         main(
             "train --model baseline --manifest manifest --output run "
@@ -178,9 +180,24 @@ def test_main_rejects_unpaired_overfit_and_test_threshold_arguments():
             "--manifest manifest --split test --output evaluation".split(),
             handlers={"evaluate": lambda args: 0},
         )
+    with pytest.raises(SystemExit) as baseline_cache:
+        main(
+            "evaluate --model baseline --checkpoint best.pt "
+            "--manifest manifest --alignment-cache alignment-cache "
+            "--output evaluation".split(),
+            handlers={"evaluate": lambda args: 0},
+        )
+    with pytest.raises(SystemExit) as baseline_train_cache:
+        main(
+            "train --model baseline --manifest manifest "
+            "--alignment-cache alignment-cache --output training".split(),
+            handlers={"train": lambda args: 0},
+        )
 
     assert overfit.value.code == 2
     assert threshold.value.code == 2
+    assert baseline_cache.value.code == 2
+    assert baseline_train_cache.value.code == 2
 
 
 def test_main_dispatches_only_the_selected_handler(capsys):
@@ -306,6 +323,52 @@ def test_train_maps_public_weights_baseline_init_and_resume_without_aliasing(
     assert capsys.readouterr().out.strip() == str(
         Result.best_checkpoint.resolve()
     )
+
+
+def test_temporal_resume_rejects_output_parent_of_alignment_cache(tmp_path):
+    import types
+
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        metadata_root=tmp_path / "metadata",
+        output_root=tmp_path / "runs",
+    )
+    manifest = tmp_path / "manifest"
+    manifest.mkdir()
+    output = tmp_path / "temporal-run"
+    alignment_cache = output / "alignment-cache"
+    alignment_cache.mkdir(parents=True)
+    sentinel = alignment_cache / "index.json"
+    sentinel.write_text("{}\n", encoding="utf-8")
+    resume = tmp_path / "last.pt"
+    resume.write_bytes(b"checkpoint")
+    args = build_parser().parse_args(
+        [
+            "train",
+            "--model",
+            "lstfe",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--resume",
+            str(resume),
+            "--alignment-cache",
+            str(alignment_cache),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="overlaps"):
+        run_train(
+            args,
+            config_loader=lambda path: cfg,
+            trainer=lambda *values, **kwargs: types.SimpleNamespace(
+                best_checkpoint=output / "checkpoints" / "best.pt"
+            ),
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "{}\n"
 
 
 @REQUIRES_TORCH
@@ -481,6 +544,73 @@ def test_task11_training_validator_consumes_passed_loader_and_restores_identity(
     assert tuple(module.training for module in model.modules()) == original_states
 
 
+@REQUIRES_TORCH
+def test_lstfe_diagnostic_uses_eval_without_bn_drift_and_restores_all_states(
+    tmp_path,
+):
+    import torch
+
+    from moving_det.vrud.tiling import Tile
+
+    observed_states = []
+
+    class DiagnosticModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bn = torch.nn.BatchNorm2d(3)
+            self.frozen_branch = torch.nn.Identity()
+
+        def forward_with_diagnostics(self, batch):
+            observed_states.append(
+                tuple(module.training for module in self.modules())
+            )
+            residual = self.bn(batch["frames"][:, 3])
+            return residual, {
+                "selected_long_index": torch.tensor(1),
+                "p2_short_residual": residual,
+            }
+
+    model = DiagnosticModel()
+    model.train()
+    model.frozen_branch.eval()
+    original_states = tuple(module.training for module in model.modules())
+    original_mean = model.bn.running_mean.detach().clone()
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        tile_size=8,
+        tile_overlap=0,
+    )
+    offsets = (-30, -15, -2, 0, 2, 15, 30)
+    clip = {
+        "frames": torch.ones((7, 3, 8, 8), dtype=torch.float32),
+        "valid": torch.ones((7,), dtype=torch.bool),
+        "transforms": torch.eye(2, 3).repeat(7, 1, 1),
+        "zero_index": 3,
+        "frame": 31,
+        "metadata": {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "frame_shape": (8, 8),
+            "offsets": offsets,
+            "support_paths": tuple(f"/source/{offset}.jpg" for offset in offsets),
+        },
+    }
+
+    diagnostic = _extract_model_diagnostic(
+        model,
+        clip,
+        "lstfe",
+        cfg,
+        diagnostic_tile=Tile(0, 0, 8, 8),
+    )
+
+    assert diagnostic["selected_long_index"] == 1
+    assert observed_states == [(False, False, False)]
+    assert torch.equal(model.bn.running_mean, original_mean)
+    assert tuple(module.training for module in model.modules()) == original_states
+
+
 def test_temporal_checkpoint_must_match_single_alignment_snapshot():
     _verify_checkpoint_alignment_provenance(
         {"alignment_cache_sha256": "a" * 64},
@@ -500,6 +630,227 @@ def test_temporal_checkpoint_must_match_single_alignment_snapshot():
             model_name="baseline",
             alignment_cache_sha256=None,
         )
+
+
+@REQUIRES_TORCH
+def test_real_evaluation_audit_detects_manifest_gt_missing_from_corrected_frame(
+    tmp_path,
+    monkeypatch,
+):
+    import torch
+
+    import moving_det.ml.evaluation as evaluation
+    import moving_det.ml.factory as factory
+    import moving_det.ml.inference as inference
+    import moving_det.ml.training as training
+    import moving_det.vru_cli as vru_cli
+    import moving_det.vrud.index as index
+    from moving_det.ml.evaluation import ThresholdEvidence
+    from moving_det.vrud.tiling import Tile
+    from moving_det.vrud.types import (
+        CorrectedFrame,
+        SequenceKey,
+        TrackKey,
+        TrackMeta,
+    )
+
+    manifest = tmp_path / "manifest"
+    manifest.mkdir()
+    (manifest / "validation.jsonl").write_text(
+        json.dumps(
+            {
+                "split": "validation",
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "tile_xywh": [0, 0, 8, 8],
+                "track_keys": [["site19", "sequence_a", 7]],
+                "source": "evaluation",
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (manifest / "train.jsonl").write_text("", encoding="utf-8")
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        metadata_root=tmp_path / "metadata",
+        tile_size=8,
+        tile_overlap=0,
+    )
+    track_key = TrackKey("site19", "sequence_a", 7)
+    tracks = {
+        track_key: TrackMeta(
+            track_key=track_key,
+            vrud_class_id=3,
+            class_id=0,
+            class_name="pedestrian",
+            mean_velocity=1.0,
+            initial_frame=1,
+            final_frame=60,
+        )
+    }
+    corrected = CorrectedFrame(
+        sequence_key=SequenceKey("site19", "sequence_a"),
+        frame_index=31,
+        image_path=tmp_path / "images" / "000031.jpg",
+        json_path=tmp_path / "images" / "000031.json",
+        width=8,
+        height=8,
+        annotations=(),
+        exclusions=(),
+    )
+    model = torch.nn.Identity()
+    request = EvaluationRequest(
+        cfg=cfg,
+        model_name="baseline",
+        checkpoint=tmp_path / "best.pt",
+        manifest_dir=manifest,
+        split="validation",
+        threshold_path=None,
+        alignment_cache=None,
+        manifest_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+    )
+    monkeypatch.setattr(factory, "create_model", lambda *values: model)
+    monkeypatch.setattr(
+        training,
+        "load_experiment_checkpoint",
+        lambda *values: {"model_name": "baseline"},
+    )
+    monkeypatch.setattr(inference, "infer_full_frame", lambda *values: ())
+    monkeypatch.setattr(index, "load_track_index", lambda path: tracks)
+    monkeypatch.setattr(
+        index,
+        "load_corrected_frame",
+        lambda *values: corrected,
+    )
+    monkeypatch.setattr(
+        evaluation,
+        "select_validation_threshold",
+        lambda *values, **kwargs: ThresholdEvidence(
+            schema_version=1,
+            model_name="baseline",
+            split="validation",
+            manifest_sha256="a" * 64,
+            checkpoint_sha256="b" * 64,
+            threshold=1.0,
+            f1_riou_025=0.0,
+            false_detections_per_frame=0.0,
+        ),
+    )
+    monkeypatch.setattr(
+        evaluation,
+        "evaluate_temporal_obb",
+        lambda *values: {},
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_load_full_frame_clip",
+        lambda *values, **kwargs: {
+            "frames": torch.zeros((1, 3, 8, 8)),
+            "valid": torch.ones((1,), dtype=torch.bool),
+            "transforms": torch.eye(2, 3).unsqueeze(0),
+            "zero_index": 0,
+            "frame": 31,
+            "metadata": {
+                "site": "site19",
+                "sequence": "sequence_a",
+            },
+        },
+    )
+    monkeypatch.setattr(vru_cli, "_load_frame_velocities", lambda *values: {})
+    monkeypatch.setattr(
+        vru_cli,
+        "_representative_diagnostic_tile",
+        lambda *values: Tile(0, 0, 8, 8),
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_extract_model_diagnostic",
+        lambda *values, **kwargs: {},
+    )
+
+    with pytest.raises(WorkflowError, match="ground-truth integrity"):
+        _evaluate_real(request)
+
+    assert not model.training
+
+
+def test_training_manifest_audit_counts_positive_references_and_metadata_mapping(
+    tmp_path,
+):
+    import moving_det.vru_cli as vru_cli
+    from moving_det.vrud.types import TrackKey, TrackMeta
+
+    manifest = tmp_path / "manifest"
+    manifest.mkdir()
+    positive_rows = [
+        {
+            "split": "train",
+            "site": "site19",
+            "sequence": "sequence_a",
+            "center_frame": index,
+            "tile_xywh": [0, 0, 8, 8],
+            "track_keys": [["site19", "sequence_a", track_id]],
+            "source": "positive",
+        }
+        for index, track_id in enumerate((7, 7, 8, 9, 10), start=1)
+    ]
+    background = {
+        "split": "train",
+        "site": "site19",
+        "sequence": "sequence_a",
+        "center_frame": 6,
+        "tile_xywh": [0, 0, 8, 8],
+        "track_keys": [],
+        "source": "background",
+    }
+    (manifest / "train.jsonl").write_text(
+        "".join(
+            json.dumps(row, separators=(",", ":")) + "\n"
+            for row in (*positive_rows, background)
+        ),
+        encoding="utf-8",
+    )
+
+    def metadata(
+        group_id,
+        *,
+        vrud_class_id=3,
+        class_id=0,
+        class_name="pedestrian",
+        reason=None,
+    ):
+        key = TrackKey("site19", "sequence_a", group_id)
+        return key, TrackMeta(
+            track_key=key,
+            vrud_class_id=vrud_class_id,
+            class_id=class_id,
+            class_name=class_name,
+            mean_velocity=1.0,
+            initial_frame=1,
+            final_frame=60,
+            reason=reason,
+        )
+
+    tracks = dict(
+        (
+            metadata(7),
+            metadata(9, class_id=1, class_name="bicycle"),
+            metadata(10, class_id=None, class_name=None, reason="non_vru_class"),
+        )
+    )
+
+    audit = vru_cli._training_manifest_audit(manifest, tracks)
+
+    assert audit == {
+        "eligible_positive_count": 5,
+        "matched_positive_count": 2,
+        "class_mapping_errors": 3,
+    }
 
 
 @REQUIRES_TORCH
@@ -546,7 +897,7 @@ def test_test_prediction_artifacts_apply_the_exact_frozen_threshold(tmp_path):
         manifest_dir=tmp_path / "manifest",
         split="test",
         threshold_path=threshold_path,
-        alignment_cache=tmp_path / "alignment-cache",
+        alignment_cache=None,
         manifest_sha256=manifest_sha256,
         checkpoint_sha256=checkpoint_sha256,
     )
@@ -916,6 +1267,62 @@ def _evaluation_bundle(
     )
 
 
+def test_temporal_evaluation_rejects_output_equal_to_alignment_cache(tmp_path):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"synthetic checkpoint")
+    alignment_cache = tmp_path / "alignment-cache"
+    alignment_cache.mkdir()
+    sentinel = alignment_cache / "index.json"
+    sentinel.write_text("{}\n", encoding="utf-8")
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        metadata_root=tmp_path / "metadata",
+        output_root=tmp_path / "runs",
+    )
+    args = build_parser().parse_args(
+        [
+            "evaluate",
+            "--model",
+            "mg_vtod",
+            "--checkpoint",
+            str(checkpoint),
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(alignment_cache),
+            "--output",
+            str(alignment_cache),
+        ]
+    )
+
+    def evaluator(request):
+        bundle = _evaluation_bundle(
+            validation=True,
+            manifest_sha256=request.manifest_sha256,
+            checkpoint_sha256=request.checkpoint_sha256,
+        )
+        return replace(
+            bundle,
+            threshold_evidence={
+                **dict(bundle.threshold_evidence),
+                "model_name": "mg_vtod",
+            },
+            alignment_cache_sha256="c" * 64,
+        )
+
+    with pytest.raises(WorkflowError, match="overlaps"):
+        run_evaluate(
+            args,
+            config_loader=lambda path: cfg,
+            evaluator=evaluator,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "{}\n"
+
+
 def test_evaluate_validation_writes_deterministic_strict_artifact_schema(
     tmp_path,
     capsys,
@@ -992,6 +1399,8 @@ def test_evaluate_validation_writes_deterministic_strict_artifact_schema(
     assert run["checkpoint_sha256"] == hashlib.sha256(
         checkpoint.read_bytes()
     ).hexdigest()
+    assert run["alignment_cache"] is None
+    assert run["alignment_cache_sha256"] is None
     assert run["class_schema"] == {
         "0": "pedestrian",
         "1": "bicycle",
@@ -1228,6 +1637,61 @@ def test_compare_rejects_consistently_unknown_artifact_schema(tmp_path):
         )
 
 
+def test_compare_rejects_equal_count_but_different_ground_truth_content(
+    tmp_path,
+):
+    roots = {
+        model: tmp_path / model
+        for model in ("baseline", "mg_vtod", "lstfe")
+    }
+    truth = {
+        "schema_version": 1,
+        "site": "site19",
+        "sequence": "sequence_a",
+        "frame": 31,
+        "class_id": 0,
+        "track_id": 7,
+        "speed_mps": 1.0,
+        "obb": [32.0, 24.0, 12.0, 6.0, 0.1],
+    }
+    for model, root in roots.items():
+        _write_evaluation_run(root, model)
+        model_truth = dict(truth)
+        if model == "mg_vtod":
+            model_truth["class_id"] = 1
+        if model == "lstfe":
+            model_truth["obb"] = [33.0, 24.0, 12.0, 6.0, 0.1]
+        (root / "ground-truth.jsonl").write_text(
+            json.dumps(
+                model_truth,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    args = build_parser().parse_args(
+        [
+            "compare",
+            "--runs",
+            *(str(roots[model]) for model in ("baseline", "mg_vtod", "lstfe")),
+            "--output",
+            str(tmp_path / "comparison"),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="ground-truth"):
+        run_compare(
+            args,
+            gate_evaluator=lambda *values: {
+                "conditions": {},
+                "evidence": {},
+                "passed": False,
+            },
+        )
+
+
 def test_compare_writes_two_real_gate_results_and_primary_metrics(
     tmp_path,
     capsys,
@@ -1238,6 +1702,11 @@ def test_compare_writes_two_real_gate_results_and_primary_metrics(
     }
     for model, root in roots.items():
         _write_evaluation_run(root, model)
+        (root / "ground-truth.jsonl").write_bytes(
+            b'{"class_id":0,"frame":31,"obb":[32.0,24.0,12.0,6.0,0.1],'
+            b'"schema_version":1,"sequence":"sequence_a","site":"site19",'
+            b'"speed_mps":1.0,"track_id":7}\n'
+        )
     output = tmp_path / "comparison"
     args = build_parser().parse_args(
         [
@@ -1269,6 +1738,9 @@ def test_compare_writes_two_real_gate_results_and_primary_metrics(
     assert set(metrics["models"]) == {"baseline", "mg_vtod", "lstfe"}
     assert set(metrics["gates"]) == {"mg_vtod", "lstfe"}
     assert metrics["gates"]["mg_vtod"]["passed"]
+    assert metrics["ground_truth_sha256"] == (
+        "af3b4d3403b5ee337dca90328215e8caa5be884ef366aa4701912382e2b7fed3"
+    )
     assert capsys.readouterr().out.strip() == str(
         (output / "metrics.json").resolve()
     )

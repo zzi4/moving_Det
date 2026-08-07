@@ -65,7 +65,7 @@ class EvaluationRequest:
     manifest_dir: Path
     split: str
     threshold_path: Path | None
-    alignment_cache: Path
+    alignment_cache: Path | None
     manifest_sha256: str
     checkpoint_sha256: str
 
@@ -219,11 +219,15 @@ def _validate_cross_arguments(
             parser.error("--overfit-samples must be exactly 64")
         if args.model == "baseline" and args.baseline_init is not None:
             parser.error("--baseline-init is only valid for temporal models")
+        if args.model == "baseline" and args.alignment_cache is not None:
+            parser.error("--alignment-cache is only valid for temporal models")
     if args.command == "evaluate":
         if args.split == "test" and args.threshold is None:
             parser.error("--threshold is required for test evaluation")
         if args.split == "validation" and args.threshold is not None:
             parser.error("--threshold is forbidden for validation evaluation")
+        if args.model == "baseline" and args.alignment_cache is not None:
+            parser.error("--alignment-cache is only valid for temporal models")
 
 
 def main(
@@ -923,9 +927,27 @@ def run_train(
     manifest = Path(args.manifest)
     if manifest.is_symlink() or not manifest.is_dir():
         raise WorkflowError("training manifest must be a regular directory")
+    alignment_cache: Path | None = None
+    if args.model == "baseline":
+        if args.alignment_cache is not None:
+            raise WorkflowError(
+                "--alignment-cache is only valid for temporal models"
+            )
+    else:
+        if args.alignment_cache is not None:
+            requested_cache = Path(args.alignment_cache)
+            if requested_cache.name != "alignment-cache":
+                raise WorkflowError(
+                    "--alignment-cache must name an alignment-cache directory"
+                )
+            cfg = replace(cfg, output_root=requested_cache.parent)
+        alignment_cache = Path(getattr(cfg, "output_root")) / "alignment-cache"
     output = _validate_output(
         Path(args.output),
-        inputs=(manifest,),
+        inputs=(
+            manifest,
+            *((alignment_cache,) if alignment_cache is not None else ()),
+        ),
         source_roots=(
             Path(getattr(cfg, "image_root")),
             Path(getattr(cfg, "metadata_root")),
@@ -968,15 +990,8 @@ def run_train(
                 "temporal training requires --baseline-init/--weights or --resume"
             )
 
-    if args.alignment_cache is not None:
-        requested_cache = Path(args.alignment_cache)
-        if requested_cache.name != "alignment-cache":
-            raise WorkflowError(
-                "--alignment-cache must name an alignment-cache directory"
-            )
-        cfg = replace(cfg, output_root=requested_cache.parent)
-    alignment_cache = Path(getattr(cfg, "output_root")) / "alignment-cache"
     if using_default_trainer and args.model != "baseline":
+        assert alignment_cache is not None
         _verify_alignment_cache_summary(
             alignment_cache,
             source_manifest=manifest,
@@ -1393,16 +1408,28 @@ def run_evaluate(
     threshold_path = Path(args.threshold) if args.threshold is not None else None
     if threshold_path is not None:
         _sha256_file(threshold_path)
-    alignment_cache = (
-        Path(args.alignment_cache)
-        if args.alignment_cache is not None
-        else Path(getattr(cfg, "output_root")) / "alignment-cache"
-    )
+    alignment_cache: Path | None = None
+    if args.model == "baseline":
+        if args.alignment_cache is not None:
+            raise WorkflowError(
+                "--alignment-cache is only valid for temporal models"
+            )
+    else:
+        alignment_cache = (
+            Path(args.alignment_cache)
+            if args.alignment_cache is not None
+            else Path(getattr(cfg, "output_root")) / "alignment-cache"
+        )
     output = _validate_output(
         Path(args.output),
         inputs=tuple(
             path
-            for path in (manifest, checkpoint, threshold_path)
+            for path in (
+                manifest,
+                checkpoint,
+                threshold_path,
+                alignment_cache,
+            )
             if path is not None
         ),
         source_roots=(
@@ -1463,7 +1490,11 @@ def run_evaluate(
             "class_schema": _CLASS_SCHEMA,
             "evaluated_frame_keys": list(artifacts.evaluated_frame_keys),
             "audit": dict(artifacts.audit),
-            "alignment_cache": str(request.alignment_cache.resolve(strict=False)),
+            "alignment_cache": (
+                str(request.alignment_cache.resolve(strict=False))
+                if request.alignment_cache is not None
+                else None
+            ),
             "alignment_cache_sha256": artifacts.alignment_cache_sha256,
             "threshold_source": (
                 str(request.threshold_path.resolve())
@@ -1553,6 +1584,37 @@ def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
         raise WorkflowError("evaluation artifact schema is unsupported")
 
 
+def _compatible_ground_truth_sha256(
+    records: Mapping[
+        str,
+        tuple[Mapping[str, object], Mapping[str, object], Path],
+    ],
+) -> str | None:
+    paths = {
+        model: records[model][2] / "ground-truth.jsonl"
+        for model in _MODEL_NAMES
+    }
+    presence = {
+        model: path.exists() or path.is_symlink()
+        for model, path in paths.items()
+    }
+    if any(presence.values()) and not all(presence.values()):
+        raise WorkflowError(
+            "comparison ground-truth evidence is incomplete across models"
+        )
+    if not any(presence.values()):
+        return None
+    digests = {
+        model: _sha256_file(path)
+        for model, path in paths.items()
+    }
+    if len(set(digests.values())) != 1:
+        raise WorkflowError(
+            "comparison ground-truth evidence content is incompatible"
+        )
+    return digests["baseline"]
+
+
 def run_compare(
     args: argparse.Namespace,
     *,
@@ -1599,6 +1661,7 @@ def run_compare(
     for model in _MODEL_NAMES[1:]:
         if _validate_audit(records[model][0].get("audit")) != baseline_audit:
             raise WorkflowError("comparison audit provenance is incompatible")
+    ground_truth_sha256 = _compatible_ground_truth_sha256(records)
 
     if gate_evaluator is None:
         from moving_det.ml.evaluation import evaluate_temporal_gate
@@ -1644,6 +1707,7 @@ def run_compare(
             "evaluation_split": "test",
             "class_schema": _CLASS_SCHEMA,
             "evaluated_frame_keys": baseline_run["evaluated_frame_keys"],
+            "ground_truth_sha256": ground_truth_sha256,
             "runs": {
                 model: {
                     "path": str(records[model][2].resolve()),
@@ -2853,7 +2917,11 @@ def _evaluation_frame_records(
     split: str,
 ) -> tuple[dict[str, object], ...]:
     rows = _read_jsonl(Path(manifest_dir) / f"{split}.jsonl")
-    records = {}
+    records: dict[tuple[str, str, int], dict[str, object]] = {}
+    track_keys_by_frame: dict[
+        tuple[str, str, int],
+        set[tuple[str, str, int]],
+    ] = {}
     for row in rows:
         site = row.get("site")
         sequence = row.get("sequence")
@@ -2868,12 +2936,217 @@ def _evaluation_frame_records(
             or frame <= 0
         ):
             raise WorkflowError("evaluation manifest row identity is invalid")
-        records[(site, sequence, frame)] = {
+        identity = (site, sequence, frame)
+        raw_track_keys = row.get("track_keys")
+        if not isinstance(raw_track_keys, list):
+            raise WorkflowError("evaluation manifest track_keys are invalid")
+        row_track_keys: set[tuple[str, str, int]] = set()
+        for raw_key in raw_track_keys:
+            if (
+                not isinstance(raw_key, list)
+                or len(raw_key) != 3
+                or raw_key[0] != site
+                or raw_key[1] != sequence
+                or isinstance(raw_key[2], bool)
+                or not isinstance(raw_key[2], int)
+            ):
+                raise WorkflowError(
+                    "evaluation manifest track identity is invalid"
+                )
+            key = (raw_key[0], raw_key[1], raw_key[2])
+            if key in row_track_keys:
+                raise WorkflowError(
+                    "evaluation manifest row contains duplicate track keys"
+                )
+            row_track_keys.add(key)
+        records[identity] = {
             "site": site,
             "sequence": sequence,
             "center_frame": frame,
         }
-    return tuple(records[key] for key in sorted(records))
+        track_keys_by_frame.setdefault(identity, set()).update(row_track_keys)
+    return tuple(
+        {
+            **records[key],
+            "track_keys": tuple(sorted(track_keys_by_frame[key])),
+        }
+        for key in sorted(records)
+    )
+
+
+def _manifest_ground_truth_expectations(
+    records: Sequence[Mapping[str, object]],
+    tracks: Mapping[object, object],
+) -> dict[tuple[str, str, int, int], int]:
+    from moving_det.vrud.types import TrackKey
+
+    expected: dict[tuple[str, str, int, int], int] = {}
+    for record in records:
+        site = str(record["site"])
+        sequence = str(record["sequence"])
+        frame = int(record["center_frame"])
+        raw_track_keys = record.get("track_keys")
+        if (
+            isinstance(raw_track_keys, (str, bytes))
+            or not isinstance(raw_track_keys, Sequence)
+        ):
+            raise WorkflowError(
+                "evaluation frame is missing frozen track identities"
+            )
+        for raw_key in raw_track_keys:
+            if (
+                isinstance(raw_key, (str, bytes))
+                or not isinstance(raw_key, Sequence)
+                or len(raw_key) != 3
+            ):
+                raise WorkflowError(
+                    "evaluation frame contains a malformed track identity"
+                )
+            track_key = TrackKey(
+                str(raw_key[0]),
+                str(raw_key[1]),
+                int(raw_key[2]),
+            )
+            if track_key.site != site or track_key.sequence != sequence:
+                raise WorkflowError(
+                    "evaluation frame track identity has mismatched provenance"
+                )
+            metadata = tracks.get(track_key)
+            class_id = getattr(metadata, "class_id", None)
+            if (
+                isinstance(class_id, bool)
+                or not isinstance(class_id, int)
+                or class_id not in {0, 1, 2, 3}
+            ):
+                raise WorkflowError(
+                    "frozen evaluation track has no eligible metadata class"
+                )
+            identity = (site, sequence, frame, track_key.group_id)
+            previous = expected.setdefault(identity, class_id)
+            if previous != class_id:
+                raise WorkflowError(
+                    "frozen evaluation track has conflicting metadata classes"
+                )
+    return expected
+
+
+def _training_manifest_audit(
+    manifest_dir: Path,
+    tracks: Mapping[object, object],
+) -> dict[str, int]:
+    from moving_det.vrud.types import TRAIN_CLASS_NAMES, VRUD_TO_TRAIN, TrackKey
+
+    eligible = 0
+    matched = 0
+    class_mapping_errors = 0
+    for row in _read_jsonl(Path(manifest_dir) / "train.jsonl"):
+        source = row.get("source")
+        if source not in {"positive", "background"}:
+            raise WorkflowError("training manifest source is invalid")
+        site = row.get("site")
+        sequence = row.get("sequence")
+        raw_track_keys = row.get("track_keys")
+        if (
+            not isinstance(site, str)
+            or not site
+            or not isinstance(sequence, str)
+            or not sequence
+            or not isinstance(raw_track_keys, list)
+        ):
+            raise WorkflowError("training manifest track provenance is invalid")
+        if source == "background":
+            if raw_track_keys:
+                raise WorkflowError(
+                    "training background row contains track references"
+                )
+            continue
+        if not raw_track_keys:
+            raise WorkflowError(
+                "training positive row contains no track references"
+            )
+        for raw_key in raw_track_keys:
+            if (
+                not isinstance(raw_key, list)
+                or len(raw_key) != 3
+                or raw_key[0] != site
+                or raw_key[1] != sequence
+                or isinstance(raw_key[2], bool)
+                or not isinstance(raw_key[2], int)
+            ):
+                raise WorkflowError(
+                    "training positive track reference is invalid"
+                )
+            eligible += 1
+            track_key = TrackKey(site, sequence, raw_key[2])
+            metadata = tracks.get(track_key)
+            if metadata is None or getattr(metadata, "reason", None) is not None:
+                class_mapping_errors += 1
+                continue
+            vrud_class_id = getattr(metadata, "vrud_class_id", None)
+            class_id = getattr(metadata, "class_id", None)
+            expected_class = VRUD_TO_TRAIN.get(vrud_class_id)
+            if (
+                isinstance(class_id, bool)
+                or expected_class is None
+                or class_id != expected_class
+                or getattr(metadata, "class_name", None)
+                != TRAIN_CLASS_NAMES[expected_class]
+            ):
+                class_mapping_errors += 1
+                continue
+            matched += 1
+    return {
+        "eligible_positive_count": eligible,
+        "matched_positive_count": matched,
+        "class_mapping_errors": class_mapping_errors,
+    }
+
+
+def _ground_truth_integrity_audit(
+    expected: Mapping[tuple[str, str, int, int], int],
+    ground_truth: Sequence[object],
+) -> dict[str, int]:
+    actual: dict[tuple[str, str, int, int], int] = {}
+    for truth in ground_truth:
+        identity = (
+            str(getattr(truth, "site")),
+            str(getattr(truth, "sequence")),
+            int(getattr(truth, "frame")),
+            int(getattr(truth, "track_id")),
+        )
+        if identity in actual:
+            raise WorkflowError(
+                "corrected ground truth contains a duplicate track state"
+            )
+        actual[identity] = int(getattr(truth, "class_id"))
+    expected_keys = set(expected)
+    actual_keys = set(actual)
+    shared = expected_keys & actual_keys
+    matched = sum(actual[key] == expected[key] for key in shared)
+    errors = (
+        len(expected_keys - actual_keys)
+        + len(actual_keys - expected_keys)
+        + sum(actual[key] != expected[key] for key in shared)
+    )
+    return {
+        "eligible_positive_count": len(expected),
+        "matched_positive_count": matched,
+        "class_mapping_errors": errors,
+    }
+
+
+def _require_ground_truth_integrity(
+    expected: Mapping[tuple[str, str, int, int], int],
+    ground_truth: Sequence[object],
+) -> None:
+    audit = _ground_truth_integrity_audit(expected, ground_truth)
+    if (
+        audit["matched_positive_count"] != audit["eligible_positive_count"]
+        or audit["class_mapping_errors"] != 0
+    ):
+        raise WorkflowError(
+            "evaluation ground-truth integrity differs from the frozen split"
+        )
 
 
 def _full_frame_path(
@@ -3159,25 +3432,36 @@ def _extract_model_diagnostic(
     motion_map = [[0.0]]
     alignment_map = [[0.0]]
     selected_long_index = -1
-    with torch.inference_mode():
-        if model_name == "mg_vtod":
-            motion = compute_motion_strength(
-                batch["frames"],
-                batch["valid"],
-                batch["transforms"],
-            )
-            motion_map = _downsample_diagnostic(motion)
-        elif model_name == "lstfe":
-            provider = getattr(model, "forward_with_diagnostics", None)
-            if not callable(provider):
-                raise WorkflowError("LSTFE model has no diagnostics interface")
-            _, diagnostic = provider(batch)
-            selected_long_index = int(
-                diagnostic["selected_long_index"].item()
-            )
-            residual = diagnostic["p2_short_residual"]
-            magnitude = residual.abs().mean(dim=1, keepdim=True)
-            alignment_map = _downsample_diagnostic(magnitude)
+    module_states = tuple(
+        (module, module.training)
+        for module in model.modules()
+    )
+    try:
+        model.eval()
+        with torch.inference_mode():
+            if model_name == "mg_vtod":
+                motion = compute_motion_strength(
+                    batch["frames"],
+                    batch["valid"],
+                    batch["transforms"],
+                )
+                motion_map = _downsample_diagnostic(motion)
+            elif model_name == "lstfe":
+                provider = getattr(model, "forward_with_diagnostics", None)
+                if not callable(provider):
+                    raise WorkflowError(
+                        "LSTFE model has no diagnostics interface"
+                    )
+                _, diagnostic = provider(batch)
+                selected_long_index = int(
+                    diagnostic["selected_long_index"].item()
+                )
+                residual = diagnostic["p2_short_residual"]
+                magnitude = residual.abs().mean(dim=1, keepdim=True)
+                alignment_map = _downsample_diagnostic(magnitude)
+    finally:
+        for module, state in module_states:
+            module.training = state
     metadata = clip["metadata"]
     assert isinstance(metadata, Mapping)
     return {
@@ -3744,6 +4028,8 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
     cfg = request.cfg
     offsets = _model_offsets(request.model_name, cfg)
     if request.model_name != "baseline":
+        if request.alignment_cache is None:
+            raise WorkflowError("temporal evaluation requires alignment cache")
         _verify_alignment_cache_summary(
             request.alignment_cache,
             source_manifest=request.manifest_dir,
@@ -3772,8 +4058,17 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+    model.eval()
 
     tracks = load_track_index(Path(getattr(cfg, "metadata_root")))
+    training_audit = _training_manifest_audit(
+        request.manifest_dir,
+        tracks,
+    )
+    expected_ground_truth = _manifest_ground_truth_expectations(
+        records,
+        tracks,
+    )
     velocities = _load_frame_velocities(cfg, records)
     predictions = []
     truth = []
@@ -3901,6 +4196,10 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         _serialize_ground_truth(item)
         for item in truth
     )
+    _require_ground_truth_integrity(
+        expected_ground_truth,
+        truth,
+    )
     return EvaluationArtifacts(
         evaluated_frame_keys=tuple(
             {
@@ -3913,11 +4212,7 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         metrics=metrics,
         predictions=prediction_rows,
         ground_truth=truth_rows,
-        audit={
-            "eligible_positive_count": len(truth_rows),
-            "matched_positive_count": len(truth_rows),
-            "class_mapping_errors": 0,
-        },
+        audit=training_audit,
         threshold_evidence=threshold_evidence,
         diagnostics=tuple(diagnostics),
         alignment_cache_sha256=(
