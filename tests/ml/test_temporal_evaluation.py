@@ -30,17 +30,27 @@ TILE = Tile(0, 0, 1024, 1024)
 def _cfg(
     *,
     frames=(1,),
+    detection_frames=None,
+    continuity_frames=None,
     site="site19",
     sequence="sequence_a",
     **changes,
 ):
+    if detection_frames is None:
+        detection_frames = frames
+    if continuity_frames is None:
+        continuity_frames = frames
     values = {
         "max_false_detections_per_frame": 5.0,
         "seed": 20260806,
         "evaluation_split": "validation",
-        "evaluated_frame_keys": tuple(
+        "detection_frame_keys": tuple(
             (site, sequence, frame)
-            for frame in frames
+            for frame in detection_frames
+        ),
+        "continuity_frame_keys": tuple(
+            (site, sequence, frame)
+            for frame in continuity_frames
         ),
     }
     values.update(changes)
@@ -84,6 +94,7 @@ def _gt(
     site="site19",
     sequence="sequence_a",
     speed=2.0,
+    frame_speed=None,
 ):
     return GroundTruth(
         frame=frame,
@@ -93,6 +104,40 @@ def _gt(
         site=site,
         sequence=sequence,
         speed_mps=speed,
+        frame_speed_mps=frame_speed,
+    )
+
+
+def _test_cfg(
+    tmp_path,
+    *,
+    detection_frames,
+    continuity_frames,
+    threshold=0.5,
+):
+    threshold_path = freeze_validation_threshold(
+        tmp_path / "threshold.json",
+        ThresholdEvidence(
+            schema_version=1,
+            model_name="baseline",
+            split="validation",
+            manifest_sha256="a" * 64,
+            checkpoint_sha256="b" * 64,
+            threshold=threshold,
+            f1_riou_025=0.5,
+            false_detections_per_frame=0.0,
+        ),
+    )
+    union = tuple(sorted(set(detection_frames) | set(continuity_frames)))
+    return _cfg(
+        frames=union,
+        detection_frames=detection_frames,
+        continuity_frames=continuity_frames,
+        evaluation_split="test",
+        threshold_path=threshold_path,
+        model_name="baseline",
+        manifest_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
     )
 
 
@@ -138,6 +183,69 @@ def test_hand_computable_ap_recall_fp_and_duplicate_prediction():
     )
     assert metrics["per_track"]["site19:sequence_a:int:1"]["coverage"] == 0.5
     assert metrics["per_track"]["site19:sequence_a:int:1"]["longest_miss"] == 1
+
+
+def test_dense_continuity_frames_cannot_change_detection_headline_metrics(
+    tmp_path,
+):
+    detection_truth = _gt(1, track=1)
+    dense_truth = tuple(
+        _gt(frame, track=2, cx=50.0, frame_speed=2.0)
+        for frame in range(2, 17)
+    )
+    dense_false_predictions = tuple(
+        _pred(frame, cx=100.0)
+        for frame in range(2, 17)
+    )
+    metrics = evaluate_temporal_obb(
+        (_pred(1), *dense_false_predictions),
+        (detection_truth, *dense_truth),
+        _test_cfg(
+            tmp_path,
+            detection_frames=(1,),
+            continuity_frames=tuple(range(2, 17)),
+        ),
+    )
+
+    assert metrics["map50"] == 1.0
+    assert metrics["recall_riou_025"] == 1.0
+    assert metrics["ground_truth_count"] == 1
+    assert metrics["prediction_count_fixed"] == 1
+    assert metrics["false_positive_count_riou_025_fixed"] == 0
+    assert metrics["evaluated_frame_count"] == 1
+    assert metrics["per_track"]["site19:sequence_a:int:2"]["coverage"] == 0.0
+    assert metrics["per_track"]["site19:sequence_a:int:2"]["longest_miss"] == 15
+
+
+def test_sparse_detection_only_frames_cannot_change_continuity_metrics(
+    tmp_path,
+):
+    ground_truth = (
+        _gt(1, track=1, cx=100.0, frame_speed=2.0),
+        _gt(2, track=1, cx=10.0, frame_speed=2.0),
+        _gt(3, track=1, cx=10.0, frame_speed=2.0),
+    )
+    predictions = (_pred(2), _pred(3))
+
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _test_cfg(
+            tmp_path,
+            detection_frames=(1,),
+            continuity_frames=(2, 3),
+        ),
+    )
+
+    track = metrics["per_track"]["site19:sequence_a:int:1"]
+    assert track["gt_count"] == 2
+    assert track["coverage"] == 1.0
+    assert track["longest_miss"] == 0
+    assert track["jitter"] == {
+        "center_px": 0.0,
+        "size_log": 0.0,
+        "angle_rad": 0.0,
+    }
 
 
 def test_confidence_order_controls_one_to_one_match_and_cross_class_never_matches():
@@ -217,7 +325,10 @@ def test_matching_is_namespaced_by_site_and_sequence_identity():
     metrics = evaluate_temporal_obb(
         predictions,
         ground_truth,
-        _cfg(evaluated_frame_keys=universe),
+        _cfg(
+            detection_frame_keys=universe,
+            continuity_frame_keys=universe,
+        ),
     )
 
     assert metrics["recall_riou_025"] == 0.0
@@ -239,7 +350,10 @@ def test_fp_per_frame_uses_immutable_evaluated_frame_universe_and_rejects_outsid
     metrics = evaluate_temporal_obb(
         predictions,
         (),
-        _cfg(evaluated_frame_keys=universe),
+        _cfg(
+            detection_frame_keys=universe,
+            continuity_frame_keys=universe,
+        ),
     )
 
     assert metrics["evaluated_frame_count"] == 3
@@ -248,7 +362,10 @@ def test_fp_per_frame_uses_immutable_evaluated_frame_universe_and_rejects_outsid
         evaluate_temporal_obb(
             (_pred(4),),
             (),
-            _cfg(evaluated_frame_keys=universe),
+            _cfg(
+                detection_frame_keys=universe,
+                continuity_frame_keys=universe,
+            ),
         )
 
 
@@ -294,6 +411,41 @@ def test_exact_speed_boundaries_and_site_strata(speed, expected_bin):
 
     assert metrics["per_speed"][expected_bin]["gt_count"] == 1
     assert metrics["per_site"]["site22"]["recall_riou_025"] == 1.0
+
+
+def test_speed_strata_use_track_mean_not_instantaneous_speed():
+    ground_truth = (
+        _gt(1, speed=2.0, frame_speed=0.2),
+        _gt(2, speed=2.0, frame_speed=5.0),
+        _gt(3, speed=2.0, frame_speed=0.05),
+    )
+
+    metrics = evaluate_temporal_obb(
+        tuple(_pred(frame) for frame in range(1, 4)),
+        ground_truth,
+        _cfg(frames=(1, 2, 3)),
+    )
+
+    assert metrics["per_speed"]["<1"]["gt_count"] == 0
+    assert metrics["per_speed"]["1-4"]["gt_count"] == 3
+    assert metrics["per_speed"][">=4"]["gt_count"] == 0
+
+
+def test_stop_detection_uses_instantaneous_speed_even_for_medium_track():
+    ground_truth = tuple(
+        _gt(frame, speed=2.0, frame_speed=0.05)
+        for frame in range(1, 16)
+    )
+
+    metrics = evaluate_temporal_obb(
+        tuple(_pred(frame) for frame in range(1, 16)),
+        ground_truth,
+        _cfg(frames=tuple(range(1, 16))),
+    )
+
+    assert metrics["per_speed"]["1-4"]["gt_count"] == 15
+    assert metrics["stopped_gt_count"] == 15
+    assert metrics["stopped_recall_riou_025"] == 1.0
 
 
 def test_stopped_recall_uses_whole_eligible_run():
@@ -597,7 +749,8 @@ def test_threshold_sweep_fp_denominator_includes_empty_evaluated_frames():
         predictions,
         ground_truth,
         _cfg(
-            evaluated_frame_keys=universe,
+            detection_frame_keys=universe,
+            continuity_frame_keys=(),
             max_false_detections_per_frame=0.25,
         ),
         model_name="baseline",
@@ -631,7 +784,6 @@ def test_primary_test_evaluation_requires_and_enforces_frozen_threshold(
         _pred(1, cx=100, confidence=0.7),
     )
     test_cfg = _cfg(
-        evaluated_frame_keys=(("site19", "sequence_a", 1),),
         evaluation_split="test",
         threshold_path=threshold_path,
         model_name="mg_vtod",
@@ -648,7 +800,6 @@ def test_primary_test_evaluation_requires_and_enforces_frozen_threshold(
             predictions,
             (_gt(1),),
             _cfg(
-                evaluated_frame_keys=(("site19", "sequence_a", 1),),
                 evaluation_split="test",
                 threshold_path=threshold_path,
                 model_name="baseline",
@@ -661,13 +812,39 @@ def test_primary_test_evaluation_requires_and_enforces_frozen_threshold(
             predictions,
             (_gt(1),),
             _cfg(
-                evaluated_frame_keys=(("site19", "sequence_a", 1),),
                 evaluation_split="test",
                 model_name="mg_vtod",
                 manifest_sha256="a" * 64,
                 checkpoint_sha256="b" * 64,
             ),
         )
+
+
+def test_test_ap_uses_full_ranking_but_fixed_metrics_use_frozen_threshold(
+    tmp_path,
+):
+    cfg = _test_cfg(
+        tmp_path,
+        detection_frames=(1,),
+        continuity_frames=(1,),
+        threshold=0.8,
+    )
+    predictions = (
+        _pred(1, cx=100.0, confidence=0.9),
+        _pred(1, confidence=0.7),
+    )
+
+    metrics = evaluate_temporal_obb(predictions, (_gt(1),), cfg)
+
+    assert metrics["map50"] == 0.5
+    assert metrics["map50_full_ranking"] == 0.5
+    assert metrics["recall_riou_025"] == 0.0
+    assert metrics["recall_riou_025_fixed"] == 0.0
+    assert metrics["prediction_count_full_ranking"] == 2
+    assert metrics["prediction_count_fixed"] == 1
+    assert metrics["false_detections_per_frame"] == 1.0
+    assert metrics["per_class"]["0"]["ap50_full_ranking"] == 0.5
+    assert metrics["per_class"]["0"]["prediction_count_fixed"] == 1
 
 
 def test_threshold_freeze_is_strict_atomic_and_provenance_bound(
@@ -719,6 +896,18 @@ def test_threshold_schema_rejects_boolean_version():
             f1_riou_025=0.6,
             false_detections_per_frame=1.0,
         )
+
+
+def test_ground_truth_frame_speed_falls_back_compatibly_and_rejects_negative():
+    legacy = _gt(1, speed=2.5)
+    explicit = _gt(1, speed=2.5, frame_speed=0.05)
+
+    assert legacy.mean_speed_mps == 2.5
+    assert legacy.instantaneous_speed_mps == 2.5
+    assert explicit.mean_speed_mps == 2.5
+    assert explicit.instantaneous_speed_mps == 0.05
+    with pytest.raises(ValueError, match="frame_speed_mps"):
+        _gt(1, frame_speed=-0.01)
 
 
 def test_threshold_freeze_preserves_existing_file_if_replace_fails(

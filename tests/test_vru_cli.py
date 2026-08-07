@@ -17,12 +17,14 @@ from moving_det.vru_cli import (
     EvaluationRequest,
     WorkflowError,
     _evaluate_real,
+    _evaluation_frame_records,
     _extract_model_diagnostic,
     _loader_task11_metrics,
     _manifest_fingerprint,
     _predictions_for_artifact,
     _select_audit_rows,
     _select_data_smoke_records,
+    _serialize_ground_truth,
     _stage_overfit_manifest,
     _verify_checkpoint_alignment_provenance,
     build_parser,
@@ -538,9 +540,10 @@ def test_task11_training_validator_consumes_passed_loader_and_restores_identity(
     assert prediction.tile == Tile(100, 200, 8, 8)
     assert truth.obb == OBB(104.0, 204.0, 4.0, 2.0, 0.0)
     assert truth.track_id == 7
-    assert observed["cfg"]["evaluated_frame_keys"] == (
+    assert observed["cfg"]["detection_frame_keys"] == (
         {"site": "site19", "sequence": "sequence_a", "frame": 31},
     )
+    assert observed["cfg"]["continuity_frame_keys"] == ()
     assert tuple(module.training for module in model.modules()) == original_states
 
 
@@ -777,6 +780,218 @@ def test_real_evaluation_audit_detects_manifest_gt_missing_from_corrected_frame(
         _evaluate_real(request)
 
     assert not model.training
+
+
+@REQUIRES_TORCH
+def test_overlapping_detection_and_continuity_frame_is_inferred_and_serialized_once(
+    tmp_path,
+    monkeypatch,
+):
+    import torch
+
+    import moving_det.ml.evaluation as evaluation
+    import moving_det.ml.factory as factory
+    import moving_det.ml.inference as inference
+    import moving_det.ml.training as training
+    import moving_det.vru_cli as vru_cli
+    import moving_det.vrud.index as index
+    from moving_det.ml.evaluation import ThresholdEvidence, freeze_validation_threshold
+    from moving_det.models import OBB
+    from moving_det.vrud.tiling import Tile
+    from moving_det.vrud.types import (
+        CorrectedAnnotation,
+        CorrectedFrame,
+        SequenceKey,
+        TrackKey,
+        TrackMeta,
+    )
+
+    manifest = tmp_path / "manifest"
+    manifest.mkdir()
+    common = {
+        "split": "test",
+        "site": "site19",
+        "sequence": "sequence_a",
+        "center_frame": 31,
+        "tile_xywh": [0, 0, 8, 8],
+        "track_keys": [["site19", "sequence_a", 7]],
+    }
+    (manifest / "test.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {**common, "source": source},
+                separators=(",", ":"),
+            )
+            + "\n"
+            for source in ("evaluation", "continuity")
+        ),
+        encoding="utf-8",
+    )
+    (manifest / "train.jsonl").write_text("", encoding="utf-8")
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        metadata_root=tmp_path / "metadata",
+        tile_size=8,
+        tile_overlap=0,
+    )
+    track_key = TrackKey("site19", "sequence_a", 7)
+    tracks = {
+        track_key: TrackMeta(
+            track_key=track_key,
+            vrud_class_id=3,
+            class_id=0,
+            class_name="pedestrian",
+            mean_velocity=2.5,
+            initial_frame=1,
+            final_frame=60,
+        )
+    }
+    annotation = CorrectedAnnotation(
+        obb=OBB(4.0, 4.0, 4.0, 2.0, 0.0),
+        class_id=0,
+        class_name="pedestrian",
+        track_key=track_key,
+        raw_json_label="car",
+    )
+    corrected = CorrectedFrame(
+        sequence_key=SequenceKey("site19", "sequence_a"),
+        frame_index=31,
+        image_path=tmp_path / "images" / "000031.jpg",
+        json_path=tmp_path / "images" / "000031.json",
+        width=8,
+        height=8,
+        annotations=(annotation,),
+        exclusions=(),
+    )
+    threshold_path = freeze_validation_threshold(
+        tmp_path / "threshold.json",
+        ThresholdEvidence(
+            schema_version=1,
+            model_name="baseline",
+            split="validation",
+            manifest_sha256="a" * 64,
+            checkpoint_sha256="b" * 64,
+            threshold=0.5,
+            f1_riou_025=0.0,
+            false_detections_per_frame=0.0,
+        ),
+    )
+    request = EvaluationRequest(
+        cfg=cfg,
+        model_name="baseline",
+        checkpoint=tmp_path / "best.pt",
+        manifest_dir=manifest,
+        split="test",
+        threshold_path=threshold_path,
+        alignment_cache=None,
+        manifest_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+    )
+    model = torch.nn.Identity()
+    inference_calls = []
+    observed_cfg = {}
+    monkeypatch.setattr(factory, "create_model", lambda *values: model)
+    monkeypatch.setattr(
+        training,
+        "load_experiment_checkpoint",
+        lambda *values: {"model_name": "baseline"},
+    )
+    monkeypatch.setattr(
+        inference,
+        "infer_full_frame",
+        lambda *values: inference_calls.append(values[1]["frame"]) or (),
+    )
+    monkeypatch.setattr(index, "load_track_index", lambda path: tracks)
+    monkeypatch.setattr(
+        index,
+        "load_corrected_frame",
+        lambda *values: corrected,
+    )
+    monkeypatch.setattr(
+        evaluation,
+        "evaluate_temporal_obb",
+        lambda predictions, ground_truth, received_cfg: observed_cfg.update(
+            received_cfg
+        )
+        or {},
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_load_full_frame_clip",
+        lambda *values, **kwargs: {
+            "frames": torch.zeros((1, 3, 8, 8)),
+            "valid": torch.ones((1,), dtype=torch.bool),
+            "transforms": torch.eye(2, 3).unsqueeze(0),
+            "zero_index": 0,
+            "frame": 31,
+            "metadata": {"site": "site19", "sequence": "sequence_a"},
+        },
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_load_frame_velocities",
+        lambda *values: {("site19", "sequence_a", 7, 31): 0.05},
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_representative_diagnostic_tile",
+        lambda *values: Tile(0, 0, 8, 8),
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_extract_model_diagnostic",
+        lambda *values, **kwargs: {},
+    )
+
+    artifacts = _evaluate_real(request)
+
+    assert inference_calls == [31]
+    assert artifacts.detection_frame_keys == (
+        {"site": "site19", "sequence": "sequence_a", "frame": 31},
+    )
+    assert artifacts.continuity_frame_keys == (
+        {"site": "site19", "sequence": "sequence_a", "frame": 31},
+    )
+    assert len(artifacts.ground_truth) == 1
+    assert artifacts.ground_truth[0]["schema_version"] == 2
+    assert artifacts.ground_truth[0]["mean_speed_mps"] == 2.5
+    assert artifacts.ground_truth[0]["frame_speed_mps"] == 0.05
+    assert observed_cfg["detection_frame_keys"] == (
+        inference.FrameKey("site19", "sequence_a", 31),
+    )
+    assert observed_cfg["continuity_frame_keys"] == (
+        inference.FrameKey("site19", "sequence_a", 31),
+    )
+
+
+@pytest.mark.parametrize(
+    ("split", "source"),
+    [("test", "mystery"), ("validation", "continuity")],
+)
+def test_evaluation_manifest_rejects_invalid_source_for_split(
+    tmp_path,
+    split,
+    source,
+):
+    manifest = tmp_path / "manifest"
+    manifest.mkdir()
+    (manifest / f"{split}.jsonl").write_text(
+        json.dumps(
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "track_keys": [],
+                "source": source,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowError, match="source"):
+        _evaluation_frame_records(manifest, split)
 
 
 def test_training_manifest_audit_counts_positive_references_and_metadata_mapping(
@@ -1211,8 +1426,15 @@ def _evaluation_bundle(
         else None
     )
     return EvaluationArtifacts(
-        evaluated_frame_keys=(
+        detection_frame_keys=(
             {"site": "site19", "sequence": "sequence_a", "frame": 31},
+        ),
+        continuity_frame_keys=(
+            ()
+            if validation
+            else (
+                {"site": "site19", "sequence": "sequence_a", "frame": 31},
+            )
         ),
         metrics={
             "map50": 0.5,
@@ -1248,12 +1470,14 @@ def _evaluation_bundle(
         ),
         ground_truth=(
             {
+                "schema_version": 2,
                 "site": "site19",
                 "sequence": "sequence_a",
                 "frame": 31,
                 "class_id": 0,
                 "track_id": 7,
-                "speed_mps": 1.5,
+                "mean_speed_mps": 1.5,
+                "frame_speed_mps": 0.5,
                 "obb": [64.0, 48.0, 20.0, 8.0, 0.2],
             },
         ),
@@ -1521,7 +1745,10 @@ def _write_evaluation_run(
             "2": "tricycle",
             "3": "motorcycle",
         },
-        "evaluated_frame_keys": [
+        "detection_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 31}
+        ],
+        "continuity_frame_keys": [
             {"site": "site19", "sequence": "sequence_a", "frame": 31}
         ],
         "audit": {
@@ -1534,7 +1761,7 @@ def _write_evaluation_run(
         "artifact_schema": {
             "metrics": 1,
             "predictions": 1,
-            "ground_truth": 1,
+            "ground_truth": 2,
         },
     }
     (root / "run.json").write_text(
@@ -1603,6 +1830,55 @@ def test_compare_requires_exact_model_set_and_compatible_provenance(
         run_compare(args, gate_evaluator=lambda *values: {})
 
 
+@pytest.mark.parametrize(
+    "universe_field",
+    ["detection_frame_keys", "continuity_frame_keys"],
+)
+def test_compare_rejects_either_frozen_universe_mismatch(
+    tmp_path,
+    universe_field,
+):
+    roots = {
+        model: tmp_path / model
+        for model in ("baseline", "mg_vtod", "lstfe")
+    }
+    common_universe = [
+        {"site": "site19", "sequence": "sequence_a", "frame": 31}
+    ]
+    for model, root in roots.items():
+        _write_evaluation_run(root, model)
+        run = json.loads((root / "run.json").read_text(encoding="utf-8"))
+        run["detection_frame_keys"] = common_universe
+        run["continuity_frame_keys"] = common_universe
+        if model == "mg_vtod":
+            run[universe_field] = [
+                {"site": "site19", "sequence": "sequence_a", "frame": 32}
+            ]
+        (root / "run.json").write_text(
+            json.dumps(run, allow_nan=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    args = build_parser().parse_args(
+        [
+            "compare",
+            "--runs",
+            *(str(roots[model]) for model in ("baseline", "mg_vtod", "lstfe")),
+            "--output",
+            str(tmp_path / "comparison"),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match=universe_field.replace("_", " ")):
+        run_compare(
+            args,
+            gate_evaluator=lambda *values: {
+                "conditions": {},
+                "evidence": {},
+                "passed": False,
+            },
+        )
+
+
 def test_compare_rejects_consistently_unknown_artifact_schema(tmp_path):
     roots = {
         model: tmp_path / model
@@ -1645,13 +1921,14 @@ def test_compare_rejects_equal_count_but_different_ground_truth_content(
         for model in ("baseline", "mg_vtod", "lstfe")
     }
     truth = {
-        "schema_version": 1,
+        "schema_version": 2,
         "site": "site19",
         "sequence": "sequence_a",
         "frame": 31,
         "class_id": 0,
         "track_id": 7,
-        "speed_mps": 1.0,
+        "mean_speed_mps": 1.0,
+        "frame_speed_mps": 0.5,
         "obb": [32.0, 24.0, 12.0, 6.0, 0.1],
     }
     for model, root in roots.items():
@@ -1692,6 +1969,37 @@ def test_compare_rejects_equal_count_but_different_ground_truth_content(
         )
 
 
+@REQUIRES_TORCH
+def test_ground_truth_artifact_names_mean_and_frame_speed_with_schema_v2():
+    from moving_det.ml.evaluation import GroundTruth
+    from moving_det.models import OBB
+
+    row = _serialize_ground_truth(
+        GroundTruth(
+            frame=31,
+            obb=OBB(32.0, 24.0, 12.0, 6.0, 0.1),
+            class_id=0,
+            track_id=7,
+            site="site19",
+            sequence="sequence_a",
+            speed_mps=2.5,
+            frame_speed_mps=0.05,
+        )
+    )
+
+    assert row == {
+        "schema_version": 2,
+        "site": "site19",
+        "sequence": "sequence_a",
+        "frame": 31,
+        "class_id": 0,
+        "track_id": 7,
+        "mean_speed_mps": 2.5,
+        "frame_speed_mps": 0.05,
+        "obb": [32.0, 24.0, 12.0, 6.0, 0.1],
+    }
+
+
 def test_compare_writes_two_real_gate_results_and_primary_metrics(
     tmp_path,
     capsys,
@@ -1704,8 +2012,8 @@ def test_compare_writes_two_real_gate_results_and_primary_metrics(
         _write_evaluation_run(root, model)
         (root / "ground-truth.jsonl").write_bytes(
             b'{"class_id":0,"frame":31,"obb":[32.0,24.0,12.0,6.0,0.1],'
-            b'"schema_version":1,"sequence":"sequence_a","site":"site19",'
-            b'"speed_mps":1.0,"track_id":7}\n'
+            b'"frame_speed_mps":0.5,"mean_speed_mps":1.0,"schema_version":2,'
+            b'"sequence":"sequence_a","site":"site19","track_id":7}\n'
         )
     output = tmp_path / "comparison"
     args = build_parser().parse_args(
@@ -1739,7 +2047,7 @@ def test_compare_writes_two_real_gate_results_and_primary_metrics(
     assert set(metrics["gates"]) == {"mg_vtod", "lstfe"}
     assert metrics["gates"]["mg_vtod"]["passed"]
     assert metrics["ground_truth_sha256"] == (
-        "af3b4d3403b5ee337dca90328215e8caa5be884ef366aa4701912382e2b7fed3"
+        "3e1e6c9b6709ae6288ff96e61a17882b207febb5397785433f0bc482f8696233"
     )
     assert capsys.readouterr().out.strip() == str(
         (output / "metrics.json").resolve()
@@ -1838,13 +2146,14 @@ def test_visualize_saved_runs_renders_real_three_model_temporal_panel(
         "tile_xywh": [160, 90, 320, 180],
     }
     truth = {
-        "schema_version": 1,
+        "schema_version": 2,
         "site": "site19",
         "sequence": "sequence_a",
         "frame": 31,
         "class_id": 0,
         "track_id": 7,
-        "speed_mps": 1.0,
+        "mean_speed_mps": 1.0,
+        "frame_speed_mps": 0.5,
         "obb": [320.0, 180.0, 40.0, 20.0, 0.2],
     }
     for model, root in roots.items():

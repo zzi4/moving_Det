@@ -41,7 +41,7 @@ _EVALUATION_TABLES = (
 _EVALUATION_ARTIFACT_SCHEMA = {
     "metrics": 1,
     "predictions": 1,
-    "ground_truth": 1,
+    "ground_truth": 2,
 }
 _AUDIT_FIELDS = (
     "site",
@@ -72,7 +72,8 @@ class EvaluationRequest:
 
 @dataclass(frozen=True)
 class EvaluationArtifacts:
-    evaluated_frame_keys: tuple[Mapping[str, object], ...]
+    detection_frame_keys: tuple[Mapping[str, object], ...]
+    continuity_frame_keys: tuple[Mapping[str, object], ...]
     metrics: Mapping[str, object]
     predictions: tuple[Mapping[str, object], ...]
     ground_truth: tuple[Mapping[str, object], ...]
@@ -867,6 +868,7 @@ def _loader_task11_metrics(
                             site=site,
                             sequence=sequence,
                             speed_mps=0.0,
+                            frame_speed_mps=0.0,
                         )
                     )
                 frame_keys.add(FrameKey(site, sequence, frame))
@@ -891,7 +893,8 @@ def _loader_task11_metrics(
             tuple(ground_truth),
             {
                 "evaluation_split": "validation",
-                "evaluated_frame_keys": evaluated_frames,
+                "detection_frame_keys": evaluated_frames,
+                "continuity_frame_keys": (),
                 "max_false_detections_per_frame": float(
                     getattr(cfg, "max_false_detections_per_frame")
                 ),
@@ -1185,7 +1188,7 @@ def _normalize_frame_keys(
     values: object,
 ) -> tuple[dict[str, object], ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-        raise WorkflowError("evaluated_frame_keys must be a sequence")
+        raise WorkflowError("frame keys must be a sequence")
     normalized = []
     identities = set()
     for value in values:
@@ -1194,7 +1197,7 @@ def _normalize_frame_keys(
             "sequence",
             "frame",
         }:
-            raise WorkflowError("evaluated frame key schema is invalid")
+            raise WorkflowError("frame key schema is invalid")
         row = {
             "site": value["site"],
             "sequence": value["sequence"],
@@ -1209,10 +1212,10 @@ def _normalize_frame_keys(
             or not isinstance(row["frame"], int)
             or row["frame"] <= 0
         ):
-            raise WorkflowError("evaluated frame key values are invalid")
+            raise WorkflowError("frame key values are invalid")
         identity = (row["site"], row["sequence"], row["frame"])
         if identity in identities:
-            raise WorkflowError("evaluated frame keys must be unique")
+            raise WorkflowError("frame keys must be unique")
         identities.add(identity)
         normalized.append(row)
     return tuple(
@@ -1343,7 +1346,16 @@ def _validate_evaluation_artifacts(
 ) -> EvaluationArtifacts:
     if not isinstance(value, EvaluationArtifacts):
         raise WorkflowError("evaluation engine returned an invalid artifact bundle")
-    frames = _normalize_frame_keys(value.evaluated_frame_keys)
+    detection_frames = _normalize_frame_keys(value.detection_frame_keys)
+    continuity_frames = _normalize_frame_keys(value.continuity_frame_keys)
+    if not detection_frames:
+        raise WorkflowError("detection frame universe must be non-empty")
+    if request.split == "validation" and continuity_frames:
+        raise WorkflowError(
+            "validation continuity frame universe must be empty"
+        )
+    if request.split == "test" and not continuity_frames:
+        raise WorkflowError("test continuity frame universe must be non-empty")
     if not isinstance(value.metrics, Mapping):
         raise WorkflowError("evaluation metrics must be a mapping")
     for section in _EVALUATION_TABLES:
@@ -1379,7 +1391,8 @@ def _validate_evaluation_artifacts(
             "temporal evaluation must record alignment cache SHA-256"
         )
     return EvaluationArtifacts(
-        evaluated_frame_keys=frames,
+        detection_frame_keys=detection_frames,
+        continuity_frame_keys=continuity_frames,
         metrics=MappingProxyType(dict(value.metrics)),
         predictions=tuple(dict(row) for row in predictions),
         ground_truth=tuple(dict(row) for row in ground_truth),
@@ -1488,7 +1501,8 @@ def run_evaluate(
             "manifest_sha256": request.manifest_sha256,
             "checkpoint_sha256": request.checkpoint_sha256,
             "class_schema": _CLASS_SCHEMA,
-            "evaluated_frame_keys": list(artifacts.evaluated_frame_keys),
+            "detection_frame_keys": list(artifacts.detection_frame_keys),
+            "continuity_frame_keys": list(artifacts.continuity_frame_keys),
             "audit": dict(artifacts.audit),
             "alignment_cache": (
                 str(request.alignment_cache.resolve(strict=False))
@@ -1582,6 +1596,27 @@ def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
         raise WorkflowError("evaluation class schema is unsupported")
     if run.get("artifact_schema") != _EVALUATION_ARTIFACT_SCHEMA:
         raise WorkflowError("evaluation artifact schema is unsupported")
+    normalized = {}
+    for field in ("detection_frame_keys", "continuity_frame_keys"):
+        rows = _normalize_frame_keys(run.get(field))
+        if run.get(field) != list(rows):
+            raise WorkflowError(
+                f"evaluation {field.replace('_', ' ')} must be ordered and unique"
+            )
+        normalized[field] = rows
+    split = run.get("evaluation_split")
+    if not normalized["detection_frame_keys"]:
+        raise WorkflowError("evaluation detection frame universe is empty")
+    if split == "validation":
+        if normalized["continuity_frame_keys"]:
+            raise WorkflowError(
+                "validation continuity frame universe must be empty"
+            )
+    elif split == "test":
+        if not normalized["continuity_frame_keys"]:
+            raise WorkflowError("test continuity frame universe is empty")
+    else:
+        raise WorkflowError("evaluation run split is unsupported")
 
 
 def _compatible_ground_truth_sha256(
@@ -1645,7 +1680,8 @@ def run_compare(
         "evaluation_split",
         "manifest_sha256",
         "class_schema",
-        "evaluated_frame_keys",
+        "detection_frame_keys",
+        "continuity_frame_keys",
     )
     baseline_run = records["baseline"][0]
     for model in _MODEL_NAMES[1:]:
@@ -1706,7 +1742,8 @@ def run_compare(
             "manifest_sha256": baseline_run["manifest_sha256"],
             "evaluation_split": "test",
             "class_schema": _CLASS_SCHEMA,
-            "evaluated_frame_keys": baseline_run["evaluated_frame_keys"],
+            "detection_frame_keys": baseline_run["detection_frame_keys"],
+            "continuity_frame_keys": baseline_run["continuity_frame_keys"],
             "ground_truth_sha256": ground_truth_sha256,
             "runs": {
                 model: {
@@ -2922,6 +2959,7 @@ def _evaluation_frame_records(
         tuple[str, str, int],
         set[tuple[str, str, int]],
     ] = {}
+    sources_by_frame: dict[tuple[str, str, int], set[str]] = {}
     for row in rows:
         site = row.get("site")
         sequence = row.get("sequence")
@@ -2937,6 +2975,16 @@ def _evaluation_frame_records(
         ):
             raise WorkflowError("evaluation manifest row identity is invalid")
         identity = (site, sequence, frame)
+        source = row.get("source")
+        allowed_sources = (
+            {"evaluation"}
+            if split == "validation"
+            else {"evaluation", "continuity"}
+        )
+        if not isinstance(source, str) or source not in allowed_sources:
+            raise WorkflowError(
+                f"{split} evaluation manifest source is invalid"
+            )
         raw_track_keys = row.get("track_keys")
         if not isinstance(raw_track_keys, list):
             raise WorkflowError("evaluation manifest track_keys are invalid")
@@ -2965,10 +3013,12 @@ def _evaluation_frame_records(
             "center_frame": frame,
         }
         track_keys_by_frame.setdefault(identity, set()).update(row_track_keys)
+        sources_by_frame.setdefault(identity, set()).add(source)
     return tuple(
         {
             **records[key],
             "track_keys": tuple(sorted(track_keys_by_frame[key])),
+            "sources": tuple(sorted(sources_by_frame[key])),
         }
         for key in sorted(records)
     )
@@ -3344,13 +3394,14 @@ def _serialize_ground_truth(value: object) -> dict[str, object]:
     truth = value
     obb = getattr(truth, "obb")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "site": getattr(truth, "site"),
         "sequence": getattr(truth, "sequence"),
         "frame": getattr(truth, "frame"),
         "class_id": getattr(truth, "class_id"),
         "track_id": getattr(truth, "track_id"),
-        "speed_mps": getattr(truth, "speed_mps"),
+        "mean_speed_mps": getattr(truth, "mean_speed_mps"),
+        "frame_speed_mps": getattr(truth, "instantaneous_speed_mps"),
         "obb": [
             obb.cx,
             obb.cy,
@@ -3567,7 +3618,8 @@ def _load_compatible_run_records(
             "evaluation_split",
             "manifest_sha256",
             "class_schema",
-            "evaluated_frame_keys",
+            "detection_frame_keys",
+            "continuity_frame_keys",
         ):
             if candidate.get(field) != baseline.get(field):
                 raise WorkflowError(f"saved-run {field} provenance is incompatible")
@@ -4073,7 +4125,8 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
     predictions = []
     truth = []
     diagnostics = []
-    frame_keys = []
+    detection_frame_keys = []
+    continuity_frame_keys = []
     for frame_index, record in enumerate(records):
         clip = _load_full_frame_clip(
             cfg,
@@ -4086,7 +4139,16 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
             str(record["sequence"]),
             int(record["center_frame"]),
         )
-        frame_keys.append(frame_key)
+        sources = record.get("sources")
+        if (
+            isinstance(sources, (str, bytes))
+            or not isinstance(sources, Sequence)
+        ):
+            raise WorkflowError("evaluation frame sources are malformed")
+        if "evaluation" in sources:
+            detection_frame_keys.append(frame_key)
+        if "continuity" in sources:
+            continuity_frame_keys.append(frame_key)
         inference_cfg = {
             "tile_size": getattr(cfg, "tile_size"),
             "tile_overlap": getattr(cfg, "tile_overlap"),
@@ -4123,6 +4185,12 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
                     "per-frame VRUD velocity is missing for eligible GT: "
                     f"{velocity_key}"
                 )
+            metadata = tracks.get(annotation.track_key)
+            if metadata is None:
+                raise WorkflowError(
+                    "eligible corrected GT has no TrackMeta: "
+                    f"{annotation.track_key}"
+                )
             truth.append(
                 _ground_truth_record(
                     frame=frame_key.frame,
@@ -4131,7 +4199,8 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
                     track_id=annotation.track_key.group_id,
                     site=frame_key.site,
                     sequence=frame_key.sequence,
-                    speed_mps=velocities[velocity_key],
+                    speed_mps=getattr(metadata, "mean_velocity"),
+                    frame_speed_mps=velocities[velocity_key],
                 )
             )
         if frame_index < 3:
@@ -4155,7 +4224,8 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         ),
         "seed": getattr(cfg, "seed"),
         "evaluation_split": request.split,
-        "evaluated_frame_keys": tuple(frame_keys),
+        "detection_frame_keys": tuple(detection_frame_keys),
+        "continuity_frame_keys": tuple(continuity_frame_keys),
         "model_name": request.model_name,
         "manifest_sha256": request.manifest_sha256,
         "checkpoint_sha256": request.checkpoint_sha256,
@@ -4201,13 +4271,21 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         truth,
     )
     return EvaluationArtifacts(
-        evaluated_frame_keys=tuple(
+        detection_frame_keys=tuple(
             {
                 "site": key.site,
                 "sequence": key.sequence,
                 "frame": key.frame,
             }
-            for key in frame_keys
+            for key in detection_frame_keys
+        ),
+        continuity_frame_keys=tuple(
+            {
+                "site": key.site,
+                "sequence": key.sequence,
+                "frame": key.frame,
+            }
+            for key in continuity_frame_keys
         ),
         metrics=metrics,
         predictions=prediction_rows,

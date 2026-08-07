@@ -90,6 +90,7 @@ class GroundTruth:
     site: str
     sequence: str
     speed_mps: float
+    frame_speed_mps: float | None = None
 
     def __post_init__(self) -> None:
         _strict_int(self.frame, "frame")
@@ -115,10 +116,27 @@ class GroundTruth:
         speed = _finite(self.speed_mps, "speed_mps")
         if speed < 0:
             raise ValueError("speed_mps must be non-negative")
+        if self.frame_speed_mps is not None:
+            frame_speed = _finite(
+                self.frame_speed_mps,
+                "frame_speed_mps",
+            )
+            if frame_speed < 0:
+                raise ValueError("frame_speed_mps must be non-negative")
 
     @property
     def frame_key(self) -> FrameKey:
         return FrameKey(self.site, self.sequence, self.frame)
+
+    @property
+    def mean_speed_mps(self) -> float:
+        return self.speed_mps
+
+    @property
+    def instantaneous_speed_mps(self) -> float:
+        if self.frame_speed_mps is None:
+            return self.speed_mps
+        return self.frame_speed_mps
 
 
 @dataclass(frozen=True)
@@ -274,9 +292,11 @@ def _serialized_frame_key(value: object) -> FrameKey:
 
 @dataclass(frozen=True)
 class _EvaluationScope:
-    prediction_rows: tuple[Detection, ...]
+    prediction_rows_full: tuple[Detection, ...]
+    prediction_rows_fixed: tuple[Detection, ...]
     truth_rows: tuple[GroundTruth, ...]
-    frame_keys: tuple[FrameKey, ...]
+    detection_frame_keys: tuple[FrameKey, ...]
+    continuity_frame_keys: tuple[FrameKey, ...]
     split: str
     threshold_evidence: ThresholdEvidence | None
 
@@ -289,19 +309,26 @@ def _evaluation_scope(
     allow_test: bool,
 ) -> _EvaluationScope:
     prediction_rows, truth_rows = _validate_records(predictions, ground_truth)
-    raw_frame_keys = _cfg_required(cfg, "evaluated_frame_keys")
-    if (
-        isinstance(raw_frame_keys, (str, bytes))
-        or not isinstance(raw_frame_keys, Sequence)
-    ):
-        raise ValueError("evaluated_frame_keys must be a sequence")
-    frame_keys = tuple(
-        _serialized_frame_key(value)
-        for value in raw_frame_keys
+    universes: dict[str, tuple[FrameKey, ...]] = {}
+    for field in ("detection_frame_keys", "continuity_frame_keys"):
+        raw_frame_keys = _cfg_required(cfg, field)
+        if (
+            isinstance(raw_frame_keys, (str, bytes))
+            or not isinstance(raw_frame_keys, Sequence)
+        ):
+            raise ValueError(f"{field} must be a sequence")
+        frame_keys = tuple(
+            _serialized_frame_key(value)
+            for value in raw_frame_keys
+        )
+        if len(frame_keys) != len(set(frame_keys)):
+            raise ValueError(f"{field} must contain unique frames")
+        universes[field] = frame_keys
+    detection_frame_keys = universes["detection_frame_keys"]
+    continuity_frame_keys = universes["continuity_frame_keys"]
+    frame_universe = frozenset(
+        (*detection_frame_keys, *continuity_frame_keys)
     )
-    if len(frame_keys) != len(set(frame_keys)):
-        raise ValueError("evaluated frame keys must be unique")
-    frame_universe = frozenset(frame_keys)
     outside = {
         item.frame_key
         for item in (*prediction_rows, *truth_rows)
@@ -328,15 +355,19 @@ def _evaluation_scope(
             checkpoint_sha256=_cfg_required(cfg, "checkpoint_sha256"),
             evaluation_split="test",
         )
-        prediction_rows = tuple(
+        fixed_prediction_rows = tuple(
             item
             for item in prediction_rows
             if item.confidence >= evidence.threshold
         )
+    else:
+        fixed_prediction_rows = prediction_rows
     return _EvaluationScope(
-        prediction_rows=prediction_rows,
+        prediction_rows_full=prediction_rows,
+        prediction_rows_fixed=fixed_prediction_rows,
         truth_rows=truth_rows,
-        frame_keys=frame_keys,
+        detection_frame_keys=detection_frame_keys,
+        continuity_frame_keys=continuity_frame_keys,
         split=split,
         threshold_evidence=evidence,
     )
@@ -452,12 +483,18 @@ def _recall_row(
     count = len(indices)
     matched_025 = sum(index in matched_gt_025 for index in indices)
     matched_050 = sum(index in matched_gt_050 for index in indices)
+    recall_025 = matched_025 / count if count else 0.0
+    recall_050 = matched_050 / count if count else 0.0
     return {
         "gt_count": count,
         "matched_count_riou_025": matched_025,
+        "matched_count_riou_025_fixed": matched_025,
         "matched_count_riou_050": matched_050,
-        "recall_riou_025": matched_025 / count if count else 0.0,
-        "recall_riou_050": matched_050 / count if count else 0.0,
+        "matched_count_riou_050_fixed": matched_050,
+        "recall_riou_025": recall_025,
+        "recall_riou_025_fixed": recall_025,
+        "recall_riou_050": recall_050,
+        "recall_riou_050_fixed": recall_050,
     }
 
 
@@ -502,7 +539,7 @@ def _stopped_indices(
         for row in ordered:
             if previous_frame is not None and row[1].frame != previous_frame + 1:
                 mask = stopped_interval_mask(
-                    [item[1].speed_mps for item in run],
+                    [item[1].instantaneous_speed_mps for item in run],
                     _STOPPED_THRESHOLD_MPS,
                     _STOPPED_MIN_FRAMES,
                 )
@@ -515,7 +552,7 @@ def _stopped_indices(
             run.append(row)
             previous_frame = row[1].frame
         mask = stopped_interval_mask(
-            [item[1].speed_mps for item in run],
+            [item[1].instantaneous_speed_mps for item in run],
             _STOPPED_THRESHOLD_MPS,
             _STOPPED_MIN_FRAMES,
         )
@@ -598,15 +635,18 @@ def evaluate_temporal_obb(
     ground_truth: Sequence[GroundTruth],
     cfg: object,
 ) -> dict[str, Any]:
-    """Evaluate a frozen frame universe using confidence-ordered matching.
+    """Evaluate distinct frozen detection and continuity frame universes.
 
-    AP uses COCO's 101 recall points and is macro-averaged only across classes
-    containing ground truth. Recall is pooled over ground-truth states.
-    Absent classes are retained in ``per_class`` with ``ap50=None``. Empty
-    inputs produce finite zero aggregate metrics.
+    AP uses every detection-universe prediction in confidence order with
+    COCO's 101 recall points and is macro-averaged only across classes
+    containing ground truth. Fixed recall and false-detection metrics use the
+    detection universe at the frozen validation threshold on test.
+    Per-track, stopped, and jitter metrics use the continuity universe at that
+    same frozen threshold. Absent classes are retained in ``per_class`` with
+    ``ap50=None``. Empty inputs produce finite zero aggregate metrics.
 
-    Test-split evaluation always loads and enforces validation threshold
-    evidence from ``cfg`` before any metric is computed.
+    Test evaluation always loads and enforces validation threshold evidence
+    from ``cfg`` before any fixed-threshold metric is computed.
     """
     scope = _evaluation_scope(
         predictions,
@@ -614,17 +654,47 @@ def evaluate_temporal_obb(
         cfg,
         allow_test=True,
     )
-    prediction_rows = scope.prediction_rows
-    truth_rows = scope.truth_rows
+    detection_frames = frozenset(scope.detection_frame_keys)
+    continuity_frames = frozenset(scope.continuity_frame_keys)
+    prediction_rows_full = tuple(
+        item
+        for item in scope.prediction_rows_full
+        if item.frame_key in detection_frames
+    )
+    prediction_rows = tuple(
+        item
+        for item in scope.prediction_rows_fixed
+        if item.frame_key in detection_frames
+    )
+    truth_rows = tuple(
+        item
+        for item in scope.truth_rows
+        if item.frame_key in detection_frames
+    )
+    continuity_predictions = tuple(
+        item
+        for item in scope.prediction_rows_fixed
+        if item.frame_key in continuity_frames
+    )
+    continuity_truth = tuple(
+        item
+        for item in scope.truth_rows
+        if item.frame_key in continuity_frames
+    )
     match_025 = _match(prediction_rows, truth_rows, 0.25)
     match_050 = _match(prediction_rows, truth_rows, 0.50)
+    continuity_match_025 = _match(
+        continuity_predictions,
+        continuity_truth,
+        0.25,
+    )
     gt_count = len(truth_rows)
     recall_025 = len(match_025.matched_gt) / gt_count if gt_count else 0.0
     recall_050 = len(match_050.matched_gt) / gt_count if gt_count else 0.0
 
     ap50_by_class = {
         class_id: _average_precision(
-            prediction_rows,
+            prediction_rows_full,
             truth_rows,
             0.50,
             class_id,
@@ -638,7 +708,7 @@ def evaluate_temporal_obb(
     for threshold in _COCO_THRESHOLDS:
         for class_id in range(_CLASS_COUNT):
             value = _average_precision(
-                prediction_rows,
+                prediction_rows_full,
                 truth_rows,
                 threshold,
                 class_id,
@@ -648,7 +718,7 @@ def evaluate_temporal_obb(
                 coco_by_class[class_id].append(value)
     map50_95 = float(np.mean(coco_values)) if coco_values else 0.0
 
-    frame_count = len(scope.frame_keys)
+    frame_count = len(scope.detection_frame_keys)
     false_positive_count = (
         len(prediction_rows)
         - sum(match_025.prediction_is_true_positive)
@@ -672,12 +742,18 @@ def evaluate_temporal_obb(
         row["prediction_count"] = sum(
             item.class_id == class_id for item in prediction_rows
         )
+        row["prediction_count_fixed"] = row["prediction_count"]
+        row["prediction_count_full_ranking"] = sum(
+            item.class_id == class_id for item in prediction_rows_full
+        )
         row["ap50"] = ap50_by_class[class_id]
+        row["ap50_full_ranking"] = ap50_by_class[class_id]
         row["ap50_95"] = (
             float(np.mean(coco_by_class[class_id]))
             if coco_by_class[class_id]
             else None
         )
+        row["ap50_95_full_ranking"] = row["ap50_95"]
         per_class[str(class_id)] = row
 
     size_indices: dict[str, list[int]] = {
@@ -688,26 +764,36 @@ def evaluate_temporal_obb(
     }
     speed_indices: dict[str, list[int]] = {"<1": [], "1-4": [], ">=4": []}
     site_indices: dict[str, list[int]] = defaultdict(list)
-    track_indices: dict[str, list[int]] = defaultdict(list)
     for index, truth in enumerate(truth_rows):
         size_indices[_size_bin(min(truth.obb.width, truth.obb.height))].append(index)
-        speed_indices[_speed_bin(truth.speed_mps)].append(index)
+        speed_indices[_speed_bin(truth.mean_speed_mps)].append(index)
         site_indices[truth.site].append(index)
-        track_indices[_track_key(truth)].append(index)
+    continuity_track_indices: dict[str, list[int]] = defaultdict(list)
+    for index, truth in enumerate(continuity_truth):
+        continuity_track_indices[_track_key(truth)].append(index)
 
-    stopped, stopped_by_track = _stopped_indices(truth_rows)
+    stopped, stopped_by_track = _stopped_indices(continuity_truth)
     per_track: dict[str, dict[str, float | int | None]] = {}
-    for key, indices in sorted(track_indices.items()):
-        ordered = sorted(indices, key=lambda index: truth_rows[index].frame)
-        matched = [index in match_025.matched_gt for index in ordered]
+    for key, indices in sorted(continuity_track_indices.items()):
+        ordered = sorted(
+            indices,
+            key=lambda index: continuity_truth[index].frame,
+        )
+        matched = [
+            index in continuity_match_025.matched_gt
+            for index in ordered
+        ]
         stopped_track = stopped_by_track[key]
         stopped_matches = sum(
-            index in match_025.matched_gt for index in stopped_track
+            index in continuity_match_025.matched_gt
+            for index in stopped_track
         )
         per_track[key] = {
             "gt_count": len(indices),
             "matched_count": sum(matched),
+            "matched_count_fixed": sum(matched),
             "coverage": sum(matched) / len(indices),
+            "coverage_fixed": sum(matched) / len(indices),
             "longest_miss": longest_consecutive_miss(matched),
             "stopped_gt_count": len(stopped_track),
             "stopped_recall": (
@@ -715,26 +801,45 @@ def evaluate_temporal_obb(
                 if stopped_track
                 else None
             ),
+            "stopped_recall_fixed": (
+                stopped_matches / len(stopped_track)
+                if stopped_track
+                else None
+            ),
         }
 
     jitter, per_track_jitter = _jitter_metrics(
-        prediction_rows,
-        truth_rows,
-        match_025,
+        continuity_predictions,
+        continuity_truth,
+        continuity_match_025,
     )
     for key, row in per_track_jitter.items():
         per_track[key]["jitter"] = row
     stopped_matches = sum(
-        index in match_025.matched_gt for index in stopped
+        index in continuity_match_025.matched_gt for index in stopped
     )
     return {
         "map50": map50,
+        "map50_full_ranking": map50,
         "map50_95": map50_95,
+        "map50_95_full_ranking": map50_95,
         "recall_riou_025": recall_025,
+        "recall_riou_025_fixed": recall_025,
         "recall_riou_050": recall_050,
+        "recall_riou_050_fixed": recall_050,
         "ground_truth_count": gt_count,
+        "continuity_ground_truth_count": len(continuity_truth),
         "prediction_count": len(prediction_rows),
+        "prediction_count_fixed": len(prediction_rows),
+        "prediction_count_full_ranking": len(prediction_rows_full),
         "evaluated_frame_count": frame_count,
+        "detection_frame_count": frame_count,
+        "continuity_frame_count": len(scope.continuity_frame_keys),
+        "inferred_frame_count": len(
+            frozenset(
+                (*scope.detection_frame_keys, *scope.continuity_frame_keys)
+            )
+        ),
         "evaluation_split": scope.split,
         "threshold_evidence": (
             asdict(scope.threshold_evidence)
@@ -742,11 +847,17 @@ def evaluate_temporal_obb(
             else None
         ),
         "false_positive_count_riou_025": false_positive_count,
+        "false_positive_count_riou_025_fixed": false_positive_count,
         "false_positive_count_riou_050": (
             len(prediction_rows)
             - sum(match_050.prediction_is_true_positive)
         ),
+        "false_positive_count_riou_050_fixed": (
+            len(prediction_rows)
+            - sum(match_050.prediction_is_true_positive)
+        ),
         "false_detections_per_frame": false_detections_per_frame,
+        "false_detections_per_frame_fixed": false_detections_per_frame,
         "per_class": per_class,
         "per_size": {
             name: _recall_row(
@@ -777,10 +888,29 @@ def evaluate_temporal_obb(
         "stopped_recall_riou_025": (
             stopped_matches / len(stopped) if stopped else 0.0
         ),
+        "stopped_recall_riou_025_fixed": (
+            stopped_matches / len(stopped) if stopped else 0.0
+        ),
         "jitter": jitter,
         "aggregation": {
             "ap": "101-point interpolated macro over GT-bearing classes",
-            "recall": "pooled over ground-truth states",
+            "ap_prediction_cutoff": "complete confidence ranking",
+            "fixed_metrics": (
+                "frozen validation confidence threshold on test; all "
+                "predictions on validation"
+            ),
+            "fixed_confidence_threshold": (
+                scope.threshold_evidence.threshold
+                if scope.threshold_evidence is not None
+                else 0.0
+            ),
+            "recall": (
+                "pooled over detection-universe ground-truth states at the "
+                "fixed cutoff"
+            ),
+            "continuity": (
+                "continuity-universe ground-truth states at the fixed cutoff"
+            ),
             "absent_class_ap": None,
             "empty_aggregate": 0.0,
         },
@@ -955,8 +1085,17 @@ def select_validation_threshold(
         cfg,
         allow_test=False,
     )
-    prediction_rows = scope.prediction_rows
-    truth_rows = scope.truth_rows
+    detection_frames = frozenset(scope.detection_frame_keys)
+    prediction_rows = tuple(
+        item
+        for item in scope.prediction_rows_full
+        if item.frame_key in detection_frames
+    )
+    truth_rows = tuple(
+        item
+        for item in scope.truth_rows
+        if item.frame_key in detection_frames
+    )
     thresholds = sorted(
         {item.confidence for item in prediction_rows},
         reverse=True,
@@ -975,7 +1114,7 @@ def select_validation_threshold(
         false_negative = len(truth_rows) - true_positive
         denominator = 2 * true_positive + false_positive + false_negative
         f1 = 2 * true_positive / denominator if denominator else 0.0
-        frame_count = len(scope.frame_keys)
+        frame_count = len(scope.detection_frame_keys)
         fp_per_frame = false_positive / frame_count if frame_count else 0.0
         if fp_per_frame <= fp_limit:
             candidates.append((f1, threshold, fp_per_frame))
