@@ -51,7 +51,13 @@ class CorrectedAnnotation:
     class_name: str | None
     track_key: TrackKey
     raw_json_label: str
-    reason: str | None = None
+    geometry_reason: str | None = None
+    metadata_reason: str | None = None
+
+    @property
+    def reason(self) -> str | None:
+        """Backward-compatible primary reason; audit the named fields."""
+        return self.geometry_reason or self.metadata_reason
 
 
 @dataclass(frozen=True)

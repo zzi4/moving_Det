@@ -279,20 +279,16 @@ def _shape_annotation(
         x < 0 or x >= width or y < 0 or y >= height
         for x, y in points
     )
-    reason = (
-        "edge_clipped"
-        if edge_clipped
-        else "unmatched_metadata"
-        if meta is None
-        else meta.reason
-    )
+    geometry_reason = "edge_clipped" if edge_clipped else None
+    metadata_reason = "unmatched_metadata" if meta is None else meta.reason
     return CorrectedAnnotation(
         obb=obb,
         class_id=class_id,
         class_name=class_name,
         track_key=track_key,
         raw_json_label=label,
-        reason=reason,
+        geometry_reason=geometry_reason,
+        metadata_reason=metadata_reason,
     )
 
 

@@ -152,6 +152,48 @@ def test_edge_crossing_rectangle_is_excluded_without_refit(vrud_fixture):
     assert frame.exclusions[0].obb == OBB(4.0, 16.0, 12.0, 8.0, 0.0)
 
 
+def test_edge_clipped_unmatched_track_preserves_both_audit_reasons(
+    vrud_fixture,
+):
+    payload = vrud_fixture.read_json()
+    payload["shapes"][0]["group_id"] = 999
+    payload["shapes"][0]["points"] = [
+        [-2.0, 12.0],
+        [10.0, 12.0],
+        [10.0, 20.0],
+        [-2.0, 20.0],
+    ]
+    vrud_fixture.write_json(payload)
+
+    exclusion = load_fixture_frame(vrud_fixture).exclusions[0]
+
+    assert exclusion.reason == "edge_clipped"
+    assert exclusion.geometry_reason == "edge_clipped"
+    assert exclusion.metadata_reason == "unmatched_metadata"
+
+
+def test_edge_clipped_ineligible_track_preserves_both_audit_reasons(
+    vrud_fixture,
+):
+    vrud_fixture.write_meta_rows(
+        [vrud_fixture.default_meta_row(meanVelocity=0.099)]
+    )
+    payload = vrud_fixture.read_json()
+    payload["shapes"][0]["points"] = [
+        [-2.0, 12.0],
+        [10.0, 12.0],
+        [10.0, 20.0],
+        [-2.0, 20.0],
+    ]
+    vrud_fixture.write_json(payload)
+
+    exclusion = load_fixture_frame(vrud_fixture).exclusions[0]
+
+    assert exclusion.reason == "edge_clipped"
+    assert exclusion.geometry_reason == "edge_clipped"
+    assert exclusion.metadata_reason == "below_mean_velocity"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
