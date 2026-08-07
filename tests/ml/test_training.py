@@ -809,3 +809,237 @@ def test_resume_restores_rng_and_stateful_loader_order_and_outcome(
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_cuda_resume_restores_nondefault_grad_scaler_and_uses_it(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first_scalers: list[torch.amp.GradScaler] = []
+
+    def first_scaler_factory(_device):
+        scaler = torch.amp.GradScaler(
+            "cuda",
+            init_scale=32.0,
+            growth_interval=1,
+        )
+        first_scalers.append(scaler)
+        return scaler
+
+    first_hooks = replace(
+        _tiny_hooks(TinyOBB(initial=0.01), map50_values=[0.1]),
+        device="cuda",
+        scaler_factory=first_scaler_factory,
+    )
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "first-cuda",
+        hooks=first_hooks,
+    )
+    first_payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert first_payload["scaler"]["scale"] == pytest.approx(64.0)
+    assert first_scalers[0].get_scale() == pytest.approx(64.0)
+
+    resumed_scalers: list[torch.amp.GradScaler] = []
+
+    def resumed_scaler_factory(_device):
+        scaler = torch.amp.GradScaler(
+            "cuda",
+            init_scale=4.0,
+            growth_interval=999,
+        )
+        resumed_scalers.append(scaler)
+        return scaler
+
+    resumed = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=2),
+        manifest,
+        tmp_path / "resumed-cuda",
+        resume_checkpoint=first.last_checkpoint,
+        hooks=replace(
+            _tiny_hooks(TinyOBB(initial=0.5), map50_values=[0.2]),
+            device="cuda",
+            scaler_factory=resumed_scaler_factory,
+        ),
+    )
+    resumed_payload = torch.load(
+        resumed.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    assert resumed_payload["scaler"]["scale"] == pytest.approx(128.0)
+    assert resumed_payload["scaler"]["growth_interval"] == 1
+    assert resumed_scalers[0].get_scale() == pytest.approx(128.0)
+
+
+def test_malformed_scaler_state_fails_before_overwriting_resume_outputs(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "first",
+        hooks=_tiny_hooks(TinyOBB(), map50_values=[0.1]),
+    )
+    payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    payload["scaler"] = "not-a-scaler-state"
+    torch.save(payload, first.last_checkpoint)
+
+    output = tmp_path / "resume-output"
+    output.mkdir()
+    history_sentinel = b"existing-history"
+    best_sentinel = b"existing-best"
+    (output / "history.json").write_bytes(history_sentinel)
+    (output / "best.pt").write_bytes(best_sentinel)
+
+    with pytest.raises(ValueError, match="scaler"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(TinyOBB(), map50_values=[0.2]),
+        )
+
+    assert (output / "history.json").read_bytes() == history_sentinel
+    assert (output / "best.pt").read_bytes() == best_sentinel
+    run = json.loads((output / "run.json").read_text())
+    assert run["status"] == "failed"
+    assert "scaler" in run["error"]
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        "checkpoint_epoch_999",
+        "string_epoch",
+        "boolean_steps",
+        "decreasing_steps",
+        "nan_loss",
+        "missing_schema_key",
+        "metric_out_of_range",
+        "checkpoint_step_mismatch",
+    ],
+)
+def test_tampered_resume_history_is_rejected_before_output_writes(
+    tmp_path,
+    temporal_config,
+    probe,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=2),
+        manifest,
+        tmp_path / f"first-{probe}",
+        hooks=_tiny_hooks(
+            TinyOBB(initial=0.01),
+            map50_values=[0.1, 0.2],
+        ),
+    )
+    payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    if probe == "checkpoint_epoch_999":
+        payload["epoch"] = 999
+    elif probe == "string_epoch":
+        payload["history"][0]["epoch"] = "0"
+    elif probe == "boolean_steps":
+        payload["history"][0]["optimizer_steps"] = True
+    elif probe == "decreasing_steps":
+        payload["history"][1]["optimizer_steps"] = 0
+    elif probe == "nan_loss":
+        payload["history"][1]["train_loss"] = float("nan")
+    elif probe == "missing_schema_key":
+        payload["history"][1].pop("learning_rate")
+    elif probe == "metric_out_of_range":
+        payload["history"][1]["recall_at_riou_025"] = 1.5
+    else:
+        payload["optimizer_steps"] += 1
+    torch.save(payload, first.last_checkpoint)
+
+    output = tmp_path / f"resume-{probe}"
+    output.mkdir()
+    history_sentinel = b"do-not-overwrite-history"
+    best_sentinel = b"do-not-overwrite-best"
+    (output / "history.json").write_bytes(history_sentinel)
+    (output / "best.pt").write_bytes(best_sentinel)
+
+    with pytest.raises(ValueError, match="history|epoch|optimizer"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=3),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(TinyOBB(), map50_values=[0.3]),
+        )
+
+    assert (output / "history.json").read_bytes() == history_sentinel
+    assert (output / "best.pt").read_bytes() == best_sentinel
+    run = json.loads((output / "run.json").read_text())
+    assert run["status"] == "failed"
+
+
+def test_tampered_prior_best_history_is_rejected_before_copy(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=2),
+        manifest,
+        tmp_path / "first-best-history",
+        hooks=_tiny_hooks(
+            TinyOBB(initial=0.01),
+            map50_values=[0.2, 0.1],
+        ),
+    )
+    best_payload = torch.load(
+        first.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    best_payload["history"][0]["epoch"] = "0"
+    torch.save(best_payload, first.best_checkpoint)
+
+    output = tmp_path / "resume-best-history"
+    output.mkdir()
+    history_sentinel = b"existing-history"
+    best_sentinel = b"existing-best"
+    (output / "history.json").write_bytes(history_sentinel)
+    (output / "best.pt").write_bytes(best_sentinel)
+
+    with pytest.raises(ValueError, match="history|epoch"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=3),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(TinyOBB(), map50_values=[0.3]),
+        )
+
+    assert (output / "history.json").read_bytes() == history_sentinel
+    assert (output / "best.pt").read_bytes() == best_sentinel

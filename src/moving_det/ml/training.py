@@ -40,6 +40,25 @@ _MANIFEST_ARTIFACTS = (
     "class-audit.json",
     "manifest.json",
 )
+_HISTORY_KEYS = frozenset(
+    {
+        "epoch",
+        "optimizer_steps",
+        "train_loss",
+        "map50",
+        "recall_at_riou_025",
+        "learning_rate",
+    }
+)
+_SCALER_STATE_KEYS = frozenset(
+    {
+        "scale",
+        "growth_factor",
+        "backoff_factor",
+        "growth_interval",
+        "_growth_tracker",
+    }
+)
 
 ModelFactory = Callable[[str, Path | str | None, TemporalOBBConfig], nn.Module]
 LoaderFactory = Callable[
@@ -55,6 +74,7 @@ Validator = Callable[
     Mapping[str, float],
 ]
 StepObserver = Callable[[Optimizer, int], None]
+ScalerFactory = Callable[[torch.device], torch.amp.GradScaler]
 
 
 @dataclass(frozen=True)
@@ -66,6 +86,7 @@ class TrainingHooks:
     gate_loader_factory: GateLoaderFactory | None = None
     validator: Validator | None = None
     on_optimizer_step: StepObserver | None = None
+    scaler_factory: ScalerFactory | None = None
     device: str | torch.device | None = None
 
 
@@ -92,6 +113,68 @@ def build_optimizer(
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
+
+
+def _default_scaler_factory(
+    device: torch.device,
+) -> torch.amp.GradScaler:
+    return torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+
+
+def _is_finite_number(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _validate_scaler_state(
+    raw_state: Any,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    if not isinstance(raw_state, Mapping):
+        raise ValueError("resume checkpoint scaler state must be a mapping")
+    state = dict(raw_state)
+    if not state:
+        if enabled:
+            raise ValueError(
+                "resume checkpoint scaler state is empty for CUDA AMP"
+            )
+        return state
+    if set(state) != _SCALER_STATE_KEYS:
+        raise ValueError(
+            "resume checkpoint scaler state has invalid fields"
+        )
+    if (
+        not _is_finite_number(state["scale"])
+        or state["scale"] <= 0
+        or not _is_finite_number(state["growth_factor"])
+        or state["growth_factor"] <= 1
+        or not _is_finite_number(state["backoff_factor"])
+        or not 0 < state["backoff_factor"] < 1
+        or type(state["growth_interval"]) is not int
+        or state["growth_interval"] <= 0
+        or type(state["_growth_tracker"]) is not int
+        or state["_growth_tracker"] < 0
+    ):
+        raise ValueError(
+            "resume checkpoint scaler state contains invalid values"
+        )
+    return state
+
+
+def _restore_scaler_state(
+    scaler: torch.amp.GradScaler,
+    raw_state: Any,
+) -> None:
+    state = _validate_scaler_state(
+        raw_state,
+        enabled=scaler.is_enabled(),
+    )
+    try:
+        scaler.load_state_dict(state)
+    except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "resume checkpoint scaler state is incompatible"
+        ) from exc
 
 
 def manifest_fingerprint(manifest_dir: Path) -> str:
@@ -512,6 +595,99 @@ def _metrics(
     return map50, recall
 
 
+def _validate_resume_history(
+    raw_history: Any,
+    *,
+    checkpoint_epoch: Any,
+    checkpoint_optimizer_steps: Any,
+) -> list[dict[str, Any]]:
+    if (
+        type(checkpoint_epoch) is not int
+        or checkpoint_epoch < 0
+    ):
+        raise ValueError(
+            "resume checkpoint epoch must be a non-negative integer"
+        )
+    if (
+        type(checkpoint_optimizer_steps) is not int
+        or checkpoint_optimizer_steps < 0
+    ):
+        raise ValueError(
+            "resume checkpoint optimizer_steps must be a non-negative integer"
+        )
+    if not isinstance(raw_history, list):
+        raise ValueError("resume checkpoint history must be a list")
+    if len(raw_history) != checkpoint_epoch + 1:
+        raise ValueError(
+            "resume checkpoint history epochs are not contiguous with "
+            "the checkpoint epoch"
+        )
+
+    history: list[dict[str, Any]] = []
+    previous_steps = -1
+    for expected_epoch, raw_record in enumerate(raw_history):
+        if not isinstance(raw_record, Mapping):
+            raise ValueError(
+                f"resume history epoch {expected_epoch} must be a mapping"
+            )
+        record = dict(raw_record)
+        if set(record) != _HISTORY_KEYS:
+            raise ValueError(
+                f"resume history epoch {expected_epoch} has invalid fields"
+            )
+        if (
+            type(record["epoch"]) is not int
+            or record["epoch"] != expected_epoch
+        ):
+            raise ValueError(
+                "resume history epochs must be exact contiguous integers "
+                "starting at zero"
+            )
+        steps = record["optimizer_steps"]
+        if (
+            type(steps) is not int
+            or steps < 0
+            or steps < previous_steps
+        ):
+            raise ValueError(
+                "resume history optimizer_steps must be non-negative and "
+                "nondecreasing"
+            )
+        previous_steps = steps
+
+        for name in (
+            "train_loss",
+            "map50",
+            "recall_at_riou_025",
+            "learning_rate",
+        ):
+            if not _is_finite_number(record[name]):
+                raise ValueError(
+                    f"resume history {name} must be a finite number"
+                )
+        if record["train_loss"] < 0:
+            raise ValueError(
+                "resume history train_loss must be non-negative"
+            )
+        if not 0 <= record["map50"] <= 1:
+            raise ValueError("resume history map50 must be in [0, 1]")
+        if not 0 <= record["recall_at_riou_025"] <= 1:
+            raise ValueError(
+                "resume history recall_at_riou_025 must be in [0, 1]"
+            )
+        if record["learning_rate"] < 0:
+            raise ValueError(
+                "resume history learning_rate must be non-negative"
+            )
+        history.append(record)
+
+    if history[-1]["optimizer_steps"] != checkpoint_optimizer_steps:
+        raise ValueError(
+            "resume history optimizer_steps does not match the checkpoint"
+        )
+    return history
+
+
 def _training_record_count(manifest_dir: Path) -> int:
     path = manifest_dir / "train.jsonl"
     try:
@@ -814,6 +990,9 @@ def train_model(
             selected_hooks.gate_loader_factory
             or _default_gate_loader_factory
         )
+        scaler_factory = (
+            selected_hooks.scaler_factory or _default_scaler_factory
+        )
         validator = selected_hooks.validator or _default_validator
         internal_load = (
             Path(resume_checkpoint)
@@ -861,22 +1040,28 @@ def train_model(
                 manifest_root,
             )
             try:
-                start_epoch = int(resume_payload["epoch"]) + 1
-                completed_epochs = start_epoch
-                optimizer_steps = int(
-                    resume_payload.get("optimizer_steps", 0)
+                checkpoint_epoch = resume_payload["epoch"]
+                checkpoint_optimizer_steps = resume_payload[
+                    "optimizer_steps"
+                ]
+                history = _validate_resume_history(
+                    resume_payload["history"],
+                    checkpoint_epoch=checkpoint_epoch,
+                    checkpoint_optimizer_steps=(
+                        checkpoint_optimizer_steps
+                    ),
                 )
+                start_epoch = checkpoint_epoch + 1
+                completed_epochs = start_epoch
+                optimizer_steps = checkpoint_optimizer_steps
                 best_map50 = float(resume_payload["best_map50"])
                 epochs_without_improvement = int(
                     resume_payload.get("epochs_without_improvement", 0)
                 )
-                raw_history = resume_payload["history"]
-                if not isinstance(raw_history, list):
-                    raise TypeError("history is not a list")
-                history = [dict(record) for record in raw_history]
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(
-                    "resume checkpoint lacks compatible training state"
+                    "resume checkpoint has invalid history, epoch, or "
+                    "optimizer state"
                 ) from exc
             load_provenance = {
                 "kind": "resume",
@@ -920,10 +1105,19 @@ def train_model(
                 total_epochs=cfg.pilot_epochs,
             ),
         )
+        scaler = scaler_factory(device)
+        if not isinstance(scaler, torch.amp.GradScaler):
+            raise ValueError(
+                "scaler_factory must return torch.amp.GradScaler"
+            )
         if resume_payload is not None:
             try:
                 optimizer.load_state_dict(resume_payload["optimizer"])
                 scheduler.load_state_dict(resume_payload["scheduler"])
+                _restore_scaler_state(
+                    scaler,
+                    resume_payload["scaler"],
+                )
                 _restore_reproducibility_state(
                     resume_payload["reproducibility_state"],
                     train_loader,
@@ -931,7 +1125,7 @@ def train_model(
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(
                     "resume checkpoint has invalid optimizer, scheduler, "
-                    "or reproducibility state"
+                    "scaler, or reproducibility state"
                 ) from exc
 
             source_best_path = Path(resume_checkpoint).parent / "best.pt"
@@ -941,6 +1135,17 @@ def train_model(
                 manifest_root,
             )
             _validate_model_state(model, source_best["model"])
+            _validate_scaler_state(
+                source_best.get("scaler"),
+                enabled=use_amp,
+            )
+            _validate_resume_history(
+                source_best.get("history"),
+                checkpoint_epoch=source_best.get("epoch"),
+                checkpoint_optimizer_steps=source_best.get(
+                    "optimizer_steps"
+                ),
+            )
             if float(source_best.get("best_map50", -math.inf)) != best_map50:
                 raise ValueError(
                     "resume best checkpoint does not match resume state"
@@ -952,7 +1157,6 @@ def train_model(
         optimizer.zero_grad(set_to_none=True)
         if use_amp:
             torch.cuda.reset_peak_memory_stats(device)
-        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
         if gate_loader is not None:
             initial_evidence_loss = _evaluate_full_loss(
@@ -1099,6 +1303,7 @@ def train_model(
                 "best_map50": best_map50,
                 "config": asdict(cfg),
                 "history": history,
+                "scaler": scaler.state_dict(),
                 "reproducibility_state": (
                     _capture_reproducibility_state(train_loader)
                 ),
