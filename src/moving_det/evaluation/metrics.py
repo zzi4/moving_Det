@@ -22,6 +22,58 @@ _REQUIRED_IOU_THRESHOLDS = (0.25, 0.5)
 _MASK_PERCENTILES = (0, 25, 50, 75, 100)
 
 
+def longest_consecutive_miss(matched: Sequence[bool]) -> int:
+    """Return the longest contiguous False run in temporal order."""
+    longest = 0
+    current = 0
+    for value in matched:
+        if not isinstance(value, (bool, np.bool_)):
+            raise ValueError("matched values must be booleans")
+        if bool(value):
+            current = 0
+        else:
+            current += 1
+            longest = max(longest, current)
+    return longest
+
+
+def stopped_interval_mask(
+    velocities: Sequence[float],
+    threshold: float,
+    min_frames: int,
+) -> list[bool]:
+    """Mark complete low-speed runs lasting at least ``min_frames``."""
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("stopped threshold must be finite and non-negative")
+    if isinstance(min_frames, bool) or not isinstance(min_frames, int) or min_frames <= 0:
+        raise ValueError("minimum stopped frames must be a positive integer")
+    values = []
+    for velocity in velocities:
+        if isinstance(velocity, bool):
+            raise ValueError("velocities must be finite and non-negative")
+        try:
+            value = float(velocity)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("velocities must be finite and non-negative") from exc
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("velocities must be finite and non-negative")
+        values.append(value)
+
+    result = [False] * len(values)
+    run_start = 0
+    while run_start < len(values):
+        if values[run_start] >= threshold:
+            run_start += 1
+            continue
+        run_end = run_start + 1
+        while run_end < len(values) and values[run_end] < threshold:
+            run_end += 1
+        if run_end - run_start >= min_frames:
+            result[run_start:run_end] = [True] * (run_end - run_start)
+        run_start = run_end
+    return result
+
+
 @dataclass(frozen=True)
 class CalibrationCandidate:
     parameter_name: str

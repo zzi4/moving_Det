@@ -1,0 +1,312 @@
+from __future__ import annotations
+
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from moving_det.models import OBB
+from moving_det.ml.inference import (
+    Detection,
+    infer_full_frame,
+    merge_tile_detections,
+)
+from moving_det.vrud.tiling import Tile
+
+
+def _cfg(**changes):
+    values = {
+        "tile_size": 1024,
+        "tile_overlap": 256,
+        "nms_iou": 0.5,
+        "confidence_threshold": 0.25,
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def _detection(
+    *,
+    cx=900.0,
+    cy=700.0,
+    width=40.0,
+    height=20.0,
+    theta=0.0,
+    confidence=0.9,
+    class_id=0,
+    tile_x=0,
+    tile_y=0,
+):
+    return Detection(
+        frame=12,
+        obb=OBB(cx, cy, width, height, theta),
+        class_id=class_id,
+        confidence=confidence,
+        tile=Tile(tile_x, tile_y, 1024, 1024),
+    )
+
+
+def _raw_prediction(
+    batch: int,
+    *,
+    local_x: float = 100.0,
+    local_y: float = 80.0,
+    class_id: int = 0,
+    confidence: float = 0.9,
+    theta: float = 0.2,
+) -> torch.Tensor:
+    # Pinned Ultralytics OBB output is BCN: xywh, nc class scores, angle.
+    output = torch.zeros(batch, 9, 1)
+    output[:, 0, 0] = local_x
+    output[:, 1, 0] = local_y
+    output[:, 2, 0] = 40.0
+    output[:, 3, 0] = 20.0
+    output[:, 4 + class_id, 0] = confidence
+    output[:, 8, 0] = theta
+    return output
+
+
+class RecordingModel(nn.Module):
+    def __init__(self, temporal: int, output_factory=None):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
+        self.temporal = temporal
+        self.output_factory = output_factory or _raw_prediction
+        self.seen = None
+        self.batch_sizes = []
+
+    def forward(self, batch):
+        self.seen = batch
+        self.batch_sizes.append(batch["img"].shape[0])
+        return self.output_factory(batch["img"].shape[0])
+
+
+@pytest.mark.parametrize(
+    ("temporal", "zero_index", "offsets"),
+    [
+        (1, 0, (0,)),
+        (5, 2, (-4, -2, 0, 2, 4)),
+        (7, 3, (-30, -15, -2, 0, 2, 15, 30)),
+    ],
+)
+def test_full_frame_inference_builds_all_temporal_model_contracts(
+    temporal,
+    zero_index,
+    offsets,
+):
+    model = RecordingModel(temporal)
+    frames = torch.zeros(1, 1, 1, 1).expand(
+        temporal,
+        3,
+        2160,
+        3840,
+    )
+    transforms = torch.eye(2, 3).expand(temporal, -1, -1).clone()
+    transforms[:, 0, 2] = 3.0
+    clip = {
+        "frames": frames,
+        "valid": torch.ones(temporal, dtype=torch.bool),
+        "transforms": transforms,
+        "zero_index": zero_index,
+        "frame": 91,
+        "metadata": {"offsets": offsets, "sequence": "s"},
+    }
+
+    detections = infer_full_frame(model, clip, _cfg())
+
+    assert model.batch_sizes == [1] * 15
+    assert model.seen["frames"].shape == (1, temporal, 3, 1024, 1024)
+    assert model.seen["valid"].shape == (1, temporal)
+    assert model.seen["transforms"].shape == (1, temporal, 2, 3)
+    assert model.seen["img"].shape == (1, 3, 1024, 1024)
+    assert len(model.seen["metadata"]) == 1
+    assert model.seen["metadata"][0]["tile_xywh"] == (
+        2816,
+        1136,
+        1024,
+        1024,
+    )
+    assert model.seen["metadata"][0]["offsets"] == offsets
+    assert len(detections) == 15
+    edge = next(item for item in detections if item.tile.x == 2816 and item.tile.y == 1136)
+    assert (
+        edge.obb.cx,
+        edge.obb.cy,
+        edge.obb.width,
+        edge.obb.height,
+        edge.obb.theta,
+    ) == pytest.approx((2916.0, 1216.0, 40.0, 20.0, 0.2))
+    assert edge.frame == 91
+
+
+def test_default_inference_batches_one_tile_at_a_time_to_bound_memory():
+    model = RecordingModel(1)
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1792),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {"offsets": (0,)},
+    }
+
+    detections = infer_full_frame(model, clip, _cfg())
+
+    assert model.batch_sizes == [1, 1]
+    assert len(detections) == 2
+
+
+def test_full_frame_inference_localizes_affine_to_each_crop():
+    model = RecordingModel(1)
+    frames = torch.rand(1, 3, 1024, 1792)
+    transforms = torch.tensor([[[1.0, 0.1, 3.0], [0.0, 1.0, 4.0]]])
+
+    infer_full_frame(
+        model,
+        {
+            "frames": frames,
+            "valid": torch.tensor([True]),
+            "transforms": transforms,
+            "zero_index": 0,
+            "frame": 1,
+            "metadata": {"offsets": (0,)},
+        },
+        _cfg(inference_batch_size=2),
+    )
+
+    torch.testing.assert_close(
+        model.seen["transforms"][1, 0],
+        torch.tensor([[1.0, 0.1, 3.0], [0.0, 1.0, 4.0]]),
+    )
+
+
+def test_overlap_predictions_merge_with_class_aware_rotated_nms():
+    predictions = (
+        _detection(confidence=0.9, tile_x=0),
+        _detection(cx=901, confidence=0.8, tile_x=768),
+        _detection(cx=901, confidence=0.7, tile_x=768, class_id=1),
+    )
+
+    merged = merge_tile_detections(predictions, iou_threshold=0.5)
+
+    assert [(item.class_id, item.confidence) for item in merged] == [
+        (0, 0.9),
+        (1, 0.7),
+    ]
+    assert merged[0].tile.x == 0
+
+
+def test_rotated_nms_tie_is_deterministic_and_preserves_source_tile():
+    first = _detection(theta=0.5, confidence=0.8, tile_x=768)
+    second = replace(first, tile=Tile(0, 0, 1024, 1024))
+
+    assert merge_tile_detections((first, second), 0.5) == (second,)
+    assert merge_tile_detections((second, first), 0.5) == (second,)
+
+
+def test_inference_empty_predictions_and_model_state_are_preserved():
+    model = RecordingModel(
+        1,
+        output_factory=lambda batch: torch.zeros(batch, 9, 0),
+    ).train()
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1024),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {"offsets": (0,)},
+    }
+
+    assert infer_full_frame(model, clip, _cfg()) == ()
+    assert model.training
+
+
+def test_pinned_within_tile_nms_suppresses_same_class_not_other_classes():
+    def overlapping(batch):
+        output = torch.zeros(batch, 9, 3)
+        output[:, :4, :] = torch.tensor(
+            [[100.0, 101.0, 100.0], [80.0, 80.0, 80.0],
+             [40.0, 40.0, 40.0], [20.0, 20.0, 20.0]]
+        )
+        output[:, 4, 0] = 0.9
+        output[:, 4, 1] = 0.8
+        output[:, 5, 2] = 0.7
+        output[:, 8, :] = 0.3
+        return output
+
+    model = RecordingModel(1, output_factory=overlapping)
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1024),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {"offsets": (0,)},
+    }
+
+    detections = infer_full_frame(model, clip, _cfg())
+
+    assert [item.class_id for item in detections] == [0, 1]
+    assert [item.confidence for item in detections] == pytest.approx([0.9, 0.7])
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("frame", True),
+        ("class_id", 4),
+        ("confidence", float("nan")),
+        ("confidence", 1.1),
+        ("obb", OBB(1, 1, 0, 2, 0)),
+        ("tile", None),
+    ],
+)
+def test_detection_rejects_malformed_values(field, value):
+    values = {
+        "frame": 1,
+        "obb": OBB(1, 1, 2, 1, 0),
+        "class_id": 0,
+        "confidence": 0.5,
+        "tile": Tile(0, 0, 8, 8),
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError):
+        Detection(**values)
+
+
+def test_inference_rejects_nonfinite_pinned_output_and_restores_state():
+    model = RecordingModel(
+        1,
+        output_factory=lambda batch: _raw_prediction(batch).fill_(float("nan")),
+    ).train()
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1024),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {"offsets": (0,)},
+    }
+
+    with pytest.raises(ValueError, match="finite"):
+        infer_full_frame(model, clip, _cfg())
+    assert model.training
+
+
+def test_inference_rejects_clip_smaller_than_tile():
+    model = RecordingModel(1)
+    clip = {
+        "frames": torch.rand(1, 3, 100, 100),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {"offsets": (0,)},
+    }
+
+    with pytest.raises(ValueError, match="smaller"):
+        infer_full_frame(model, clip, _cfg())
