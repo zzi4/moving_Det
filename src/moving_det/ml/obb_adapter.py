@@ -64,17 +64,17 @@ def obb_to_normalized_xywhr(obb: OBB, tile: Tile) -> np.ndarray:
     theta = theta % np.pi
     if theta >= np.pi / 2:
         width, height, theta = height, width, theta - np.pi / 2
-    theta = min(
-        theta,
-        float(np.nextafter(np.float32(np.pi / 2), np.float32(0))),
-    )
+    encoded_theta = np.float32(theta)
+    if encoded_theta >= np.pi / 2:
+        width, height = height, width
+        encoded_theta = np.float32(0)
     result = np.asarray(
         [
             (obb.cx - tile.x) / tile.width,
             (obb.cy - tile.y) / tile.height,
             width / tile.width,
             height / tile.height,
-            theta,
+            encoded_theta,
         ],
         dtype=np.float32,
     )

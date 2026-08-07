@@ -74,6 +74,33 @@ def test_round_trip_preserves_periodic_angle_across_internal_interval(theta):
     assert rotated_iou(original, restored) > 0.99999
 
 
+@pytest.mark.parametrize(
+    ("theta", "expected_width", "expected_height"),
+    [
+        (-1e-12, 1000 / 1024, 0.1 / 1024),
+        (math.pi / 2 - 1e-12, 0.1 / 1024, 1000 / 1024),
+    ],
+)
+def test_float32_angle_boundary_uses_equivalent_zero_angle_representation(
+    theta,
+    expected_width,
+    expected_height,
+):
+    tile = Tile(0, 0, 1024, 1024)
+    original = OBB(512, 512, 1000, 0.1, theta)
+
+    converted = obb_to_normalized_xywhr(original, tile)
+    restored = normalized_xywhr_to_obb(converted, tile)
+
+    assert rotated_iou(original, restored) > 0.99999
+    assert converted[2] == pytest.approx(expected_width)
+    assert converted[3] == pytest.approx(expected_height)
+    assert converted[4] == 0
+    assert 0 <= converted[4] < math.pi / 2
+    assert restored.width >= restored.height
+    assert -math.pi / 2 <= restored.theta < math.pi / 2
+
+
 def test_inverse_conversion_restores_long_side_convention():
     tile = Tile(100, 200, 400, 800)
 
