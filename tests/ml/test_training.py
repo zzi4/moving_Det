@@ -13,6 +13,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+import moving_det.ml.training as training_module
 from moving_det.ml.factory import create_model
 from moving_det.ml.training import (
     TrainingHooks,
@@ -713,9 +714,15 @@ def test_resume_to_fresh_output_preserves_prior_best_without_improvement(
 
 
 class StatefulRandomLoader:
-    def __init__(self, order_log: list[tuple[float, float, float]]) -> None:
+    def __init__(
+        self,
+        order_log: list[tuple[float, float, float]],
+        *,
+        seed: int = 9917,
+    ) -> None:
         self.order_log = order_log
-        self.generator = torch.Generator().manual_seed(9917)
+        self.generator = torch.Generator().manual_seed(seed)
+        self.load_calls = 0
 
     def __len__(self) -> int:
         return 4
@@ -738,23 +745,31 @@ class StatefulRandomLoader:
         return {"generator": self.generator.get_state()}
 
     def load_state_dict(self, state: dict[str, Tensor]) -> None:
+        self.load_calls += 1
         self.generator.set_state(state["generator"])
 
 
 def _stateful_hooks(
     model: TinyOBB,
     order_log: list[tuple[float, float, float]],
+    *,
+    loader: StatefulRandomLoader | None = None,
+    map50_values: list[float] | None = None,
 ) -> TrainingHooks:
-    loader = StatefulRandomLoader(order_log)
+    selected_loader = loader or StatefulRandomLoader(order_log)
+    scores = iter(map50_values or [0.1] * 100)
     return TrainingHooks(
         model_factory=lambda _name, _weights, _cfg: model,
-        loader_factory=lambda _name, _cfg, _root: (loader, [_batch()]),
+        loader_factory=lambda _name, _cfg, _root: (
+            selected_loader,
+            [_batch()],
+        ),
         gate_loader_factory=lambda _name, _cfg, _root: [
             _batch(batch_size=16)
             for _ in range(4)
         ],
         validator=lambda _model, _loader, _device: {
-            "map50": 0.1,
+            "map50": next(scores),
             "recall_at_riou_025": 0.9,
         },
         device="cpu",
@@ -1039,6 +1054,391 @@ def test_tampered_prior_best_history_is_rejected_before_copy(
             output,
             resume_checkpoint=first.last_checkpoint,
             hooks=_tiny_hooks(TinyOBB(), map50_values=[0.3]),
+        )
+
+    assert (output / "history.json").read_bytes() == history_sentinel
+    assert (output / "best.pt").read_bytes() == best_sentinel
+
+
+def test_invalid_last_history_is_rejected_before_target_model_mutation(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "first",
+        hooks=_tiny_hooks(TinyOBB(initial=0.01), map50_values=[0.1]),
+    )
+    payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    payload["history"][0]["epoch"] = "0"
+    torch.save(payload, first.last_checkpoint)
+
+    target = TinyOBB(initial=0.875)
+    target_before = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+    }
+    output = tmp_path / "invalid-last"
+    output.mkdir()
+    sentinels = {
+        "last.pt": b"existing-last",
+        "best.pt": b"existing-best",
+        "history.json": b"existing-history",
+    }
+    for name, content in sentinels.items():
+        (output / name).write_bytes(content)
+
+    with pytest.raises(ValueError, match="history|epoch"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(target, map50_values=[0.2]),
+        )
+
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            target_before[name],
+            rtol=0,
+            atol=0,
+        )
+    for name, content in sentinels.items():
+        assert (output / name).read_bytes() == content
+
+
+def test_invalid_best_is_rejected_before_model_optimizer_or_loader_mutation(
+    tmp_path,
+    temporal_config,
+    monkeypatch,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=2),
+        manifest,
+        tmp_path / "first",
+        hooks=_stateful_hooks(
+            TinyOBB(initial=0.01),
+            [],
+            map50_values=[0.3, 0.2],
+        ),
+    )
+    best_payload = torch.load(
+        first.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    best_payload["history"][0]["train_loss"] += 0.125
+    torch.save(best_payload, first.best_checkpoint)
+
+    target = TinyOBB(initial=0.875)
+    target_before = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+    }
+    target_loader = StatefulRandomLoader([], seed=17)
+    loader_generator_before = target_loader.generator.get_state().clone()
+    optimizers: list[torch.optim.AdamW] = []
+
+    class TrackingAdamW(torch.optim.AdamW):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.load_calls = 0
+
+        def load_state_dict(self, state_dict):
+            self.load_calls = getattr(self, "load_calls", 0) + 1
+            return super().load_state_dict(state_dict)
+
+    def tracking_optimizer(model, cfg):
+        optimizer = TrackingAdamW(
+            model.parameters(),
+            lr=cfg.learning_rate,
+            weight_decay=cfg.weight_decay,
+        )
+        optimizers.append(optimizer)
+        return optimizer
+
+    monkeypatch.setattr(
+        training_module,
+        "build_optimizer",
+        tracking_optimizer,
+    )
+    output = tmp_path / "invalid-best"
+    output.mkdir()
+    sentinels = {
+        "last.pt": b"existing-last",
+        "best.pt": b"existing-best",
+        "history.json": b"existing-history",
+    }
+    for name, content in sentinels.items():
+        (output / name).write_bytes(content)
+
+    with pytest.raises(ValueError, match="best|history"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=3),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_stateful_hooks(
+                target,
+                [],
+                loader=target_loader,
+                map50_values=[0.4],
+            ),
+        )
+
+    assert len(optimizers) == 1
+    assert optimizers[0].load_calls == 0
+    assert not optimizers[0].state
+    assert target_loader.load_calls == 0
+    torch.testing.assert_close(
+        target_loader.generator.get_state(),
+        loader_generator_before,
+        rtol=0,
+        atol=0,
+    )
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            target_before[name],
+            rtol=0,
+            atol=0,
+        )
+    for name, content in sentinels.items():
+        assert (output / name).read_bytes() == content
+
+
+@pytest.mark.parametrize(
+    "probe",
+    ["invalid_torch_rng", "invalid_loader_state"],
+)
+def test_invalid_reproducibility_metadata_is_rejected_before_mutation(
+    tmp_path,
+    temporal_config,
+    probe,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / f"first-{probe}",
+        hooks=_stateful_hooks(
+            TinyOBB(initial=0.01),
+            [],
+            map50_values=[0.2],
+        ),
+    )
+    payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    state = payload["reproducibility_state"]
+    if probe == "invalid_torch_rng":
+        state["torch_cpu"] = torch.ones(3)
+    else:
+        state["loader"] = {"wrong": torch.zeros(1)}
+    torch.save(payload, first.last_checkpoint)
+
+    target = TinyOBB(initial=0.875)
+    target_before = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+    }
+    target_loader = StatefulRandomLoader([], seed=17)
+    loader_generator_before = target_loader.generator.get_state().clone()
+    output = tmp_path / f"invalid-repro-{probe}"
+    output.mkdir()
+    sentinels = {
+        "last.pt": b"existing-last",
+        "best.pt": b"existing-best",
+        "history.json": b"existing-history",
+    }
+    for name, content in sentinels.items():
+        (output / name).write_bytes(content)
+
+    with pytest.raises(ValueError, match="reproducibility|loader|RNG"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_stateful_hooks(
+                target,
+                [],
+                loader=target_loader,
+                map50_values=[0.3],
+            ),
+        )
+
+    assert target_loader.load_calls == 0
+    torch.testing.assert_close(
+        target_loader.generator.get_state(),
+        loader_generator_before,
+        rtol=0,
+        atol=0,
+    )
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            target_before[name],
+            rtol=0,
+            atol=0,
+        )
+    for name, content in sentinels.items():
+        assert (output / name).read_bytes() == content
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_invalid_best_is_rejected_before_target_scaler_restore(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "first-cuda-mutation",
+        hooks=replace(
+            _tiny_hooks(TinyOBB(initial=0.01), map50_values=[0.2]),
+            device="cuda",
+            scaler_factory=lambda _device: torch.amp.GradScaler(
+                "cuda",
+                init_scale=32,
+                growth_interval=1,
+            ),
+        ),
+    )
+    best_payload = torch.load(
+        first.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    best_payload["history"][0]["train_loss"] += 0.125
+    torch.save(best_payload, first.best_checkpoint)
+
+    class TrackingGradScaler(torch.amp.GradScaler):
+        def __init__(self):
+            super().__init__(
+                "cuda",
+                init_scale=4,
+                growth_interval=999,
+            )
+            self.load_calls = 0
+
+        def load_state_dict(self, state_dict):
+            self.load_calls += 1
+            return super().load_state_dict(state_dict)
+
+    target_scaler = TrackingGradScaler()
+    with pytest.raises(ValueError, match="best|history"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            tmp_path / "invalid-best-cuda",
+            resume_checkpoint=first.last_checkpoint,
+            hooks=replace(
+                _tiny_hooks(TinyOBB(initial=0.875), map50_values=[0.3]),
+                device="cuda",
+                scaler_factory=lambda _device: target_scaler,
+            ),
+        )
+
+    assert target_scaler.load_calls == 0
+    assert target_scaler.get_scale() == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        "final_best_map50",
+        "prefix_record",
+        "epoch",
+        "best_map50",
+        "best_model_name",
+        "last_model_name",
+    ],
+)
+def test_inherited_best_semantics_are_cross_validated_before_copy(
+    tmp_path,
+    temporal_config,
+    probe,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=2),
+        manifest,
+        tmp_path / f"first-best-semantics-{probe}",
+        hooks=_tiny_hooks(
+            TinyOBB(initial=0.01),
+            map50_values=[0.3, 0.2],
+        ),
+    )
+    last_payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    best_payload = torch.load(
+        first.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    if probe == "final_best_map50":
+        best_payload["history"][-1]["map50"] = 0.25
+    elif probe == "prefix_record":
+        best_payload["history"][-1]["train_loss"] += 0.125
+    elif probe == "epoch":
+        best_payload["epoch"] = 1
+        best_payload["optimizer_steps"] = last_payload["history"][1][
+            "optimizer_steps"
+        ]
+        best_payload["history"] = [
+            dict(record)
+            for record in last_payload["history"]
+        ]
+        best_payload["history"][-1]["map50"] = best_payload["best_map50"]
+    elif probe == "best_map50":
+        last_payload["best_map50"] = 0.25
+        best_payload["best_map50"] = 0.25
+    elif probe == "best_model_name":
+        best_payload["model_name"] = "mg_vtod"
+    else:
+        last_payload["model_name"] = "mg_vtod"
+    torch.save(last_payload, first.last_checkpoint)
+    torch.save(best_payload, first.best_checkpoint)
+
+    output = tmp_path / f"invalid-best-semantics-{probe}"
+    output.mkdir()
+    history_sentinel = b"existing-history"
+    best_sentinel = b"existing-best"
+    (output / "history.json").write_bytes(history_sentinel)
+    (output / "best.pt").write_bytes(best_sentinel)
+
+    with pytest.raises(ValueError, match="best|model"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=3),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(TinyOBB(initial=0.875), map50_values=[0.4]),
         )
 
     assert (output / "history.json").read_bytes() == history_sentinel

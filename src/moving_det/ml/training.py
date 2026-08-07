@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+import copy
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -59,7 +60,17 @@ _SCALER_STATE_KEYS = frozenset(
         "_growth_tracker",
     }
 )
-
+_REPRODUCIBILITY_STATE_KEYS = frozenset(
+    {
+        "python_random",
+        "numpy_random",
+        "torch_cpu",
+        "torch_cuda",
+        "loader",
+        "dataset",
+        "sampler",
+    }
+)
 ModelFactory = Callable[[str, Path | str | None, TemporalOBBConfig], nn.Module]
 LoaderFactory = Callable[
     [str, TemporalOBBConfig, Path],
@@ -355,6 +366,26 @@ def _validate_model_state(
     return allowed_missing
 
 
+def _apply_model_state(
+    model: nn.Module,
+    source_state: Mapping[str, Any],
+    allowed_missing: set[str],
+) -> None:
+    incompatibility = model.load_state_dict(
+        dict(source_state),
+        strict=False,
+    )
+    invalid_missing = set(incompatibility.missing_keys).difference(
+        allowed_missing
+    )
+    if invalid_missing or incompatibility.unexpected_keys:
+        raise ValueError(
+            "checkpoint is incompatible with target temporal model: "
+            f"missing={sorted(invalid_missing)}, "
+            f"unexpected={sorted(incompatibility.unexpected_keys)}"
+        )
+
+
 def load_experiment_checkpoint(
     model: nn.Module,
     checkpoint: Path,
@@ -368,17 +399,7 @@ def load_experiment_checkpoint(
     )
     source_state = dict(payload["model"])
     allowed_missing = _validate_model_state(model, source_state)
-
-    incompatibility = model.load_state_dict(source_state, strict=False)
-    invalid_missing = set(incompatibility.missing_keys).difference(
-        allowed_missing
-    )
-    if invalid_missing or incompatibility.unexpected_keys:
-        raise ValueError(
-            "checkpoint is incompatible with target temporal model: "
-            f"missing={sorted(invalid_missing)}, "
-            f"unexpected={sorted(incompatibility.unexpected_keys)}"
-        )
+    _apply_model_state(model, source_state, allowed_missing)
     return payload
 
 
@@ -739,6 +760,307 @@ def _capture_reproducibility_state(train_loader: Any) -> dict[str, Any]:
     return state
 
 
+def _validate_torch_generator_state(
+    raw_state: Any,
+    *,
+    label: str,
+    device: str = "cpu",
+) -> None:
+    if (
+        not isinstance(raw_state, Tensor)
+        or raw_state.dtype != torch.uint8
+        or raw_state.ndim != 1
+        or raw_state.numel() == 0
+    ):
+        raise ValueError(f"{label} RNG state must be a non-empty byte tensor")
+    try:
+        generator = torch.Generator(device=device)
+        generator.set_state(raw_state.detach().cpu().clone())
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} RNG state is incompatible") from exc
+
+
+def _validate_component_state_without_mutation(
+    component: Any,
+    raw_state: Any | None,
+    *,
+    label: str,
+) -> None:
+    state_provider = getattr(component, "state_dict", None)
+    state_loader = getattr(component, "load_state_dict", None)
+    supports_state = callable(state_provider) and callable(state_loader)
+    if raw_state is None:
+        if supports_state:
+            raise ValueError(
+                f"resume {label} state is missing for a stateful component"
+            )
+        return
+    if not isinstance(raw_state, Mapping):
+        raise ValueError(f"resume {label} state must be a mapping")
+    if not supports_state:
+        raise ValueError(
+            f"resume {label} state cannot be restored by the target component"
+        )
+    try:
+        candidate = copy.deepcopy(component)
+        candidate.load_state_dict(copy.deepcopy(dict(raw_state)))
+    except Exception as exc:
+        raise ValueError(f"resume {label} state is incompatible") from exc
+
+
+def _validate_reproducibility_state(
+    raw_state: Any,
+    train_loader: Any,
+) -> dict[str, Any]:
+    if not isinstance(raw_state, Mapping):
+        raise ValueError(
+            "resume checkpoint reproducibility state must be a mapping"
+        )
+    state = dict(raw_state)
+    expected_keys = set(_REPRODUCIBILITY_STATE_KEYS)
+    loader_generator = getattr(train_loader, "generator", None)
+    if isinstance(loader_generator, torch.Generator):
+        expected_keys.add("loader_generator")
+    sampler = getattr(train_loader, "sampler", None)
+    sampler_generator = getattr(sampler, "generator", None)
+    if isinstance(sampler_generator, torch.Generator):
+        expected_keys.add("sampler_generator")
+    if set(state) != expected_keys:
+        raise ValueError(
+            "resume checkpoint reproducibility state has invalid metadata"
+        )
+
+    try:
+        python_candidate = random.Random()
+        python_candidate.setstate(state["python_random"])
+        numpy_candidate = np.random.RandomState()
+        numpy_candidate.set_state(state["numpy_random"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "resume checkpoint has invalid Python or NumPy RNG state"
+        ) from exc
+    _validate_torch_generator_state(
+        state["torch_cpu"],
+        label="torch CPU",
+    )
+
+    cuda_states = state["torch_cuda"]
+    if cuda_states is not None:
+        if not isinstance(cuda_states, (list, tuple)):
+            raise ValueError(
+                "resume checkpoint CUDA RNG state must be a sequence or null"
+            )
+        for index, cuda_state in enumerate(cuda_states):
+            if (
+                not isinstance(cuda_state, Tensor)
+                or cuda_state.dtype != torch.uint8
+                or cuda_state.ndim != 1
+                or cuda_state.numel() == 0
+            ):
+                raise ValueError(
+                    "resume checkpoint CUDA RNG state contains an invalid "
+                    "entry"
+                )
+            if index < torch.cuda.device_count():
+                _validate_torch_generator_state(
+                    cuda_state,
+                    label=f"torch CUDA {index}",
+                    device=f"cuda:{index}",
+                )
+
+    _validate_component_state_without_mutation(
+        train_loader,
+        state["loader"],
+        label="loader",
+    )
+    _validate_component_state_without_mutation(
+        getattr(train_loader, "dataset", None),
+        state["dataset"],
+        label="dataset",
+    )
+    _validate_component_state_without_mutation(
+        sampler,
+        state["sampler"],
+        label="sampler",
+    )
+    if "loader_generator" in state:
+        _validate_torch_generator_state(
+            state["loader_generator"],
+            label="training loader",
+        )
+    if "sampler_generator" in state:
+        _validate_torch_generator_state(
+            state["sampler_generator"],
+            label="training sampler",
+        )
+    return state
+
+
+def _validate_loadable_state_without_mutation(
+    target: Any,
+    raw_state: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(raw_state, Mapping):
+        raise ValueError(f"resume checkpoint {label} state must be a mapping")
+    state = dict(raw_state)
+    try:
+        candidate = copy.deepcopy(target)
+        candidate.load_state_dict(copy.deepcopy(state))
+    except Exception as exc:
+        raise ValueError(
+            f"resume checkpoint {label} state is incompatible"
+        ) from exc
+    return state
+
+
+def _validate_resume_checkpoint_payload(
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+    expected_model_name: str,
+    model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LambdaLR,
+    scaler: torch.amp.GradScaler,
+    train_loader: Any,
+    manifest_dir: Path,
+) -> list[dict[str, Any]]:
+    _verify_manifest_sha256(
+        payload["manifest_sha256"],
+        manifest_dir,
+    )
+    payload_model_name = payload.get("model_name")
+    if (
+        not isinstance(payload_model_name, str)
+        or payload_model_name != expected_model_name
+    ):
+        raise ValueError(
+            f"resume {label} checkpoint model name is incompatible"
+        )
+    _validate_model_state(model, payload["model"])
+    history = _validate_resume_history(
+        payload.get("history"),
+        checkpoint_epoch=payload.get("epoch"),
+        checkpoint_optimizer_steps=payload.get("optimizer_steps"),
+    )
+    best_map50 = payload.get("best_map50")
+    if (
+        not _is_finite_number(best_map50)
+        or not 0 <= best_map50 <= 1
+    ):
+        raise ValueError(
+            f"resume {label} checkpoint best_map50 must be finite and in [0, 1]"
+        )
+    epochs_without_improvement = payload.get(
+        "epochs_without_improvement"
+    )
+    if (
+        type(epochs_without_improvement) is not int
+        or epochs_without_improvement < 0
+    ):
+        raise ValueError(
+            f"resume {label} checkpoint has invalid early-stop state"
+        )
+    if not isinstance(payload.get("config"), Mapping):
+        raise ValueError(
+            f"resume {label} checkpoint config must be a mapping"
+        )
+    _validate_loadable_state_without_mutation(
+        optimizer,
+        payload.get("optimizer"),
+        label=f"{label} optimizer",
+    )
+    _validate_loadable_state_without_mutation(
+        scheduler,
+        payload.get("scheduler"),
+        label=f"{label} scheduler",
+    )
+    _validate_scaler_state(
+        payload.get("scaler"),
+        enabled=scaler.is_enabled(),
+    )
+    _validate_reproducibility_state(
+        payload.get("reproducibility_state"),
+        train_loader,
+    )
+    return history
+
+
+def _validate_resume_pair(
+    last_payload: Mapping[str, Any],
+    best_payload: Mapping[str, Any],
+    *,
+    model_name: str,
+    model: nn.Module,
+    optimizer: Optimizer,
+    scheduler: LambdaLR,
+    scaler: torch.amp.GradScaler,
+    train_loader: Any,
+    manifest_dir: Path,
+) -> list[dict[str, Any]]:
+    last_history = _validate_resume_checkpoint_payload(
+        last_payload,
+        label="last",
+        expected_model_name=model_name,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        train_loader=train_loader,
+        manifest_dir=manifest_dir,
+    )
+    best_history = _validate_resume_checkpoint_payload(
+        best_payload,
+        label="best",
+        expected_model_name=model_name,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        train_loader=train_loader,
+        manifest_dir=manifest_dir,
+    )
+    if (
+        last_payload["manifest_sha256"]
+        != best_payload["manifest_sha256"]
+    ):
+        raise ValueError(
+            "resume best and last checkpoint manifests do not match"
+        )
+    if last_payload["model_name"] != best_payload["model_name"]:
+        raise ValueError(
+            "resume best and last checkpoint model names do not match"
+        )
+    if best_payload["best_map50"] != last_payload["best_map50"]:
+        raise ValueError(
+            "resume best checkpoint best_map50 does not match last checkpoint"
+        )
+    best_epoch = best_payload["epoch"]
+    if best_epoch > last_payload["epoch"]:
+        raise ValueError(
+            "resume best checkpoint epoch is newer than last checkpoint"
+        )
+    if best_history[-1]["map50"] != best_payload["best_map50"]:
+        raise ValueError(
+            "resume best checkpoint final history map50 does not match "
+            "best_map50"
+        )
+    if max(record["map50"] for record in last_history) != last_payload[
+        "best_map50"
+    ]:
+        raise ValueError(
+            "resume last checkpoint best_map50 does not match its history"
+        )
+    if best_history != last_history[: best_epoch + 1]:
+        raise ValueError(
+            "resume best checkpoint history does not exactly match the "
+            "last checkpoint prefix"
+        )
+    return last_history
+
+
 def _restore_component_state(component: Any, state: Any | None) -> None:
     if state is None:
         return
@@ -950,7 +1272,6 @@ def train_model(
                 }
                 for index in range(torch.cuda.device_count())
             ]
-        _atomic_json_write(output_root / "run.json", run)
 
         if not isinstance(cfg, TemporalOBBConfig):
             raise ValueError("cfg must be a TemporalOBBConfig")
@@ -1012,6 +1333,7 @@ def train_model(
             cfg,
         ).to(device)
         resume_payload: dict[str, Any] | None = None
+        source_best: dict[str, Any] | None = None
         history: list[dict[str, Any]] = []
         start_epoch = 0
         epochs_without_improvement = 0
@@ -1034,35 +1356,8 @@ def train_model(
             }
         elif resume_checkpoint is not None:
             source = Path(resume_checkpoint)
-            resume_payload = load_experiment_checkpoint(
-                model,
-                source,
-                manifest_root,
-            )
-            try:
-                checkpoint_epoch = resume_payload["epoch"]
-                checkpoint_optimizer_steps = resume_payload[
-                    "optimizer_steps"
-                ]
-                history = _validate_resume_history(
-                    resume_payload["history"],
-                    checkpoint_epoch=checkpoint_epoch,
-                    checkpoint_optimizer_steps=(
-                        checkpoint_optimizer_steps
-                    ),
-                )
-                start_epoch = checkpoint_epoch + 1
-                completed_epochs = start_epoch
-                optimizer_steps = checkpoint_optimizer_steps
-                best_map50 = float(resume_payload["best_map50"])
-                epochs_without_improvement = int(
-                    resume_payload.get("epochs_without_improvement", 0)
-                )
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    "resume checkpoint has invalid history, epoch, or "
-                    "optimizer state"
-                ) from exc
+            resume_payload = _load_checkpoint_payload(source)
+            source_best = _load_checkpoint_payload(source.parent / "best.pt")
             load_provenance = {
                 "kind": "resume",
                 "checkpoint": str(source),
@@ -1070,7 +1365,7 @@ def train_model(
                 "weights": None,
                 "manifest_sha256": resume_payload["manifest_sha256"],
                 "model_name": resume_payload.get("model_name"),
-                "epoch": resume_payload["epoch"],
+                "epoch": resume_payload.get("epoch"),
             }
         else:
             load_provenance = {
@@ -1081,8 +1376,6 @@ def train_model(
                 "manifest_sha256": manifest_sha256,
             }
         run["load_provenance"] = load_provenance
-        run["status"] = "running"
-        _atomic_json_write(output_root / "run.json", run)
 
         optimizer = build_optimizer(model, cfg)
         train_loader, validation_loader = loader_factory(
@@ -1111,7 +1404,39 @@ def train_model(
                 "scaler_factory must return torch.amp.GradScaler"
             )
         if resume_payload is not None:
+            assert source_best is not None
             try:
+                history = _validate_resume_pair(
+                    resume_payload,
+                    source_best,
+                    model_name=model_name,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    train_loader=train_loader,
+                    manifest_dir=manifest_root,
+                )
+                checkpoint_epoch = resume_payload["epoch"]
+                checkpoint_optimizer_steps = resume_payload[
+                    "optimizer_steps"
+                ]
+                start_epoch = checkpoint_epoch + 1
+                completed_epochs = start_epoch
+                optimizer_steps = checkpoint_optimizer_steps
+                best_map50 = resume_payload["best_map50"]
+                epochs_without_improvement = resume_payload[
+                    "epochs_without_improvement"
+                ]
+                allowed_missing = _validate_model_state(
+                    model,
+                    resume_payload["model"],
+                )
+                _apply_model_state(
+                    model,
+                    resume_payload["model"],
+                    allowed_missing,
+                )
                 optimizer.load_state_dict(resume_payload["optimizer"])
                 scheduler.load_state_dict(resume_payload["scheduler"])
                 _restore_scaler_state(
@@ -1122,36 +1447,17 @@ def train_model(
                     resume_payload["reproducibility_state"],
                     train_loader,
                 )
-            except (KeyError, TypeError, ValueError) as exc:
+            except (KeyError, RuntimeError, TypeError, ValueError) as exc:
                 raise ValueError(
-                    "resume checkpoint has invalid optimizer, scheduler, "
-                    "scaler, or reproducibility state"
+                    "resume checkpoint validation or restoration failed: "
+                    f"{exc}"
                 ) from exc
 
-            source_best_path = Path(resume_checkpoint).parent / "best.pt"
-            source_best = _load_checkpoint_payload(source_best_path)
-            _verify_manifest_sha256(
-                source_best["manifest_sha256"],
-                manifest_root,
-            )
-            _validate_model_state(model, source_best["model"])
-            _validate_scaler_state(
-                source_best.get("scaler"),
-                enabled=use_amp,
-            )
-            _validate_resume_history(
-                source_best.get("history"),
-                checkpoint_epoch=source_best.get("epoch"),
-                checkpoint_optimizer_steps=source_best.get(
-                    "optimizer_steps"
-                ),
-            )
-            if float(source_best.get("best_map50", -math.inf)) != best_map50:
-                raise ValueError(
-                    "resume best checkpoint does not match resume state"
-                )
             _atomic_torch_save(source_best, best_checkpoint)
             _atomic_json_write(history_path, history)
+
+        run["status"] = "running"
+        _atomic_json_write(output_root / "run.json", run)
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
