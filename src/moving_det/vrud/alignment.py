@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
+import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
+import threading
 from typing import Any
 
 import numpy as np
@@ -25,6 +31,9 @@ _NPZ_FIELDS = {
     "reason_present",
     "reason",
 }
+_LOCK_NAME = ".alignment-cache.lock"
+_ROOT_LOCKS: dict[str, threading.RLock] = {}
+_ROOT_LOCKS_GUARD = threading.Lock()
 
 
 def _validate_key_part(value: object, field: str) -> None:
@@ -70,18 +79,41 @@ def localize_affine(global_matrix: np.ndarray, tile: Tile) -> np.ndarray:
     if not isinstance(tile, Tile):
         raise ValueError("tile must be a Tile")
 
-    global_h = np.eye(3, dtype=np.float64)
-    global_h[:2] = matrix.astype(np.float64)
-    crop = np.asarray(
-        [
-            [1.0, 0.0, float(tile.x)],
-            [0.0, 1.0, float(tile.y)],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-    localized = np.linalg.inv(crop) @ global_h @ crop
-    return localized[:2].astype(np.float32)
+    try:
+        tile_x = float(tile.x)
+        tile_y = float(tile.y)
+        global_h = np.eye(3, dtype=np.float64)
+        global_h[:2] = matrix.astype(np.float64)
+        crop = np.asarray(
+            [
+                [1.0, 0.0, tile_x],
+                [0.0, 1.0, tile_y],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        with np.errstate(over="raise", invalid="raise"):
+            localized = np.linalg.inv(crop) @ global_h @ crop
+    except (FloatingPointError, OverflowError, np.linalg.LinAlgError) as exc:
+        raise ValueError(
+            "localized affine must have a finite float32 representation"
+        ) from exc
+    if not np.isfinite(crop).all() or not np.isfinite(localized).all():
+        raise ValueError(
+            "localized affine must have a finite float32 representation"
+        )
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            result = localized[:2].astype(np.float32)
+    except FloatingPointError as exc:
+        raise ValueError(
+            "localized affine must have a finite float32 representation"
+        ) from exc
+    if not np.isfinite(result).all():
+        raise ValueError(
+            "localized affine must have a finite float32 representation"
+        )
+    return result
 
 
 def _key_payload(key: AlignmentKey) -> dict[str, object]:
@@ -139,6 +171,25 @@ def _validate_result(result: AlignmentResult) -> None:
         raise ValueError("successful alignment reason must be None")
 
 
+def _root_thread_lock(root: Path) -> threading.RLock:
+    key = os.path.abspath(os.fspath(root))
+    with _ROOT_LOCKS_GUARD:
+        lock = _ROOT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _ROOT_LOCKS[key] = lock
+        return lock
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class AlignmentCache:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
@@ -148,9 +199,11 @@ class AlignmentCache:
         return {"schema_version": _CACHE_SCHEMA_VERSION, "entries": {}}
 
     def _read_index(self) -> dict[str, object]:
+        if self.index_path.is_symlink():
+            raise ValueError("alignment cache index is not a regular file")
         if not self.index_path.exists():
             return self._empty_index()
-        if self.index_path.is_symlink() or not self.index_path.is_file():
+        if not self.index_path.is_file():
             raise ValueError("alignment cache index is not a regular file")
         try:
             with self.index_path.open("r", encoding="utf-8") as stream:
@@ -220,7 +273,7 @@ class AlignmentCache:
         if hashlib.sha256(payload).hexdigest() != checksum:
             raise ValueError("alignment cache artifact checksum is mismatched")
         try:
-            with np.load(path, allow_pickle=False) as stored:
+            with np.load(io.BytesIO(payload), allow_pickle=False) as stored:
                 if set(stored.files) != _NPZ_FIELDS:
                     raise ValueError("alignment cache artifact fields are invalid")
                 matrix = stored["matrix"]
@@ -264,6 +317,71 @@ class AlignmentCache:
             raise ValueError("alignment cache artifact result is invalid") from exc
         return result
 
+    @contextmanager
+    def _exclusive_process_lock(self):
+        lock_path = self.root / _LOCK_NAME
+        if lock_path.is_symlink():
+            raise ValueError("alignment cache lock must not be a symlink")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno in {
+                errno.ELOOP,
+                errno.EISDIR,
+                errno.ENOENT,
+                errno.ENOTDIR,
+            }:
+                raise ValueError(
+                    "alignment cache lock path is unsafe"
+                ) from exc
+            raise
+
+        locked = False
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(descriptor_stat.st_mode):
+                raise ValueError(
+                    "alignment cache lock must be a regular file"
+                )
+            try:
+                path_stat = os.stat(lock_path, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(
+                    "alignment cache lock path changed during open"
+                ) from exc
+            if (
+                not stat.S_ISREG(path_stat.st_mode)
+                or path_stat.st_dev != descriptor_stat.st_dev
+                or path_stat.st_ino != descriptor_stat.st_ino
+            ):
+                raise ValueError(
+                    "alignment cache lock path changed during open"
+                )
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locked = True
+            try:
+                locked_path_stat = os.stat(lock_path, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(
+                    "alignment cache lock path changed while locked"
+                ) from exc
+            if (
+                not stat.S_ISREG(locked_path_stat.st_mode)
+                or locked_path_stat.st_dev != descriptor_stat.st_dev
+                or locked_path_stat.st_ino != descriptor_stat.st_ino
+            ):
+                raise ValueError(
+                    "alignment cache lock path changed while locked"
+                )
+            yield
+        finally:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
     def get(self, key: AlignmentKey) -> AlignmentResult | None:
         if not isinstance(key, AlignmentKey):
             raise ValueError("cache key must be an AlignmentKey")
@@ -286,64 +404,74 @@ class AlignmentCache:
         if not self.root.is_dir():
             raise ValueError("alignment cache root is not a directory")
 
-        index = self._read_index()
-        key_digest = _key_digest(key)
-        artifact_temp: Path | None = None
-        index_temp: Path | None = None
-        try:
-            artifact_fd, artifact_name = tempfile.mkstemp(
-                prefix=f".{key_digest}-",
-                suffix=".npz.tmp",
-                dir=self.root,
-            )
-            artifact_temp = Path(artifact_name)
-            with os.fdopen(artifact_fd, "wb") as stream:
-                np.savez_compressed(
-                    stream,
-                    matrix=result.matrix,
-                    correlation=np.asarray(result.correlation, dtype=np.float64),
-                    used_fallback=np.asarray(
-                        result.used_fallback,
-                        dtype=np.bool_,
-                    ),
-                    reason_present=np.asarray(
-                        result.reason is not None,
-                        dtype=np.bool_,
-                    ),
-                    reason=np.asarray(result.reason or "", dtype=np.str_),
-                )
-                stream.flush()
-                os.fsync(stream.fileno())
-            payload = artifact_temp.read_bytes()
-            checksum = hashlib.sha256(payload).hexdigest()
-            artifact = f"{key_digest}-{checksum}.npz"
-            os.replace(artifact_temp, self.root / artifact)
-            artifact_temp = None
+        with _root_thread_lock(self.root):
+            with self._exclusive_process_lock():
+                index = self._read_index()
+                key_digest = _key_digest(key)
+                artifact_temp: Path | None = None
+                index_temp: Path | None = None
+                try:
+                    artifact_fd, artifact_name = tempfile.mkstemp(
+                        prefix=f".{key_digest}-",
+                        suffix=".npz.tmp",
+                        dir=self.root,
+                    )
+                    artifact_temp = Path(artifact_name)
+                    with os.fdopen(artifact_fd, "wb") as stream:
+                        np.savez_compressed(
+                            stream,
+                            matrix=result.matrix,
+                            correlation=np.asarray(
+                                result.correlation,
+                                dtype=np.float64,
+                            ),
+                            used_fallback=np.asarray(
+                                result.used_fallback,
+                                dtype=np.bool_,
+                            ),
+                            reason_present=np.asarray(
+                                result.reason is not None,
+                                dtype=np.bool_,
+                            ),
+                            reason=np.asarray(
+                                result.reason or "",
+                                dtype=np.str_,
+                            ),
+                        )
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    payload = artifact_temp.read_bytes()
+                    checksum = hashlib.sha256(payload).hexdigest()
+                    artifact = f"{key_digest}-{checksum}.npz"
+                    os.replace(artifact_temp, self.root / artifact)
+                    artifact_temp = None
+                    _fsync_directory(self.root)
 
-            entries = dict(index["entries"])
-            entries[key_digest] = {
-                "key": _key_payload(key),
-                "artifact": artifact,
-                "sha256": checksum,
-            }
-            updated = {
-                "schema_version": _CACHE_SCHEMA_VERSION,
-                "entries": entries,
-            }
-            index_fd, index_name = tempfile.mkstemp(
-                prefix=".index-",
-                suffix=".json.tmp",
-                dir=self.root,
-            )
-            index_temp = Path(index_name)
-            with os.fdopen(index_fd, "wb") as stream:
-                stream.write(_canonical_json(updated))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(index_temp, self.index_path)
-            index_temp = None
-        finally:
-            if artifact_temp is not None:
-                artifact_temp.unlink(missing_ok=True)
-            if index_temp is not None:
-                index_temp.unlink(missing_ok=True)
+                    entries = dict(index["entries"])
+                    entries[key_digest] = {
+                        "key": _key_payload(key),
+                        "artifact": artifact,
+                        "sha256": checksum,
+                    }
+                    updated = {
+                        "schema_version": _CACHE_SCHEMA_VERSION,
+                        "entries": entries,
+                    }
+                    index_fd, index_name = tempfile.mkstemp(
+                        prefix=".index-",
+                        suffix=".json.tmp",
+                        dir=self.root,
+                    )
+                    index_temp = Path(index_name)
+                    with os.fdopen(index_fd, "wb") as stream:
+                        stream.write(_canonical_json(updated))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(index_temp, self.index_path)
+                    index_temp = None
+                    _fsync_directory(self.root)
+                finally:
+                    if artifact_temp is not None:
+                        artifact_temp.unlink(missing_ok=True)
+                    if index_temp is not None:
+                        index_temp.unlink(missing_ok=True)

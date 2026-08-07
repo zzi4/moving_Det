@@ -131,6 +131,9 @@ def compute_motion_strength(
     Affines map center-output pixel coordinates to support-input coordinates,
     matching ``cv2.warpAffine(..., WARP_INVERSE_MAP)``. The odd temporal
     sequence must place a valid, identity-transformed zero offset at its center.
+    Finite floating values are accepted without a normalized-range assumption;
+    numerical tolerance is derived only from the center and sampled valid
+    supports, so padding values cannot affect valid evidence.
     Unbatched input returns ``[1,H,W]`` and batched input returns ``[B,1,H,W]``.
     """
 
@@ -172,9 +175,17 @@ def compute_motion_strength(
             detached[:, center_index] * grayscale_weights[:, 0]
         ).sum(dim=1)
         differences = (warped_gray - center_gray[:, None]).abs()
+        support_valid = valid.clone()
+        support_valid[:, center_index] = False
+        pixel_valid = support_valid[:, :, None, None] & spatial_support
+        valid_support_scale = (
+            warped_gray.abs()
+            .masked_fill(~pixel_valid, 0.0)
+            .amax(dim=(1, 2, 3))
+        )
+        center_scale = center_gray.abs().amax(dim=(1, 2))
         numeric_tolerance = (
-            detached.abs()
-            .amax(dim=(1, 2, 3, 4), keepdim=True)
+            torch.maximum(center_scale, valid_support_scale)
             .clamp_min(1.0)
             * (8.0 * torch.finfo(detached.dtype).eps)
         ).reshape(batch, 1, 1, 1)
@@ -184,9 +195,6 @@ def compute_motion_strength(
             differences,
         )
 
-        support_valid = valid.clone()
-        support_valid[:, center_index] = False
-        pixel_valid = support_valid[:, :, None, None] & spatial_support
         differences = differences.masked_fill(~pixel_valid, -torch.inf)
         motion = differences.amax(dim=1)
         motion = torch.where(

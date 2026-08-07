@@ -148,6 +148,39 @@ def test_invalid_support_is_ignored_when_another_support_is_valid():
     assert torch.count_nonzero(ignored) > 0
 
 
+def test_invalid_temporal_values_cannot_change_numeric_tolerance():
+    frames = torch.zeros(5, 3, 48, 64)
+    frames[1, :, 18:28, 20:32] = 1.0
+    valid = torch.tensor([False, True, True, False, False])
+    baseline = compute_motion_strength(frames, valid, _identity(5))
+
+    frames[0] = 1e20
+    with_invalid_extreme = compute_motion_strength(frames, valid, _identity(5))
+
+    assert torch.equal(baseline, with_invalid_extreme)
+    assert torch.count_nonzero(baseline) > 0
+
+
+def test_out_of_frame_values_cannot_change_numeric_tolerance():
+    frames = torch.zeros(5, 3, 48, 64)
+    frames[0, :, :, :20] = 1e20
+    frames[1, :, 18:28, 20:32] = 1.0
+    valid = torch.tensor([True, True, True, False, False])
+    transforms = _identity(5)
+    transforms[0, 0, 2] = 20
+    with_out_of_frame_extreme = compute_motion_strength(
+        frames,
+        valid,
+        transforms,
+    )
+
+    frames[0] = 0
+    baseline = compute_motion_strength(frames, valid, transforms)
+
+    assert torch.equal(baseline, with_out_of_frame_extreme)
+    assert torch.count_nonzero(baseline) > 0
+
+
 def test_out_of_frame_support_pixels_do_not_create_false_motion():
     frames = torch.ones(5, 3, 48, 64)
     transforms = _identity(5)

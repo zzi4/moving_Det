@@ -1,5 +1,9 @@
 import json
+import multiprocessing
+import os
 from pathlib import Path
+import stat
+import threading
 
 import cv2
 import numpy as np
@@ -37,6 +41,23 @@ def _result(matrix=None, *, correlation=0.93, fallback=False, reason=None):
 
 def _key() -> AlignmentKey:
     return AlignmentKey("site22", "sequence_a", 101, 97)
+
+
+def _concurrent_put(
+    root: str,
+    barrier,
+    support_frame: int,
+    translation: float,
+) -> None:
+    barrier.wait(timeout=10)
+    cache = AlignmentCache(root)
+    cache.put(
+        AlignmentKey("site22", "sequence_a", 101, support_frame),
+        _result(
+            np.float32([[1, 0, translation], [0, 1, 0]]),
+            correlation=0.90 + translation / 100.0,
+        ),
+    )
 
 
 def _valid_local_support_mask(
@@ -133,6 +154,21 @@ def test_localize_affine_requires_finite_float32_2_by_3(matrix):
 
 
 @pytest.mark.parametrize(
+    ("origin", "matrix"),
+    [
+        (10**400, np.float32([[1, 0, 0], [0, 1, 0]])),
+        (10**300, np.float32([[1, 0.25, 0], [0.1, 1, 0]])),
+    ],
+)
+def test_localize_affine_rejects_origins_that_cannot_produce_finite_float32(
+    origin,
+    matrix,
+):
+    with pytest.raises(ValueError, match="finite.*float32"):
+        localize_affine(matrix, Tile(origin, origin, 64, 64))
+
+
+@pytest.mark.parametrize(
     "args",
     [
         ("../site", "sequence", 2, 1),
@@ -214,6 +250,119 @@ def test_cache_atomic_index_failure_preserves_existing_value(tmp_path, monkeypat
     assert restored.correlation == 0.93
 
 
+@pytest.mark.parametrize("same_key", [False, True], ids=["distinct", "same"])
+def test_threaded_puts_are_serialized_without_lost_or_mixed_entries(
+    tmp_path,
+    same_key,
+):
+    barrier = threading.Barrier(2)
+    errors = []
+    support_frames = (97, 97 if same_key else 105)
+
+    def worker(support_frame, translation):
+        try:
+            _concurrent_put(
+                str(tmp_path),
+                barrier,
+                support_frame,
+                translation,
+            )
+        except BaseException as exc:  # captured for the main test thread
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(support_frames[0], 1.0)),
+        threading.Thread(target=worker, args=(support_frames[1], 2.0)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert not any(thread.is_alive() for thread in threads), "threaded put hung"
+    assert errors == []
+    cache = AlignmentCache(tmp_path)
+    if same_key:
+        actual = cache.get(AlignmentKey("site22", "sequence_a", 101, 97))
+        assert actual is not None
+        translation = float(actual.matrix[0, 2])
+        assert (translation, actual.correlation) in {
+            (1.0, 0.91),
+            (2.0, 0.92),
+        }
+    else:
+        first = cache.get(AlignmentKey("site22", "sequence_a", 101, 97))
+        second = cache.get(AlignmentKey("site22", "sequence_a", 101, 105))
+        assert first is not None and second is not None
+        assert float(first.matrix[0, 2]) == 1.0
+        assert float(second.matrix[0, 2]) == 2.0
+
+
+@pytest.mark.parametrize("same_key", [False, True], ids=["distinct", "same"])
+def test_multiprocess_puts_are_serialized_without_lost_or_mixed_entries(
+    tmp_path,
+    same_key,
+):
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    support_frames = (97, 97 if same_key else 105)
+    processes = [
+        context.Process(
+            target=_concurrent_put,
+            args=(str(tmp_path), barrier, support_frames[0], 1.0),
+        ),
+        context.Process(
+            target=_concurrent_put,
+            args=(str(tmp_path), barrier, support_frames[1], 2.0),
+        ),
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+    if any(process.is_alive() for process in processes):
+        for process in processes:
+            process.terminate()
+            process.join(timeout=5)
+        pytest.fail("multiprocess put hung")
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    cache = AlignmentCache(tmp_path)
+    if same_key:
+        actual = cache.get(AlignmentKey("site22", "sequence_a", 101, 97))
+        assert actual is not None
+        translation = float(actual.matrix[0, 2])
+        assert (translation, actual.correlation) in {
+            (1.0, 0.91),
+            (2.0, 0.92),
+        }
+    else:
+        first = cache.get(AlignmentKey("site22", "sequence_a", 101, 97))
+        second = cache.get(AlignmentKey("site22", "sequence_a", 101, 105))
+        assert first is not None and second is not None
+        assert float(first.matrix[0, 2]) == 1.0
+        assert float(second.matrix[0, 2]) == 2.0
+
+
+def test_put_fsyncs_directory_after_payload_and_index_renames(
+    tmp_path,
+    monkeypatch,
+):
+    observed_directory_fsyncs = 0
+    real_fsync = os.fsync
+
+    def observe_fsync(file_descriptor):
+        nonlocal observed_directory_fsyncs
+        if stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+            observed_directory_fsyncs += 1
+        return real_fsync(file_descriptor)
+
+    monkeypatch.setattr("moving_det.vrud.alignment.os.fsync", observe_fsync)
+    AlignmentCache(tmp_path).put(_key(), _result())
+
+    assert observed_directory_fsyncs >= 2
+
+
 @pytest.mark.parametrize("corruption", ["json", "entry-key", "artifact", "npz"])
 def test_cache_rejects_malformed_mismatched_or_corrupt_artifacts(
     tmp_path,
@@ -276,6 +425,79 @@ def test_cache_rejects_artifact_symlink_even_when_target_checksum_matches(
 
     with pytest.raises(ValueError, match="cache"):
         cache.get(_key())
+
+
+def test_cache_loads_the_exact_bytes_that_passed_checksum(
+    tmp_path,
+    monkeypatch,
+):
+    cache = AlignmentCache(tmp_path / "original")
+    cache.put(_key(), _result())
+    substitute_cache = AlignmentCache(tmp_path / "substitute")
+    substitute_cache.put(
+        _key(),
+        _result(
+            np.float32([[1, 0, 77], [0, 1, 55]]),
+            correlation=0.99,
+        ),
+    )
+    substitute_index = json.loads(
+        (tmp_path / "substitute" / "index.json").read_text(encoding="utf-8")
+    )
+    _, substitute_entry = next(iter(substitute_index["entries"].items()))
+    substitute_bytes = (
+        tmp_path / "substitute" / substitute_entry["artifact"]
+    ).read_bytes()
+    real_read_bytes = Path.read_bytes
+    swapped = False
+
+    def read_then_replace(path):
+        nonlocal swapped
+        verified = real_read_bytes(path)
+        if path.parent == tmp_path / "original" and path.suffix == ".npz":
+            path.write_bytes(substitute_bytes)
+            swapped = True
+        return verified
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_replace)
+    actual = cache.get(_key())
+
+    assert swapped is True
+    assert actual is not None
+    np.testing.assert_array_equal(
+        actual.matrix,
+        np.float32([[1, 0, 2], [0, 1, -1]]),
+    )
+    assert actual.correlation == 0.93
+
+
+@pytest.mark.parametrize("broken", [False, True], ids=["live", "broken"])
+def test_put_rejects_symlink_process_lock(tmp_path, broken):
+    tmp_path.mkdir(exist_ok=True)
+    target = tmp_path / "outside-lock"
+    if not broken:
+        target.write_text("do not lock", encoding="utf-8")
+    lock_path = tmp_path / ".alignment-cache.lock"
+    lock_path.symlink_to(target)
+
+    with pytest.raises(ValueError, match="lock.*symlink|symlink.*lock"):
+        AlignmentCache(tmp_path).put(_key(), _result())
+
+    if not broken:
+        assert target.read_text(encoding="utf-8") == "do not lock"
+
+
+@pytest.mark.parametrize("operation", ["get", "put"])
+def test_cache_rejects_broken_index_symlink(operation, tmp_path):
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "index.json").symlink_to(tmp_path / "missing-index.json")
+    cache = AlignmentCache(tmp_path)
+
+    with pytest.raises(ValueError, match="index.*regular"):
+        if operation == "get":
+            cache.get(_key())
+        else:
+            cache.put(_key(), _result())
 
 
 def test_cache_rejects_boolean_schema_version(tmp_path):
