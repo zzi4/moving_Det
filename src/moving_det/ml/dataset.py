@@ -18,6 +18,11 @@ from moving_det.geometry.obb import obb_to_points, points_to_obb
 from moving_det.ml.obb_adapter import obb_to_normalized_xywhr
 from moving_det.models import OBB
 from moving_det.temporal_config import TemporalOBBConfig
+from moving_det.vrud.alignment import (
+    AlignmentCache,
+    AlignmentKey,
+    localize_affine,
+)
 from moving_det.vrud.index import load_corrected_frame, load_track_index
 from moving_det.vrud.tiling import Tile, full_frame_tiles
 from moving_det.vrud.types import TrackKey
@@ -230,6 +235,87 @@ def apply_obb_transform(obb: OBB, transform: SpatialTransform) -> OBB:
     return points_to_obb(points)
 
 
+def _spatial_forward_affine(transform: SpatialTransform) -> np.ndarray:
+    pixel_center_offset = (transform.scale - 1.0) / 2.0
+    forward = np.eye(3, dtype=np.float64)
+    scale = np.asarray(
+        [
+            [transform.scale, 0.0, pixel_center_offset],
+            [0.0, transform.scale, pixel_center_offset],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    forward = scale @ forward
+
+    crop_x, crop_y, crop_width, crop_height = transform.crop_xywh
+    crop = np.asarray(
+        [
+            [1.0, 0.0, -float(crop_x)],
+            [0.0, 1.0, -float(crop_y)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    forward = crop @ forward
+    if transform.horizontal_flip:
+        horizontal = np.asarray(
+            [
+                [-1.0, 0.0, float(crop_width - 1)],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        forward = horizontal @ forward
+    if transform.vertical_flip:
+        vertical = np.asarray(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, -1.0, float(crop_height - 1)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        forward = vertical @ forward
+
+    width, height = crop_width, crop_height
+    for _ in range(transform.quarter_turns):
+        quarter_turn = np.asarray(
+            [
+                [0.0, 1.0, 0.0],
+                [-1.0, 0.0, float(width - 1)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=np.float64,
+        )
+        forward = quarter_turn @ forward
+        width, height = height, width
+    return forward
+
+
+def _conjugate_affine(
+    matrix: np.ndarray,
+    transform: SpatialTransform,
+) -> np.ndarray:
+    affine = np.eye(3, dtype=np.float64)
+    affine[:2] = matrix.astype(np.float64)
+    forward = _spatial_forward_affine(transform)
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            augmented = forward @ affine @ np.linalg.inv(forward)
+            result = augmented[:2].astype(np.float32)
+    except (FloatingPointError, OverflowError, np.linalg.LinAlgError) as exc:
+        raise ValueError(
+            "augmented alignment must have a finite float32 representation"
+        ) from exc
+    if not np.isfinite(result).all():
+        raise ValueError(
+            "augmented alignment must have a finite float32 representation"
+        )
+    return result
+
+
 def _obb_is_inside(obb: OBB, width: int, height: int) -> bool:
     points = obb_to_points(obb)
     return bool(
@@ -417,6 +503,8 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
         cfg: TemporalOBBConfig,
         clip_spec: ClipSpec,
         training: bool,
+        *,
+        alignment_cache: AlignmentCache | None = None,
     ) -> None:
         if not isinstance(cfg, TemporalOBBConfig):
             raise ValueError("cfg must be a TemporalOBBConfig")
@@ -424,11 +512,25 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             raise ValueError("clip_spec must be a ClipSpec")
         if not isinstance(training, bool):
             raise ValueError("training must be a boolean")
+        if (
+            alignment_cache is not None
+            and not isinstance(alignment_cache, AlignmentCache)
+        ):
+            raise ValueError("alignment_cache must be an AlignmentCache")
 
         self.manifest_path = Path(manifest_path)
         self.cfg = cfg
         self.clip_spec = clip_spec
         self.training = training
+        self._alignment_cache = (
+            alignment_cache
+            if alignment_cache is not None
+            else (
+                AlignmentCache(cfg.output_root / "alignment-cache")
+                if len(clip_spec.offsets) > 1
+                else None
+            )
+        )
         self._records = _load_manifest(self.manifest_path, cfg)
         self._tracks = load_track_index(cfg.metadata_root)
         self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
@@ -581,6 +683,36 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             )
         return classes, local_obbs
 
+    def _local_transforms(
+        self,
+        record: _ManifestRecord,
+        valid: Sequence[bool],
+    ) -> list[np.ndarray]:
+        transforms = []
+        for offset, is_valid in zip(
+            self.clip_spec.offsets,
+            valid,
+            strict=True,
+        ):
+            matrix = np.eye(2, 3, dtype=np.float32)
+            if offset != 0 and is_valid:
+                assert self._alignment_cache is not None
+                key = AlignmentKey(
+                    record.site,
+                    record.sequence,
+                    record.center_frame,
+                    record.center_frame + offset,
+                )
+                result = self._alignment_cache.get(key)
+                if result is None:
+                    raise ValueError(
+                        "required alignment cache entry is missing: "
+                        f"{key}"
+                    )
+                matrix = localize_affine(result.matrix, record.tile)
+            transforms.append(matrix)
+        return transforms
+
     def __getitem__(self, index: int) -> dict[str, object]:
         record = self._records[index]
         center_path = self._frame_path(record, record.center_frame)
@@ -590,17 +722,23 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             )
         self._validate_center_tile(record, center_path)
 
+        support_records = []
+        for offset in self.clip_spec.offsets:
+            image_path = self._frame_path(
+                record,
+                record.center_frame + offset,
+            )
+            support_records.append((image_path, image_path.is_file()))
+        valid = [is_valid for _, is_valid in support_records]
+        local_transforms = self._local_transforms(record, valid)
+
         frames = []
-        valid = []
         support_paths: list[str | None] = []
         zero_frame = torch.zeros(
             (3, record.tile.height, record.tile.width),
             dtype=torch.float32,
         )
-        for offset in self.clip_spec.offsets:
-            image_path = self._frame_path(record, record.center_frame + offset)
-            is_valid = image_path.is_file()
-            valid.append(is_valid)
+        for image_path, is_valid in support_records:
             support_paths.append(str(image_path) if is_valid else None)
             frames.append(
                 self._load_tile(image_path, record.tile)
@@ -624,6 +762,19 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
                 if is_valid
                 else frame
                 for frame, is_valid in zip(frames, valid, strict=True)
+            ]
+            local_transforms = [
+                (
+                    _conjugate_affine(matrix, spatial_transform)
+                    if offset != 0 and is_valid
+                    else matrix
+                )
+                for matrix, offset, is_valid in zip(
+                    local_transforms,
+                    self.clip_spec.offsets,
+                    valid,
+                    strict=True,
+                )
             ]
             transformed = [
                 (class_id, apply_obb_transform(obb, spatial_transform))
@@ -691,11 +842,7 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             "tile_xywh": metadata["tile_xywh"],
             "cls": class_tensor,
             "bboxes": torch.from_numpy(boxes),
-            "transforms": torch.eye(2, 3, dtype=torch.float32).expand(
-                len(frames),
-                -1,
-                -1,
-            ).clone(),
+            "transforms": torch.from_numpy(np.stack(local_transforms)),
             "metadata": metadata,
         }
 

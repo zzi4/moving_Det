@@ -1,10 +1,14 @@
+import json
 import math
 
+import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 import torch
 
 from moving_det.geometry.obb import rotated_iou
+import moving_det.ml.dataset as dataset_module
+import moving_det.ml.training as training_module
 from moving_det.ml.dataset import (
     ClipSpec,
     SpatialTransform,
@@ -12,11 +16,59 @@ from moving_det.ml.dataset import (
     apply_obb_transform,
     collate_temporal_obb,
 )
+from moving_det.motion.alignment import AlignmentResult
 from moving_det.models import OBB
+from moving_det.vrud.alignment import AlignmentCache, AlignmentKey
 from tests.vrud.conftest import temporal_fixture
 
 
+def _cache_required_supports(
+    temporal_fixture,
+    *,
+    offsets=(-4, -2, 0, 2, 4),
+    matrices=None,
+):
+    payload = json.loads(
+        temporal_fixture.manifest.read_text(encoding="utf-8")
+    )
+    cache = AlignmentCache(
+        temporal_fixture.config.output_root / "alignment-cache"
+    )
+    matrices = matrices or {}
+    for offset in offsets:
+        support_frame = payload["center_frame"] + offset
+        support_path = (
+            temporal_fixture.config.image_root
+            / f"{payload['site']}_sequence"
+            / payload["sequence"]
+            / f"{support_frame:06d}.jpg"
+        )
+        if offset == 0 or not support_path.is_file():
+            continue
+        key = AlignmentKey(
+            payload["site"],
+            payload["sequence"],
+            payload["center_frame"],
+            support_frame,
+        )
+        if cache.get(key) is None:
+            cache.put(
+                key,
+                AlignmentResult(
+                    matrix=np.asarray(
+                        matrices.get(offset, np.eye(2, 3)),
+                        dtype=np.float32,
+                    ),
+                    correlation=0.95,
+                    used_fallback=False,
+                    reason=None,
+                ),
+            )
+    return cache
+
+
 def make_mg_dataset(temporal_fixture, *, training: bool = False):
+    _cache_required_supports(temporal_fixture)
     return TemporalClipDataset(
         temporal_fixture.manifest,
         temporal_fixture.config,
@@ -47,6 +99,59 @@ def test_clip_uses_identical_tile_coordinates_for_every_offset(temporal_fixture)
     )
 
 
+def test_temporal_clip_loads_each_exact_cached_support_key(temporal_fixture):
+    matrices = {
+        -4: np.float32([[1.0, 0.0, -4.0], [0.0, 1.0, 1.0]]),
+        -2: np.float32([[1.0, 0.0, -2.0], [0.0, 1.0, 2.0]]),
+        2: np.float32([[1.0, 0.0, 2.0], [0.0, 1.0, 3.0]]),
+        4: np.float32([[1.0, 0.0, 4.0], [0.0, 1.0, 4.0]]),
+    }
+    _cache_required_supports(temporal_fixture, matrices=matrices)
+
+    sample = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod", (-4, -2, 0, 2, 4)),
+        training=False,
+    )[0]
+
+    torch.testing.assert_close(
+        sample["transforms"],
+        torch.from_numpy(
+            np.stack(
+                [
+                    matrices[-4],
+                    matrices[-2],
+                    np.eye(2, 3, dtype=np.float32),
+                    matrices[2],
+                    matrices[4],
+                ]
+            )
+        ),
+        rtol=0,
+        atol=0,
+    )
+    assert sample["transforms"].dtype == torch.float32
+    assert bool(torch.isfinite(sample["transforms"]).all())
+
+
+def test_temporal_clip_fails_closed_when_valid_support_cache_entry_is_missing(
+    temporal_fixture,
+):
+    dataset = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod", (-4, -2, 0, 2, 4)),
+        training=False,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"alignment.*missing|missing.*alignment",
+    ):
+        dataset[0]
+
+
 def test_sequence_boundary_uses_valid_mask_without_frame_copy(temporal_fixture):
     temporal_fixture.set_center_frame(2)
 
@@ -56,6 +161,36 @@ def test_sequence_boundary_uses_valid_mask_without_frame_copy(temporal_fixture):
     assert torch.count_nonzero(sample["frames"][0]) == 0
     assert torch.count_nonzero(sample["frames"][1]) == 0
     assert not torch.equal(sample["frames"][0], sample["frames"][2])
+
+
+def test_missing_supports_need_no_cache_and_keep_identity(temporal_fixture):
+    temporal_fixture.set_center_frame(2)
+    nonidentity = {
+        2: np.float32([[1.0, 0.0, 3.0], [0.0, 1.0, -1.0]]),
+        4: np.float32([[1.0, 0.0, 6.0], [0.0, 1.0, -2.0]]),
+    }
+    _cache_required_supports(temporal_fixture, matrices=nonidentity)
+
+    sample = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod", (-4, -2, 0, 2, 4)),
+        training=False,
+    )[0]
+
+    identity = torch.eye(2, 3)
+    assert sample["valid"].tolist() == [False, False, True, True, True]
+    torch.testing.assert_close(sample["transforms"][0], identity)
+    torch.testing.assert_close(sample["transforms"][1], identity)
+    torch.testing.assert_close(sample["transforms"][2], identity)
+    torch.testing.assert_close(
+        sample["transforms"][3],
+        torch.from_numpy(nonidentity[2]),
+    )
+    torch.testing.assert_close(
+        sample["transforms"][4],
+        torch.from_numpy(nonidentity[4]),
+    )
 
 
 def test_missing_center_frame_is_rejected_instead_of_becoming_padding(
@@ -85,6 +220,258 @@ def test_center_annotation_uses_corrected_vrud_class_and_normalized_obb(
         rtol=0,
     )
     assert sample["metadata"]["track_keys"] == (("site22", "sequence_a", 7),)
+
+
+def test_baseline_clip_does_not_read_or_create_alignment_cache(
+    temporal_fixture,
+):
+    cache_root = temporal_fixture.config.output_root / "alignment-cache"
+
+    sample = make_baseline_dataset(temporal_fixture)[0]
+
+    torch.testing.assert_close(sample["transforms"], torch.eye(2, 3)[None])
+    assert not cache_root.exists()
+
+
+def test_cached_global_affine_is_localized_to_manifest_tile(temporal_fixture):
+    for image_path in temporal_fixture.config.image_root.rglob("*.jpg"):
+        Image.new("RGB", (2048, 2048), color=(0, 0, 0)).save(image_path)
+        json_path = image_path.with_suffix(".json")
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        payload["imageWidth"] = 2048
+        payload["imageHeight"] = 2048
+        json_path.write_text(
+            json.dumps(payload, allow_nan=False),
+            encoding="utf-8",
+        )
+    temporal_fixture.update_manifest(
+        tile_xywh=[768, 768, 1024, 1024],
+        track_keys=[],
+        source="background",
+    )
+    global_matrix = np.float32(
+        [[1.0, 0.25, 3.0], [-0.125, 1.0, -4.0]]
+    )
+    _cache_required_supports(
+        temporal_fixture,
+        matrices={-4: global_matrix},
+    )
+
+    sample = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod", (-4, -2, 0, 2, 4)),
+        training=False,
+    )[0]
+
+    torch.testing.assert_close(
+        sample["transforms"][0],
+        torch.tensor(
+            [[1.0, 0.25, 195.0], [-0.125, 1.0, -100.0]],
+            dtype=torch.float32,
+        ),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_training_conjugates_alignment_into_shared_augmented_coordinates(
+    temporal_fixture,
+    monkeypatch,
+):
+    cached = np.float32(
+        [[0.96, -0.28, 20.0], [0.28, 0.96, -10.0]]
+    )
+    _cache_required_supports(
+        temporal_fixture,
+        matrices={offset: cached for offset in (-4, -2, 2, 4)},
+    )
+    support_center = (404, 502)
+    sequence_dir = (
+        temporal_fixture.config.image_root
+        / "site22_sequence"
+        / "sequence_a"
+    )
+    for support_frame in (1, 3, 7, 9):
+        image = Image.new("RGB", (1024, 1024), color=(0, 0, 0))
+        ImageDraw.Draw(image).rectangle(
+            (
+                support_center[0] - 32,
+                support_center[1] - 10,
+                support_center[0] + 32,
+                support_center[1] + 10,
+            ),
+            fill=(255, 255, 255),
+        )
+        image.save(
+            sequence_dir / f"{support_frame:06d}.jpg",
+            quality=100,
+            subsampling=0,
+        )
+    spatial = SpatialTransform(
+        horizontal_flip=True,
+        vertical_flip=True,
+        quarter_turns=1,
+        scale=1.125,
+        crop_xywh=(64, 48, 1024, 1024),
+    )
+    monkeypatch.setattr(
+        dataset_module,
+        "sample_spatial_transform",
+        lambda _generator, *, image_size: spatial,
+    )
+
+    sample = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod", (-4, -2, 0, 2, 4)),
+        training=True,
+    )[0]
+
+    expected = torch.tensor(
+        [[0.96, -0.28, 36.185024], [0.28, 0.96, -279.92]],
+        dtype=torch.float32,
+    )
+    for support_index in (0, 1, 3, 4):
+        torch.testing.assert_close(
+            sample["transforms"][support_index],
+            expected,
+            rtol=0,
+            atol=2e-5,
+        )
+    torch.testing.assert_close(sample["transforms"][2], torch.eye(2, 3))
+    assert sample["transforms"].dtype == torch.float32
+    assert bool(torch.isfinite(sample["transforms"]).all())
+
+    observed_centers = []
+    for frame in sample["frames"]:
+        y, x = torch.where(frame.mean(dim=0) > 0.5)
+        observed_centers.append(
+            torch.stack((x.float().mean(), y.float().mean()))
+        )
+    center = observed_centers[2]
+    mapped = (
+        expected[:, :2] @ center
+        + expected[:, 2]
+    )
+    torch.testing.assert_close(
+        mapped,
+        observed_centers[0],
+        rtol=0,
+        atol=1.0,
+    )
+    torch.testing.assert_close(
+        sample["bboxes"][0, :2] * 1024,
+        center,
+        rtol=0,
+        atol=1.0,
+    )
+
+
+def test_alignment_conjugation_matches_augmented_pixel_centers():
+    center_point = (25, 20)
+    support_point = (38, 43)
+    center = torch.zeros(3, 64, 64)
+    support = torch.zeros(3, 64, 64)
+    center[:, center_point[1], center_point[0]] = 1.0
+    support[:, support_point[1], support_point[0]] = 1.0
+    spatial = SpatialTransform(
+        horizontal_flip=True,
+        vertical_flip=True,
+        quarter_turns=1,
+        scale=2.0,
+        crop_xywh=(8, 6, 96, 96),
+    )
+
+    augmented_center = dataset_module.apply_image_transform(center, spatial)
+    augmented_support = dataset_module.apply_image_transform(support, spatial)
+
+    def intensity_center(frame):
+        weights = frame.mean(dim=0)
+        y, x = torch.meshgrid(
+            torch.arange(weights.shape[0], dtype=weights.dtype),
+            torch.arange(weights.shape[1], dtype=weights.dtype),
+            indexing="ij",
+        )
+        return torch.stack(
+            (
+                (x * weights).sum() / weights.sum(),
+                (y * weights).sum() / weights.sum(),
+            )
+        )
+
+    observed_center = intensity_center(augmented_center)
+    observed_support = intensity_center(augmented_support)
+    augmented_alignment = torch.from_numpy(
+        dataset_module._conjugate_affine(
+            np.float32([[-1.0, 0.0, 63.0], [0.0, -1.0, 63.0]]),
+            spatial,
+        )
+    )
+    mapped = (
+        augmented_alignment[:, :2] @ observed_center
+        + augmented_alignment[:, 2]
+    )
+
+    torch.testing.assert_close(mapped, observed_support, rtol=0, atol=1e-5)
+
+
+def test_default_temporal_train_validation_and_gate_loaders_consume_cache(
+    temporal_fixture,
+):
+    payload = json.loads(
+        temporal_fixture.manifest.read_text(encoding="utf-8")
+    )
+    validation_payload = {
+        **payload,
+        "split": "validation",
+        "source": "evaluation",
+    }
+    (temporal_fixture.manifest.parent / "validation.jsonl").write_text(
+        json.dumps(validation_payload, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    cached = np.float32([[1.0, 0.0, 7.0], [0.0, 1.0, -3.0]])
+    _cache_required_supports(
+        temporal_fixture,
+        matrices={offset: cached for offset in (-4, -2, 2, 4)},
+    )
+
+    train_loader, validation_loader = training_module._default_loader_factory(
+        "mg_vtod",
+        temporal_fixture.config,
+        temporal_fixture.manifest.parent,
+    )
+    gate_loader = training_module._default_gate_loader_factory(
+        "mg_vtod",
+        temporal_fixture.config,
+        temporal_fixture.manifest.parent,
+    )
+
+    for batch in (
+        next(iter(train_loader)),
+        next(iter(validation_loader)),
+        next(iter(gate_loader)),
+    ):
+        identity = torch.eye(2, 3).expand(5, -1, -1)
+        assert not torch.equal(batch["transforms"][0], identity)
+        assert bool(torch.isfinite(batch["transforms"]).all())
+
+
+def test_default_temporal_gate_loader_cannot_fall_back_when_cache_is_absent(
+    temporal_fixture,
+):
+    loader = training_module._default_gate_loader_factory(
+        "mg_vtod",
+        temporal_fixture.config,
+        temporal_fixture.manifest.parent,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"alignment.*missing|missing.*alignment",
+    ):
+        next(iter(loader))
 
 
 def _training_draw_signature(sample):
