@@ -657,6 +657,49 @@ def test_default_temporal_training_records_one_frozen_alignment_fingerprint(
     assert best["alignment_cache_sha256"] == expected
 
 
+def test_overfit_rejects_custom_training_loaders_with_default_gate_loader(
+    temporal_fixture,
+):
+    manifest, _cache = _prepare_default_temporal_training(temporal_fixture)
+    train_manifest = manifest / "train.jsonl"
+    record = train_manifest.read_text(encoding="utf-8").strip()
+    train_manifest.write_text(
+        "".join(f"{record}\n" for _ in range(64)),
+        encoding="utf-8",
+    )
+    custom_loader_calls: list[str] = []
+
+    def custom_loader_factory(_name, _cfg, _manifest_root):
+        custom_loader_calls.append("called")
+        return [_batch(batch_size=1)], [_batch(batch_size=1)]
+
+    with pytest.raises(
+        ValueError,
+        match="custom loader_factory requires a custom gate_loader_factory",
+    ):
+        train_model(
+            "mg_vtod",
+            replace(
+                temporal_fixture.config,
+                effective_batch_size=1,
+            ),
+            manifest,
+            temporal_fixture.config.output_root / "mixed-loader-run",
+            max_steps=1,
+            hooks=TrainingHooks(
+                model_factory=lambda _name, _weights, _cfg: DatasetTinyOBB(),
+                loader_factory=custom_loader_factory,
+                validator=lambda _model, _loader, _device: {
+                    "map50": 0.25,
+                    "recall_at_riou_025": 0.9,
+                },
+                device="cpu",
+            ),
+        )
+
+    assert custom_loader_calls == []
+
+
 def test_default_temporal_loader_snapshots_must_share_one_fingerprint():
     class Dataset:
         def __init__(self, fingerprint):

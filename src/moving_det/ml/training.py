@@ -94,7 +94,8 @@ class TrainingHooks:
 
     Supplying a custom loader factory is an explicit synthetic/no-cache seam:
     such runs record a null alignment-cache fingerprint.  Default loaders
-    always resolve and validate frozen dataset snapshots.
+    always resolve and validate frozen dataset snapshots.  Overfit runs with
+    custom loaders must also supply a custom gate loader.
     """
 
     model_factory: ModelFactory = create_model
@@ -1507,6 +1508,15 @@ def train_model(
         ):
             raise ValueError(
                 "overfit mode requires exactly 64 frozen train samples"
+            )
+        if (
+            max_steps is not None
+            and selected_hooks.loader_factory is not None
+            and selected_hooks.gate_loader_factory is None
+        ):
+            raise ValueError(
+                "custom loader_factory requires a custom "
+                "gate_loader_factory in overfit mode"
             )
 
         loader_factory = (
