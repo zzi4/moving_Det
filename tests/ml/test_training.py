@@ -1443,3 +1443,280 @@ def test_inherited_best_semantics_are_cross_validated_before_copy(
 
     assert (output / "history.json").read_bytes() == history_sentinel
     assert (output / "best.pt").read_bytes() == best_sentinel
+
+
+def _global_rng_snapshot() -> dict[str, Any]:
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state().clone(),
+        "torch_cuda": [
+            state.clone()
+            for state in torch.cuda.get_rng_state_all()
+        ],
+    }
+
+
+def _assert_global_rng_equal(
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    assert actual["python"] == expected["python"]
+    assert actual["numpy"][0] == expected["numpy"][0]
+    np.testing.assert_array_equal(
+        actual["numpy"][1],
+        expected["numpy"][1],
+    )
+    assert actual["numpy"][2:] == expected["numpy"][2:]
+    torch.testing.assert_close(
+        actual["torch_cpu"],
+        expected["torch_cpu"],
+        rtol=0,
+        atol=0,
+    )
+    assert len(actual["torch_cuda"]) == len(expected["torch_cuda"])
+    for actual_state, expected_state in zip(
+        actual["torch_cuda"],
+        expected["torch_cuda"],
+        strict=True,
+    ):
+        torch.testing.assert_close(
+            actual_state,
+            expected_state,
+            rtol=0,
+            atol=0,
+        )
+
+
+def _consume_all_global_rngs() -> None:
+    random.random()
+    np.random.random()
+    torch.rand(())
+    if torch.cuda.is_available():
+        torch.rand((), device="cuda")
+
+
+@pytest.mark.parametrize("invalid_payload", ["last", "best"])
+def test_rejected_resume_restores_every_caller_global_rng(
+    tmp_path,
+    temporal_config,
+    invalid_payload,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / f"first-rng-{invalid_payload}",
+        hooks=_tiny_hooks(TinyOBB(initial=0.01), map50_values=[0.2]),
+    )
+    checkpoint = (
+        first.last_checkpoint
+        if invalid_payload == "last"
+        else first.best_checkpoint
+    )
+    payload = torch.load(
+        checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    if invalid_payload == "last":
+        payload["history"][0]["epoch"] = "0"
+    else:
+        payload["history"][0]["train_loss"] += 0.125
+    torch.save(payload, checkpoint)
+
+    def model_factory(_name, _weights, _cfg):
+        _consume_all_global_rngs()
+        return TinyOBB(initial=0.875)
+
+    def loader_factory(_name, _cfg, _root):
+        _consume_all_global_rngs()
+        return [_batch() for _ in range(4)], [_batch()]
+
+    random.seed(1701)
+    np.random.seed(1702)
+    torch.manual_seed(1703)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(1704)
+    incoming_rng = _global_rng_snapshot()
+    output = tmp_path / f"rejected-rng-{invalid_payload}"
+
+    with pytest.raises(ValueError, match="history|validation"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=TrainingHooks(
+                model_factory=model_factory,
+                loader_factory=loader_factory,
+                validator=lambda _model, _loader, _device: {
+                    "map50": 0.3,
+                    "recall_at_riou_025": 0.9,
+                },
+                device="cpu",
+            ),
+        )
+
+    _assert_global_rng_equal(_global_rng_snapshot(), incoming_rng)
+    run = json.loads((output / "run.json").read_text())
+    assert run["status"] == "failed"
+
+
+def test_tied_maximum_cannot_move_inherited_best_to_later_epoch(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=2),
+        manifest,
+        tmp_path / "first-tied-best",
+        hooks=_tiny_hooks(
+            TinyOBB(initial=0.01),
+            map50_values=[0.3, 0.3],
+        ),
+    )
+    last_payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert last_payload["epochs_without_improvement"] == 1
+    torch.save(last_payload, first.best_checkpoint)
+
+    with pytest.raises(ValueError, match="best.*epoch|strict improvement"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=3),
+            manifest,
+            tmp_path / "rejected-tied-best",
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(TinyOBB(initial=0.875), map50_values=[0.4]),
+        )
+
+
+def test_last_stale_epoch_count_is_derived_from_strict_improvements(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=4),
+        manifest,
+        tmp_path / "first-stale",
+        hooks=_tiny_hooks(
+            TinyOBB(initial=0.01),
+            map50_values=[0.2, 0.3, 0.3, 0.25],
+        ),
+    )
+    last_payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert last_payload["epochs_without_improvement"] == 2
+    last_payload["epochs_without_improvement"] = 1
+    torch.save(last_payload, first.last_checkpoint)
+
+    with pytest.raises(ValueError, match="stale|epochs_without_improvement"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=5),
+            manifest,
+            tmp_path / "rejected-stale",
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(TinyOBB(initial=0.875), map50_values=[0.4]),
+        )
+
+
+@pytest.mark.parametrize(
+    "probe",
+    ["mismatched_step", "missing_step", "empty_state"],
+)
+def test_best_optimizer_state_step_matches_best_history(
+    tmp_path,
+    temporal_config,
+    probe,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=2),
+        manifest,
+        tmp_path / "first-best-optimizer-step",
+        hooks=_tiny_hooks(
+            TinyOBB(initial=0.01),
+            map50_values=[0.3, 0.2],
+        ),
+    )
+    best_payload = torch.load(
+        first.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    if probe == "empty_state":
+        best_payload["optimizer"]["state"] = {}
+    else:
+        for parameter_state in best_payload["optimizer"]["state"].values():
+            if probe == "mismatched_step":
+                parameter_state["step"] += 1
+            else:
+                parameter_state.pop("step")
+    torch.save(best_payload, first.best_checkpoint)
+
+    with pytest.raises(ValueError, match="best.*optimizer.*step"):
+        train_model(
+            "baseline",
+            replace(temporal_config, pilot_epochs=3),
+            manifest,
+            tmp_path / "rejected-best-optimizer-step",
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(TinyOBB(initial=0.875), map50_values=[0.4]),
+        )
+
+
+def test_valid_multi_improvement_and_ties_resume(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=5),
+        manifest,
+        tmp_path / "first-valid-ties",
+        hooks=_tiny_hooks(
+            TinyOBB(initial=0.01),
+            map50_values=[0.1, 0.3, 0.2, 0.4, 0.4],
+        ),
+    )
+    last_payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    best_payload = torch.load(
+        first.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert last_payload["epochs_without_improvement"] == 1
+    assert best_payload["epoch"] == 3
+    assert best_payload["epochs_without_improvement"] == 0
+
+    resumed = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=6),
+        manifest,
+        tmp_path / "resumed-valid-ties",
+        resume_checkpoint=first.last_checkpoint,
+        hooks=_tiny_hooks(TinyOBB(initial=0.875), map50_values=[0.35]),
+    )
+
+    assert resumed.epochs_completed == 6
+    assert resumed.best_map50 == pytest.approx(0.4)

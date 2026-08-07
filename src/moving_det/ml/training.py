@@ -760,6 +760,30 @@ def _capture_reproducibility_state(train_loader: Any) -> dict[str, Any]:
     return state
 
 
+def _capture_global_rng_state() -> dict[str, Any]:
+    return {
+        "python_random": random.getstate(),
+        "numpy_random": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state().clone(),
+        "torch_cuda": (
+            [
+                state.clone()
+                for state in torch.cuda.get_rng_state_all()
+            ]
+            if torch.cuda.is_available()
+            else None
+        ),
+    }
+
+
+def _restore_global_rng_state(state: Mapping[str, Any]) -> None:
+    random.setstate(state["python_random"])
+    np.random.set_state(state["numpy_random"])
+    torch.set_rng_state(state["torch_cpu"])
+    if torch.cuda.is_available() and state["torch_cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+
+
 def _validate_torch_generator_state(
     raw_state: Any,
     *,
@@ -915,6 +939,52 @@ def _validate_loadable_state_without_mutation(
     return state
 
 
+def _validate_optimizer_step_state(
+    raw_optimizer_state: Mapping[str, Any],
+    *,
+    checkpoint_optimizer_steps: int,
+    label: str,
+) -> None:
+    parameter_states = raw_optimizer_state.get("state")
+    if not isinstance(parameter_states, Mapping):
+        raise ValueError(
+            f"resume {label} optimizer state entries must be a mapping"
+        )
+    if checkpoint_optimizer_steps > 0 and not parameter_states:
+        raise ValueError(
+            f"resume {label} optimizer step state cannot be empty"
+        )
+    for parameter_state in parameter_states.values():
+        if not isinstance(parameter_state, Mapping):
+            raise ValueError(
+                f"resume {label} optimizer parameter state must be a mapping"
+            )
+        if "step" not in parameter_state:
+            raise ValueError(
+                f"resume {label} optimizer step is missing"
+            )
+        raw_step = parameter_state["step"]
+        if isinstance(raw_step, Tensor):
+            if (
+                raw_step.numel() != 1
+                or not bool(torch.isfinite(raw_step).all().item())
+            ):
+                raise ValueError(
+                    f"resume {label} optimizer step is invalid"
+                )
+            step = raw_step.item()
+        else:
+            step = raw_step
+        if (
+            type(step) not in (int, float)
+            or not math.isfinite(step)
+            or step != checkpoint_optimizer_steps
+        ):
+            raise ValueError(
+                f"resume {label} optimizer step does not match history"
+            )
+
+
 def _validate_resume_checkpoint_payload(
     payload: Mapping[str, Any],
     *,
@@ -967,9 +1037,19 @@ def _validate_resume_checkpoint_payload(
         raise ValueError(
             f"resume {label} checkpoint config must be a mapping"
         )
+    raw_optimizer_state = payload.get("optimizer")
+    if not isinstance(raw_optimizer_state, Mapping):
+        raise ValueError(
+            f"resume checkpoint {label} optimizer state must be a mapping"
+        )
+    _validate_optimizer_step_state(
+        raw_optimizer_state,
+        checkpoint_optimizer_steps=payload["optimizer_steps"],
+        label=label,
+    )
     _validate_loadable_state_without_mutation(
         optimizer,
-        payload.get("optimizer"),
+        raw_optimizer_state,
         label=f"{label} optimizer",
     )
     _validate_loadable_state_without_mutation(
@@ -986,6 +1066,23 @@ def _validate_resume_checkpoint_payload(
         train_loader,
     )
     return history
+
+
+def _derive_strict_best(
+    history: list[dict[str, Any]],
+) -> tuple[float, int, int]:
+    best_map50 = -math.inf
+    best_epoch = -1
+    stale_epochs = 0
+    for record in history:
+        map50 = record["map50"]
+        if map50 > best_map50:
+            best_map50 = map50
+            best_epoch = record["epoch"]
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
+    return best_map50, best_epoch, stale_epochs
 
 
 def _validate_resume_pair(
@@ -1037,6 +1134,31 @@ def _validate_resume_pair(
         raise ValueError(
             "resume best checkpoint best_map50 does not match last checkpoint"
         )
+    derived_best_map50, derived_best_epoch, derived_stale_epochs = (
+        _derive_strict_best(last_history)
+    )
+    if last_payload["best_map50"] != derived_best_map50:
+        raise ValueError(
+            "resume last checkpoint best_map50 does not match strict "
+            "improvement history"
+        )
+    if best_payload["epoch"] != derived_best_epoch:
+        raise ValueError(
+            "resume best checkpoint epoch does not match the first strict "
+            "improvement reaching best_map50"
+        )
+    if best_payload["epochs_without_improvement"] != 0:
+        raise ValueError(
+            "resume best checkpoint epochs_without_improvement must be zero"
+        )
+    if (
+        last_payload["epochs_without_improvement"]
+        != derived_stale_epochs
+    ):
+        raise ValueError(
+            "resume last checkpoint stale epochs_without_improvement does "
+            "not match strict improvement history"
+        )
     best_epoch = best_payload["epoch"]
     if best_epoch > last_payload["epoch"]:
         raise ValueError(
@@ -1046,12 +1168,6 @@ def _validate_resume_pair(
         raise ValueError(
             "resume best checkpoint final history map50 does not match "
             "best_map50"
-        )
-    if max(record["map50"] for record in last_history) != last_payload[
-        "best_map50"
-    ]:
-        raise ValueError(
-            "resume last checkpoint best_map50 does not match its history"
         )
     if best_history != last_history[: best_epoch + 1]:
         raise ValueError(
@@ -1191,6 +1307,12 @@ def train_model(
     hooks: TrainingHooks | None = None,
 ) -> TrainResult:
     """Train a model with deterministic provenance and internal checkpoints."""
+    incoming_resume_rng = (
+        _capture_global_rng_state()
+        if resume_checkpoint is not None
+        else None
+    )
+    resume_validation_committed = resume_checkpoint is None
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc)
@@ -1417,6 +1539,7 @@ def train_model(
                     train_loader=train_loader,
                     manifest_dir=manifest_root,
                 )
+                resume_validation_committed = True
                 checkpoint_epoch = resume_payload["epoch"]
                 checkpoint_optimizer_steps = resume_payload[
                     "optimizer_steps"
@@ -1700,10 +1823,17 @@ def train_model(
             )
         raise
     finally:
-        run["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
-        run["elapsed_seconds"] = time.perf_counter() - started_clock
-        if use_amp:
-            run["peak_allocated_memory_bytes"] = int(
-                torch.cuda.max_memory_allocated(device)
-            )
-        _atomic_json_write(output_root / "run.json", run)
+        try:
+            run["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
+            run["elapsed_seconds"] = time.perf_counter() - started_clock
+            if use_amp:
+                run["peak_allocated_memory_bytes"] = int(
+                    torch.cuda.max_memory_allocated(device)
+                )
+            _atomic_json_write(output_root / "run.json", run)
+        finally:
+            if (
+                incoming_resume_rng is not None
+                and not resume_validation_committed
+            ):
+                _restore_global_rng_state(incoming_resume_rng)
