@@ -566,67 +566,134 @@ def _stopped_indices(
     return all_stopped, stopped_by_track
 
 
-def _population_std(values: Sequence[float]) -> float:
-    return float(np.std(np.asarray(values, dtype=np.float64))) if values else 0.0
+def _contiguous_index_runs(
+    indices: Sequence[int],
+    ground_truth: tuple[GroundTruth, ...],
+) -> tuple[tuple[int, ...], ...]:
+    ordered = sorted(indices, key=lambda index: ground_truth[index].frame)
+    runs: list[list[int]] = []
+    for index in ordered:
+        if (
+            not runs
+            or ground_truth[index].frame
+            != ground_truth[runs[-1][-1]].frame + 1
+        ):
+            runs.append([])
+        runs[-1].append(index)
+    return tuple(tuple(run) for run in runs)
 
 
-def _period_pi_circular_std(values: Sequence[float]) -> float:
-    """Finite doubled-angle circular standard deviation for period-pi data."""
-    if not values:
-        return 0.0
-    doubled = 2.0 * np.asarray(values, dtype=np.float64)
-    resultant = math.hypot(
-        float(np.mean(np.cos(doubled))),
-        float(np.mean(np.sin(doubled))),
+def _obb_residual(
+    prediction: Detection,
+    truth: GroundTruth,
+) -> tuple[float, float, float, float, float]:
+    prediction_long = max(prediction.obb.width, prediction.obb.height)
+    prediction_short = min(prediction.obb.width, prediction.obb.height)
+    truth_long = max(truth.obb.width, truth.obb.height)
+    truth_short = min(truth.obb.width, truth.obb.height)
+    return (
+        prediction.obb.cx - truth.obb.cx,
+        prediction.obb.cy - truth.obb.cy,
+        math.log(prediction_long / truth_long),
+        math.log(prediction_short / truth_short),
+        normalize_theta(prediction.obb.theta - truth.obb.theta),
     )
-    safe_resultant = min(
-        1.0,
-        max(resultant, np.finfo(np.float64).tiny),
-    )
-    return 0.5 * math.sqrt(max(0.0, -2.0 * math.log(safe_resultant)))
 
 
 def _jitter_metrics(
     predictions: tuple[Detection, ...],
     ground_truth: tuple[GroundTruth, ...],
     matches: _MatchResult,
-) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
-    errors: dict[str, dict[str, list[float]]] = defaultdict(
-        lambda: {"dx": [], "dy": [], "size": [], "angle": []}
-    )
-    for prediction_index, truth_index in matches.prediction_to_gt.items():
-        prediction = predictions[prediction_index]
-        truth = ground_truth[truth_index]
-        row = errors[_track_key(truth)]
-        row["dx"].append(prediction.obb.cx - truth.obb.cx)
-        row["dy"].append(prediction.obb.cy - truth.obb.cy)
-        row["size"].append(
-            math.log(
-                (prediction.obb.width * prediction.obb.height)
-                / (truth.obb.width * truth.obb.height)
-            )
-        )
-        row["angle"].append(
-            normalize_theta(prediction.obb.theta - truth.obb.theta)
-        )
-    per_track = {}
-    for key, row in errors.items():
-        per_track[key] = {
-            "center_px": math.hypot(
-                _population_std(row["dx"]),
-                _population_std(row["dy"]),
-            ),
-            "size_log": _population_std(row["size"]),
-            "angle_rad": _period_pi_circular_std(row["angle"]),
+) -> tuple[
+    dict[str, float | int],
+    dict[str, dict[str, float | int]],
+]:
+    prediction_by_truth = {
+        truth_index: predictions[prediction_index]
+        for prediction_index, truth_index in matches.prediction_to_gt.items()
+    }
+    truth_by_track: dict[str, list[int]] = defaultdict(list)
+    for truth_index, truth in enumerate(ground_truth):
+        truth_by_track[_track_key(truth)].append(truth_index)
+
+    per_track: dict[str, dict[str, float | int]] = {}
+    for key, indices in sorted(truth_by_track.items()):
+        pair_values: dict[str, list[float]] = {
+            "center_px": [],
+            "long_side_log": [],
+            "short_side_log": [],
+            "angle_rad": [],
         }
-    aggregate = {
+        ordered = sorted(
+            indices,
+            key=lambda index: ground_truth[index].frame,
+        )
+        for first_index, second_index in zip(
+            ordered,
+            ordered[1:],
+        ):
+            if (
+                ground_truth[second_index].frame
+                != ground_truth[first_index].frame + 1
+                or first_index not in prediction_by_truth
+                or second_index not in prediction_by_truth
+            ):
+                continue
+            first = _obb_residual(
+                prediction_by_truth[first_index],
+                ground_truth[first_index],
+            )
+            second = _obb_residual(
+                prediction_by_truth[second_index],
+                ground_truth[second_index],
+            )
+            pair_values["center_px"].append(
+                math.hypot(second[0] - first[0], second[1] - first[1])
+            )
+            pair_values["long_side_log"].append(abs(second[2] - first[2]))
+            pair_values["short_side_log"].append(abs(second[3] - first[3]))
+            pair_values["angle_rad"].append(
+                abs(normalize_theta(second[4] - first[4]))
+            )
+        pair_count = len(pair_values["center_px"])
+        row: dict[str, float | int] = {
+            name: (
+                float(np.mean(values))
+                if values
+                else 0.0
+            )
+            for name, values in pair_values.items()
+        }
+        row["size_log"] = (
+            float(row["long_side_log"])
+            + float(row["short_side_log"])
+        ) / 2.0
+        row["adjacent_pair_count"] = pair_count
+        per_track[key] = row
+
+    eligible = tuple(
+        row
+        for row in per_track.values()
+        if row["adjacent_pair_count"] > 0
+    )
+    aggregate: dict[str, float | int] = {
         name: (
-            float(np.mean([row[name] for row in per_track.values()]))
-            if per_track
+            float(np.mean([float(row[name]) for row in eligible]))
+            if eligible
             else 0.0
         )
-        for name in ("center_px", "size_log", "angle_rad")
+        for name in (
+            "center_px",
+            "long_side_log",
+            "short_side_log",
+            "size_log",
+            "angle_rad",
+        )
     }
+    aggregate["adjacent_pair_count"] = sum(
+        int(row["adjacent_pair_count"])
+        for row in per_track.values()
+    )
     return aggregate, per_track
 
 
@@ -775,14 +842,24 @@ def evaluate_temporal_obb(
     stopped, stopped_by_track = _stopped_indices(continuity_truth)
     per_track: dict[str, dict[str, float | int | None]] = {}
     for key, indices in sorted(continuity_track_indices.items()):
-        ordered = sorted(
-            indices,
-            key=lambda index: continuity_truth[index].frame,
-        )
+        runs = _contiguous_index_runs(indices, continuity_truth)
+        ordered = tuple(index for run in runs for index in run)
         matched = [
             index in continuity_match_025.matched_gt
             for index in ordered
         ]
+        longest_miss = max(
+            (
+                longest_consecutive_miss(
+                    [
+                        index in continuity_match_025.matched_gt
+                        for index in run
+                    ]
+                )
+                for run in runs
+            ),
+            default=0,
+        )
         stopped_track = stopped_by_track[key]
         stopped_matches = sum(
             index in continuity_match_025.matched_gt
@@ -794,7 +871,7 @@ def evaluate_temporal_obb(
             "matched_count_fixed": sum(matched),
             "coverage": sum(matched) / len(indices),
             "coverage_fixed": sum(matched) / len(indices),
-            "longest_miss": longest_consecutive_miss(matched),
+            "longest_miss": longest_miss,
             "stopped_gt_count": len(stopped_track),
             "stopped_recall": (
                 stopped_matches / len(stopped_track)
@@ -910,6 +987,15 @@ def evaluate_temporal_obb(
             ),
             "continuity": (
                 "continuity-universe ground-truth states at the fixed cutoff"
+            ),
+            "jitter": (
+                "adjacent matched-frame changes of detection-vs-GT residuals: "
+                "Euclidean center pixels, absolute long/short-side log deltas, "
+                "and absolute period-pi angle deltas; track means are equally "
+                "weighted and adjacent_pair_count is the summed evidence count"
+            ),
+            "size_log": (
+                "arithmetic mean of long_side_log and short_side_log jitter"
             ),
             "absent_class_ap": None,
             "empty_aggregate": 0.0,

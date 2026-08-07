@@ -243,8 +243,11 @@ def test_sparse_detection_only_frames_cannot_change_continuity_metrics(
     assert track["longest_miss"] == 0
     assert track["jitter"] == {
         "center_px": 0.0,
+        "long_side_log": 0.0,
+        "short_side_log": 0.0,
         "size_log": 0.0,
         "angle_rad": 0.0,
+        "adjacent_pair_count": 1,
     }
 
 
@@ -468,6 +471,19 @@ def test_stopped_recall_uses_whole_eligible_run():
     assert metrics["per_track"]["site19:sequence_a:int:1"]["longest_miss"] == 5
 
 
+def test_longest_miss_never_bridges_distinct_continuity_windows():
+    frames = (1, 2, 301, 302)
+    metrics = evaluate_temporal_obb(
+        (_pred(1), _pred(302)),
+        tuple(_gt(frame) for frame in frames),
+        _cfg(frames=frames),
+    )
+
+    track = metrics["per_track"]["site19:sequence_a:int:1"]
+    assert track["coverage"] == 0.5
+    assert track["longest_miss"] == 1
+
+
 def test_integer_and_string_track_ids_keep_independent_temporal_metrics():
     ground_truth = tuple(
         [
@@ -508,6 +524,108 @@ def test_integer_and_string_track_ids_keep_independent_temporal_metrics():
     assert string_track["stopped_recall"] is None
     assert string_track["coverage"] == 1.0
     assert string_track["jitter"]["center_px"] > 0.9
+    assert string_track["jitter"]["adjacent_pair_count"] == 14
+
+
+def test_gap_separated_residual_offsets_do_not_create_cross_window_jitter():
+    frames = (1, 2, 301, 302)
+    predictions = (
+        _pred(1, cx=10),
+        _pred(2, cx=10),
+        _pred(301, cx=15),
+        _pred(302, cx=15),
+    )
+
+    metrics = evaluate_temporal_obb(
+        predictions,
+        tuple(_gt(frame, cx=10) for frame in frames),
+        _cfg(frames=frames),
+    )
+
+    expected = {
+        "center_px": 0.0,
+        "long_side_log": 0.0,
+        "short_side_log": 0.0,
+        "size_log": 0.0,
+        "angle_rad": 0.0,
+        "adjacent_pair_count": 2,
+    }
+    assert metrics["jitter"] == expected
+    assert metrics["per_track"]["site19:sequence_a:int:1"]["jitter"] == expected
+
+
+def test_equal_area_opposite_side_changes_report_both_side_jitters():
+    ground_truth = (_gt(1), _gt(2))
+    predictions = (
+        _pred(1, width=16.0, height=12.5),
+        _pred(2, width=25.0, height=8.0),
+    )
+
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _cfg(frames=(1, 2)),
+    )
+
+    expected_delta = math.log(25.0 / 16.0)
+    jitter = metrics["jitter"]
+    assert jitter["long_side_log"] == pytest.approx(expected_delta)
+    assert jitter["short_side_log"] == pytest.approx(expected_delta)
+    assert jitter["size_log"] == pytest.approx(expected_delta)
+    assert jitter["adjacent_pair_count"] == 1
+
+
+def test_jitter_aggregate_weights_tracks_not_adjacent_pairs():
+    ground_truth = (
+        _gt(1, track=1, cx=10),
+        _gt(2, track=1, cx=10),
+        _gt(1, track=2, cx=50),
+        _gt(2, track=2, cx=50),
+        _gt(3, track=2, cx=50),
+        _gt(4, track=2, cx=50),
+    )
+    predictions = (
+        _pred(1, cx=10),
+        _pred(2, cx=12),
+        _pred(1, cx=50),
+        _pred(2, cx=50),
+        _pred(3, cx=50),
+        _pred(4, cx=50),
+    )
+
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _cfg(frames=(1, 2, 3, 4)),
+    )
+
+    first = metrics["per_track"]["site19:sequence_a:int:1"]["jitter"]
+    second = metrics["per_track"]["site19:sequence_a:int:2"]["jitter"]
+    assert first["center_px"] == 2.0
+    assert first["adjacent_pair_count"] == 1
+    assert second["center_px"] == 0.0
+    assert second["adjacent_pair_count"] == 3
+    assert metrics["jitter"]["center_px"] == 1.0
+    assert metrics["jitter"]["adjacent_pair_count"] == 4
+
+
+def test_single_matched_state_has_finite_zero_pair_jitter():
+    metrics = evaluate_temporal_obb(
+        (_pred(1),),
+        (_gt(1), _gt(2)),
+        _cfg(frames=(1, 2)),
+    )
+
+    expected = {
+        "center_px": 0.0,
+        "long_side_log": 0.0,
+        "short_side_log": 0.0,
+        "size_log": 0.0,
+        "angle_rad": 0.0,
+        "adjacent_pair_count": 0,
+    }
+    assert metrics["jitter"] == expected
+    assert metrics["per_track"]["site19:sequence_a:int:1"]["jitter"] == expected
 
 
 def test_periodic_angle_and_center_size_jitter_are_wrap_safe():
@@ -526,11 +644,16 @@ def test_periodic_angle_and_center_size_jitter_are_wrap_safe():
         _cfg(frames=(1, 2)),
     )
 
-    assert metrics["jitter"]["center_px"] == pytest.approx(1.0)
+    assert metrics["jitter"]["center_px"] == pytest.approx(2.0)
+    assert metrics["jitter"]["long_side_log"] == pytest.approx(
+        abs(math.log(21 / 20) - math.log(19 / 20))
+    )
+    assert metrics["jitter"]["short_side_log"] == 0.0
     assert metrics["jitter"]["size_log"] == pytest.approx(
         abs(math.log(21 / 20) - math.log(19 / 20)) / 2
     )
-    assert metrics["jitter"]["angle_rad"] < 0.03
+    assert metrics["jitter"]["angle_rad"] == pytest.approx(0.04)
+    assert metrics["jitter"]["adjacent_pair_count"] == 1
 
 
 def test_period_pi_angle_jitter_is_circular_at_residual_boundary():
@@ -548,9 +671,10 @@ def test_period_pi_angle_jitter_is_circular_at_residual_boundary():
     )
 
     assert metrics["jitter"]["angle_rad"] == pytest.approx(
-        epsilon,
+        2 * epsilon,
         rel=0.02,
     )
+    assert math.isfinite(metrics["jitter"]["angle_rad"])
 
 
 def test_empty_behavior_is_explicit_and_finite():
