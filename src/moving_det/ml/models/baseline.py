@@ -59,6 +59,11 @@ class BaselineOBB(nn.Module):
         super().__init__()
         self.detector = create_p2_obb_detector(weights=weights, nc=nc)
 
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        self.detector.criterion = None
+        return result
+
     def forward(self, batch: Mapping[str, Any]) -> Any:
         image = batch["img"]
         if not isinstance(image, Tensor):
@@ -70,7 +75,7 @@ class BaselineOBB(nn.Module):
         batch: Mapping[str, Any],
     ) -> tuple[Tensor, dict[str, Tensor]]:
         predictions = self.forward(batch)
-        if not hasattr(self.detector, "criterion"):
+        if getattr(self.detector, "criterion", None) is None:
             self.detector.criterion = self.detector.init_criterion()
         loss_values, components = self.detector.criterion(predictions, batch)
 
