@@ -3442,6 +3442,34 @@ def _downsample_diagnostic(tensor: object) -> list[list[float]]:
     )
 
 
+def _learned_p2_offset_magnitude(diagnostic: Mapping[str, object]) -> object:
+    import torch
+
+    try:
+        value = torch.as_tensor(
+            diagnostic["p2_short_offset_magnitude"],
+            dtype=torch.float32,
+        )
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise WorkflowError(
+            "LSTFE learned P2 deformable offset diagnostic is missing or invalid"
+        ) from exc
+    if (
+        value.ndim != 4
+        or value.shape[0] != 1
+        or value.shape[1] != 1
+        or value.shape[2] <= 0
+        or value.shape[3] <= 0
+        or not torch.isfinite(value).all()
+        or bool((value < 0).any())
+    ):
+        raise WorkflowError(
+            "LSTFE learned P2 deformable offset diagnostic must be a finite "
+            "non-negative [1,1,H,W] tensor"
+        )
+    return value
+
+
 def _extract_model_diagnostic(
     model: object,
     clip: Mapping[str, object],
@@ -3507,9 +3535,9 @@ def _extract_model_diagnostic(
                 selected_long_index = int(
                     diagnostic["selected_long_index"].item()
                 )
-                residual = diagnostic["p2_short_residual"]
-                magnitude = residual.abs().mean(dim=1, keepdim=True)
-                alignment_map = _downsample_diagnostic(magnitude)
+                alignment_map = _downsample_diagnostic(
+                    _learned_p2_offset_magnitude(diagnostic)
+                )
     finally:
         for module, state in module_states:
             module.training = state

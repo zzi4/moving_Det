@@ -121,7 +121,7 @@ class ShortTermAlign(nn.Module):
         current: Tensor,
         supports: Tensor,
         valid: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         batch, channels, height, width = _validate_feature_pair(
             current,
             supports,
@@ -135,15 +135,30 @@ class ShortTermAlign(nn.Module):
 
         aligned_slots: list[Tensor] = []
         logit_slots: list[Tensor] = []
+        offset_magnitude_slots: list[Tensor] = []
         for slot in range(2):
             aligned = torch.zeros_like(current)
             logits = current.new_zeros((batch, height, width))
+            offset_magnitude = current.new_zeros((batch, height, width))
             active = valid[:, slot].nonzero(as_tuple=False).flatten()
             if active.numel() > 0:
                 active_current = current.index_select(0, active)
                 active_support = supports[:, slot].index_select(0, active)
                 offsets = self.offset(
                     torch.cat((active_current, active_support), dim=1)
+                )
+                active_offset_magnitude = (
+                    offsets.reshape(
+                        active.shape[0],
+                        9,
+                        2,
+                        height,
+                        width,
+                    )
+                    .square()
+                    .sum(dim=2)
+                    .sqrt()
+                    .mean(dim=1)
                 )
                 active_aligned = deform_conv2d(
                     active_support,
@@ -165,10 +180,17 @@ class ShortTermAlign(nn.Module):
                 ).squeeze(1)
                 aligned = aligned.index_copy(0, active, active_aligned)
                 logits = logits.index_copy(0, active, active_logits)
+                offset_magnitude = offset_magnitude.index_copy(
+                    0,
+                    active,
+                    active_offset_magnitude,
+                )
             aligned_slots.append(aligned)
             logit_slots.append(logits)
+            offset_magnitude_slots.append(offset_magnitude)
 
         aligned_supports = torch.stack(aligned_slots, dim=1)
+        offset_magnitudes = torch.stack(offset_magnitude_slots, dim=1)
         logits = torch.stack(logit_slots, dim=1)
         valid_spatial = valid[:, :, None, None]
         masked_logits = logits.masked_fill(~valid_spatial, -torch.inf)
@@ -183,7 +205,7 @@ class ShortTermAlign(nn.Module):
         residual = (
             weights[:, :, None] * aligned_supports
         ).sum(dim=1)
-        return residual, aligned_supports, weights
+        return residual, aligned_supports, weights, offset_magnitudes
 
     def forward(
         self,
@@ -191,7 +213,7 @@ class ShortTermAlign(nn.Module):
         supports: Tensor,
         valid: Tensor,
     ) -> Tensor:
-        residual, _, _ = self.forward_with_diagnostics(
+        residual, _, _, _ = self.forward_with_diagnostics(
             current,
             supports,
             valid,
@@ -775,14 +797,14 @@ class LSTFEOBB(BaselineOBB):
         p3_current = p3_by_time[:, self.current_index]
         p2_short = p2_by_time[:, self.short_indices]
         p3_short = p3_by_time[:, self.short_indices]
-        p2_residual, p2_aligned, p2_weights = (
+        p2_residual, p2_aligned, p2_weights, p2_offset_magnitudes = (
             self.p2_align.forward_with_diagnostics(
                 p2_current,
                 p2_short,
                 short_valid,
             )
         )
-        p3_residual, p3_aligned, p3_weights = (
+        p3_residual, p3_aligned, p3_weights, _ = (
             self.p3_align.forward_with_diagnostics(
                 p3_current,
                 p3_short,
@@ -819,6 +841,9 @@ class LSTFEOBB(BaselineOBB):
             long_to_short=self.p3_long_to_short,
             short_to_current=self.p3_short_to_current,
         )
+        p2_short_offset_magnitude = (
+            p2_weights * p2_offset_magnitudes
+        ).sum(dim=1, keepdim=True)
         predictions = execute_yolo_graph(
             self.detector,
             current_image,
@@ -832,6 +857,7 @@ class LSTFEOBB(BaselineOBB):
             "valid_support_rows": executed_rows - frames.shape[0],
             "p2_short_residual": p2_residual,
             "p3_short_residual": p3_residual,
+            "p2_short_offset_magnitude": p2_short_offset_magnitude,
             "p2_attention_shape": self.p2_short_to_current.last_attention_shape,
             "p3_attention_shape": self.p3_short_to_current.last_attention_shape,
         }

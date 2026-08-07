@@ -571,6 +571,12 @@ def test_lstfe_diagnostic_uses_eval_without_bn_drift_and_restores_all_states(
             return residual, {
                 "selected_long_index": torch.tensor(1),
                 "p2_short_residual": residual,
+                "p2_short_offset_magnitude": torch.zeros(
+                    residual.shape[0],
+                    1,
+                    residual.shape[2],
+                    residual.shape[3],
+                ),
             }
 
     model = DiagnosticModel()
@@ -612,6 +618,137 @@ def test_lstfe_diagnostic_uses_eval_without_bn_drift_and_restores_all_states(
     assert observed_states == [(False, False, False)]
     assert torch.equal(model.bn.running_mean, original_mean)
     assert tuple(module.training for module in model.modules()) == original_states
+
+
+@REQUIRES_TORCH
+def test_cli_lstfe_alignment_map_consumes_only_learned_offset_diagnostic(
+    tmp_path,
+):
+    import torch
+
+    from moving_det.vrud.tiling import Tile
+
+    class DiagnosticModel(torch.nn.Module):
+        def forward_with_diagnostics(self, batch):
+            height = batch["frames"].shape[-2] // 4
+            width = batch["frames"].shape[-1] // 4
+            offset_magnitude = torch.zeros((1, 1, height, width))
+            offset_magnitude[:, :, :, width // 2 :] = 8.0
+            unrelated_residual = torch.full(
+                (1, 3, height, width),
+                100.0,
+            )
+            return unrelated_residual, {
+                "selected_long_index": torch.tensor(2),
+                "p2_short_residual": unrelated_residual,
+                "p2_short_offset_magnitude": offset_magnitude,
+            }
+
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        tile_size=8,
+        tile_overlap=0,
+    )
+    offsets = (-30, -15, -2, 0, 2, 15, 30)
+    clip = {
+        "frames": torch.ones((7, 3, 8, 8), dtype=torch.float32),
+        "valid": torch.ones((7,), dtype=torch.bool),
+        "transforms": torch.eye(2, 3).repeat(7, 1, 1),
+        "zero_index": 3,
+        "frame": 31,
+        "metadata": {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "frame_shape": (8, 8),
+            "offsets": offsets,
+            "support_paths": tuple(f"/source/{offset}.jpg" for offset in offsets),
+        },
+    }
+
+    diagnostic = _extract_model_diagnostic(
+        DiagnosticModel(),
+        clip,
+        "lstfe",
+        cfg,
+        diagnostic_tile=Tile(0, 0, 8, 8),
+    )
+
+    magnitude = np.asarray(
+        diagnostic["short_alignment_magnitude"],
+        dtype=np.float32,
+    )
+    assert magnitude.shape == (180, 320)
+    assert magnitude[90, 0] == 0.0
+    assert magnitude[90, -1] == 1.0
+    assert diagnostic["selected_long_index"] == 2
+
+
+@REQUIRES_TORCH
+@pytest.mark.parametrize(
+    "defect",
+    ("missing", "wrong-shape", "nonfinite", "negative"),
+)
+def test_cli_lstfe_missing_or_malformed_learned_offset_fails_closed(
+    tmp_path,
+    defect,
+):
+    import torch
+
+    from moving_det.vrud.tiling import Tile
+
+    class DiagnosticModel(torch.nn.Module):
+        def forward_with_diagnostics(self, batch):
+            diagnostic = {
+                "selected_long_index": torch.tensor(1),
+                "p2_short_residual": torch.ones((1, 3, 2, 2)),
+            }
+            if defect == "wrong-shape":
+                diagnostic["p2_short_offset_magnitude"] = torch.zeros(
+                    (1, 2, 2, 2)
+                )
+            elif defect == "nonfinite":
+                diagnostic["p2_short_offset_magnitude"] = torch.full(
+                    (1, 1, 2, 2),
+                    float("nan"),
+                )
+            elif defect == "negative":
+                diagnostic["p2_short_offset_magnitude"] = torch.full(
+                    (1, 1, 2, 2),
+                    -0.1,
+                )
+            return torch.zeros((1, 3, 2, 2)), diagnostic
+
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        tile_size=8,
+        tile_overlap=0,
+    )
+    offsets = (-30, -15, -2, 0, 2, 15, 30)
+    clip = {
+        "frames": torch.ones((7, 3, 8, 8), dtype=torch.float32),
+        "valid": torch.ones((7,), dtype=torch.bool),
+        "transforms": torch.eye(2, 3).repeat(7, 1, 1),
+        "zero_index": 3,
+        "frame": 31,
+        "metadata": {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "frame_shape": (8, 8),
+            "offsets": offsets,
+            "support_paths": tuple(f"/source/{offset}.jpg" for offset in offsets),
+        },
+    }
+
+    with pytest.raises(WorkflowError, match="learned P2 deformable offset"):
+        _extract_model_diagnostic(
+            DiagnosticModel(),
+            clip,
+            "lstfe",
+            cfg,
+            diagnostic_tile=Tile(0, 0, 8, 8),
+        )
 
 
 def test_temporal_checkpoint_must_match_single_alignment_snapshot():

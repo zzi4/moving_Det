@@ -117,7 +117,7 @@ def test_short_alignment_uses_deformable_offsets_and_safe_masking():
         dtype=torch.bool,
     )
 
-    residual, aligned, weights = align.forward_with_diagnostics(
+    residual, aligned, weights, offset_magnitude = align.forward_with_diagnostics(
         current,
         supports,
         valid,
@@ -128,14 +128,59 @@ def test_short_alignment_uses_deformable_offsets_and_safe_masking():
     assert residual.shape == current.shape
     assert aligned.shape == supports.shape
     assert weights.shape == (3, 2, 9, 11)
+    assert offset_magnitude.shape == (3, 2, 9, 11)
     torch.testing.assert_close(weights[0].sum(0), torch.ones(9, 11))
     torch.testing.assert_close(weights[1, 0], torch.ones(9, 11))
     assert torch.count_nonzero(weights[1, 1]) == 0
     assert torch.count_nonzero(residual[2]) == 0
     assert torch.count_nonzero(aligned[2]) == 0
+    assert torch.count_nonzero(offset_magnitude[2]) == 0
     assert torch.isfinite(residual).all()
     assert align.offset.weight.grad is not None
     assert torch.isfinite(align.offset.weight.grad).all()
+
+
+def test_short_alignment_diagnostic_is_actual_mean_deform_offset_magnitude():
+    align = ShortTermAlign(channels=4)
+    with torch.no_grad():
+        align.offset.weight.zero_()
+        align.offset.bias.copy_(
+            torch.tensor([3.0, 4.0] * 9, dtype=torch.float32)
+        )
+    current = torch.zeros(2, 4, 7, 9)
+    supports = torch.stack(
+        (
+            torch.full((2, 4, 7, 9), -100.0),
+            torch.full((2, 4, 7, 9), 250.0),
+        ),
+        dim=1,
+    )
+    valid = torch.tensor(
+        [[True, True], [True, False]],
+        dtype=torch.bool,
+    )
+
+    _, _, _, offset_magnitude = align.forward_with_diagnostics(
+        current,
+        supports,
+        valid,
+    )
+
+    assert offset_magnitude.shape == (2, 2, 7, 9)
+    torch.testing.assert_close(
+        offset_magnitude[0],
+        torch.full((2, 7, 9), 5.0),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        offset_magnitude[1, 0],
+        torch.full((7, 9), 5.0),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.count_nonzero(offset_magnitude[1, 1]) == 0
+    assert torch.isfinite(offset_magnitude).all()
 
 
 def test_short_alignment_does_not_send_invalid_rows_to_deform_conv(monkeypatch):
@@ -157,9 +202,68 @@ def test_short_alignment_does_not_send_invalid_rows_to_deform_conv(monkeypatch):
         dtype=torch.bool,
     )
 
-    align(current, supports, valid)
+    _, _, _, offset_magnitude = align.forward_with_diagnostics(
+        current,
+        supports,
+        valid,
+    )
 
     assert seen_batch_sizes == [2, 1]
+    assert torch.count_nonzero(offset_magnitude[~valid]) == 0
+
+
+def test_model_p2_offset_diagnostic_uses_exact_short_alignment_weights(
+    monkeypatch,
+):
+    import types
+
+    model = LSTFEOBB(weights=None).eval()
+    valid = torch.tensor(
+        [
+            [False, False, True, True, True, False, False],
+            [False, False, False, True, False, False, False],
+        ],
+        dtype=torch.bool,
+    )
+    batch = _synthetic_batch(batch_size=2, valid=valid)
+
+    def controlled_p2_diagnostic(self, current, supports, short_valid):
+        batch_size, channels, height, width = current.shape
+        aligned = current.new_zeros(
+            (batch_size, 2, channels, height, width)
+        )
+        weights = current.new_zeros((batch_size, 2, height, width))
+        weights[0, 0] = 0.25
+        weights[0, 1] = 0.75
+        slot_magnitudes = current.new_zeros(
+            (batch_size, 2, height, width)
+        )
+        slot_magnitudes[0, 0] = 2.0
+        slot_magnitudes[0, 1] = 6.0
+        residual = (
+            weights[:, :, None] * aligned
+        ).sum(dim=1)
+        return residual, aligned, weights, slot_magnitudes
+
+    monkeypatch.setattr(
+        model.p2_align,
+        "forward_with_diagnostics",
+        types.MethodType(controlled_p2_diagnostic, model.p2_align),
+    )
+
+    with torch.inference_mode():
+        _, diagnostics = model.forward_with_diagnostics(batch)
+
+    magnitude = diagnostics["p2_short_offset_magnitude"]
+    assert magnitude.shape[0:2] == (2, 1)
+    torch.testing.assert_close(
+        magnitude[0],
+        torch.full_like(magnitude[0], 5.0),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.count_nonzero(magnitude[1]) == 0
+    assert torch.isfinite(magnitude).all()
 
 
 def test_long_selector_chooses_lowest_cosine_similarity_and_first_tie():

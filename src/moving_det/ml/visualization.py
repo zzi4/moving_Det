@@ -570,7 +570,10 @@ def _render_canvas(sample: PanelSample) -> Image.Image:
             "LSTFE-OBB",
             sample.lstfe,
             sample.short_alignment_magnitude,
-            f"LSTFE short-alignment magnitude; selected {selected}",
+            (
+                "LSTFE normalized weighted learned P2 deformable-offset "
+                f"magnitude; selected {selected}"
+            ),
         ),
     )
     crop_xyxy = _comparison_crop(sample)

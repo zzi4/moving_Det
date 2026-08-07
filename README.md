@@ -178,7 +178,8 @@ conda run -n moving-det-vru moving-det-vru audit-sample \
   `F1@rIoU 0.25` 的全局阈值；test 只加载，不重新选择。
 - `<comparison>/metrics.json`：基线、MG、LSTFE 指标和两个五条件 gate。
 - `<comparison>/overlays/*.jpg`：同一帧三模型 OBB、MG 软运动图和 LSTFE
-  长短期诊断面板。支持帧、GT、预测与热图统一裁到同一个代表性
+  长期帧选择及归一化的 P2 学习可变形偏移幅值诊断面板（偏移值位于 P2 特征图
+  采样坐标，不是原图像素位移）。支持帧、GT、预测与热图统一裁到同一个代表性
   `diagnostic_tile_xywh`，避免把 tile 诊断图拉伸为整张 4K。
 
 所有 JSON 禁止 NaN/Infinity；文件写入采用同目录临时文件或完整 staging 目录后
