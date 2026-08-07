@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "moving-det"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26,<3",
   "opencv-python-headless>=4.10,<5",
@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9"]
+ml = ["ultralytics==8.4.115"]
 
 [project.scripts]
 moving-det = "moving_det.cli:main"

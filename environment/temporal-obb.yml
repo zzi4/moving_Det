@@ -1,0 +1,11 @@
+name: moving-det-vru
+channels: [pytorch, nvidia, conda-forge]
+dependencies:
+  - python=3.11
+  - pytorch=2.5.1
+  - torchvision=0.20.1
+  - pytorch-cuda=12.4
+  - pip
+  - pip:
+      - ultralytics==8.4.115
+      - -e ".[dev,ml]"

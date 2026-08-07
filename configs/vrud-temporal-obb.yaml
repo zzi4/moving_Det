@@ -1,0 +1,27 @@
+image_root: /mnt/nas/Processing_data/site19_22_sequence
+metadata_root: /mnt/nas/Processing_data/VRUD
+output_root: runs/vrud-pilot
+pretrained_weights: yolo11m-obb.pt
+seed: 20260806
+fps: 30
+tile_size: 1024
+tile_overlap: 256
+train_stride: 5
+eval_stride: 15
+max_centers_per_track: 32
+max_positive_clips_per_class: 5000
+negative_fraction: 0.25
+mg_offsets: [-4, -2, 0, 2, 4]
+lstfe_offsets: [-30, -15, -2, 0, 2, 15, 30]
+ecc_min_correlation: 0.8
+ecc_max_translation: 20.0
+ecc_max_rotation_degrees: 2.0
+optimizer: AdamW
+learning_rate: 0.0002
+weight_decay: 0.01
+warmup_epochs: 3
+pilot_epochs: 80
+early_stopping_patience: 15
+effective_batch_size: 16
+nms_iou: 0.5
+max_false_detections_per_frame: 5.0
