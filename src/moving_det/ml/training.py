@@ -10,11 +10,13 @@ import math
 import os
 from pathlib import Path
 import platform
+import random
 import subprocess
 import tempfile
 import time
 from typing import Any
 
+import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.optim import AdamW, Optimizer
@@ -36,12 +38,17 @@ _MANIFEST_ARTIFACTS = (
     "test.jsonl",
     "exclusions.csv",
     "class-audit.json",
+    "manifest.json",
 )
 
 ModelFactory = Callable[[str, Path | str | None, TemporalOBBConfig], nn.Module]
 LoaderFactory = Callable[
     [str, TemporalOBBConfig, Path],
     tuple[Iterable[Mapping[str, Any]], Iterable[Mapping[str, Any]]],
+]
+GateLoaderFactory = Callable[
+    [str, TemporalOBBConfig, Path],
+    Iterable[Mapping[str, Any]],
 ]
 Validator = Callable[
     [nn.Module, Iterable[Mapping[str, Any]], torch.device],
@@ -56,6 +63,7 @@ class TrainingHooks:
 
     model_factory: ModelFactory = create_model
     loader_factory: LoaderFactory | None = None
+    gate_loader_factory: GateLoaderFactory | None = None
     validator: Validator | None = None
     on_optimizer_step: StepObserver | None = None
     device: str | torch.device | None = None
@@ -88,14 +96,34 @@ def build_optimizer(
 
 def manifest_fingerprint(manifest_dir: Path) -> str:
     """Hash the frozen manifest names and bytes in a platform-independent order."""
-    root = Path(manifest_dir)
+    root_path = Path(manifest_dir)
+    if root_path.is_symlink():
+        raise ValueError("manifest directory cannot be a symlink")
+    try:
+        root = root_path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"manifest directory does not exist: {root_path}"
+        ) from exc
+    if not root.is_dir():
+        raise ValueError(f"manifest root is not a directory: {root}")
     digest = hashlib.sha256()
-    for relative_name in _MANIFEST_ARTIFACTS:
+    for relative_name in sorted(_MANIFEST_ARTIFACTS):
         path = root / relative_name
-        if not path.is_file():
-            raise ValueError(f"manifest artifact does not exist: {path}")
+        if path.is_symlink():
+            raise ValueError(f"manifest artifact cannot be a symlink: {path}")
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise ValueError(
+                f"manifest artifact must be a regular file inside the root: {path}"
+            ) from exc
+        if not resolved.is_relative_to(root) or not path.is_file():
+            raise ValueError(
+                f"manifest artifact must be a regular file inside the root: {path}"
+            )
         name_bytes = relative_name.encode("utf-8")
-        content = path.read_bytes()
+        content = resolved.read_bytes()
         digest.update(len(name_bytes).to_bytes(8, byteorder="big"))
         digest.update(name_bytes)
         digest.update(len(content).to_bytes(8, byteorder="big"))
@@ -218,6 +246,32 @@ def _allowed_temporal_parameter_names(model: nn.Module) -> set[str]:
     return set(names)
 
 
+def _validate_model_state(
+    model: nn.Module,
+    source_state: Mapping[str, Any],
+) -> set[str]:
+    target_state = model.state_dict()
+    allowed_missing = _allowed_temporal_parameter_names(model)
+    missing = set(target_state).difference(source_state)
+    unexpected = set(source_state).difference(target_state)
+    incompatible = {
+        name
+        for name in set(target_state).intersection(source_state)
+        if not isinstance(source_state[name], Tensor)
+        or source_state[name].shape != target_state[name].shape
+        or source_state[name].dtype != target_state[name].dtype
+    }
+    invalid_missing = missing.difference(allowed_missing)
+    if invalid_missing or unexpected or incompatible:
+        raise ValueError(
+            "checkpoint is incompatible with target temporal model: "
+            f"missing={sorted(invalid_missing)}, "
+            f"unexpected={sorted(unexpected)}, "
+            f"incompatible={sorted(incompatible)}"
+        )
+    return allowed_missing
+
+
 def load_experiment_checkpoint(
     model: nn.Module,
     checkpoint: Path,
@@ -230,31 +284,9 @@ def load_experiment_checkpoint(
         Path(expected_manifest),
     )
     source_state = dict(payload["model"])
-    target_state = model.state_dict()
-    detector_names = {
-        name for name in target_state
-        if name.startswith("detector.")
-    }
-    missing_detector = detector_names.difference(source_state)
-    mismatched_detector = {
-        name
-        for name in detector_names.intersection(source_state)
-        if not isinstance(source_state[name], Tensor)
-        or source_state[name].shape != target_state[name].shape
-    }
-    if missing_detector or mismatched_detector:
-        raise ValueError(
-            "checkpoint is incompatible with target temporal model: "
-            "detector tensors are missing or have different shapes"
-        )
+    allowed_missing = _validate_model_state(model, source_state)
 
-    allowed_missing = _allowed_temporal_parameter_names(model)
-    try:
-        incompatibility = model.load_state_dict(source_state, strict=False)
-    except RuntimeError as exc:
-        raise ValueError(
-            "checkpoint is incompatible with target temporal model"
-        ) from exc
+    incompatibility = model.load_state_dict(source_state, strict=False)
     invalid_missing = set(incompatibility.missing_keys).difference(
         allowed_missing
     )
@@ -315,6 +347,26 @@ def _default_loader_factory(
     )
 
 
+def _default_gate_loader_factory(
+    model_name: str,
+    cfg: TemporalOBBConfig,
+    manifest_dir: Path,
+) -> DataLoader:
+    evidence = TemporalClipDataset(
+        manifest_dir / "train.jsonl",
+        cfg,
+        _clip_spec(model_name, cfg),
+        training=False,
+    )
+    return DataLoader(
+        evidence,
+        batch_size=1,
+        shuffle=False,
+        num_workers=0,
+        collate_fn=collate_temporal_obb,
+    )
+
+
 def _default_validator(
     _model: nn.Module,
     _loader: Iterable[Mapping[str, Any]],
@@ -343,7 +395,7 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def _atomic_json_write(path: Path, payload: Mapping[str, Any]) -> None:
+def _atomic_json_write(path: Path, payload: Any) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -400,53 +452,6 @@ def _dependency_versions() -> dict[str, str | None]:
         except importlib.metadata.PackageNotFoundError:
             versions[name] = None
     return versions
-
-
-def _runtime_provenance(
-    model_name: str,
-    cfg: TemporalOBBConfig,
-    manifest_dir: Path,
-    *,
-    device: torch.device,
-    load_provenance: Mapping[str, Any],
-    started_at: datetime,
-) -> dict[str, Any]:
-    gpu = []
-    if torch.cuda.is_available():
-        gpu = [
-            {
-                "index": index,
-                "name": torch.cuda.get_device_name(index),
-                "total_memory_bytes": torch.cuda.get_device_properties(
-                    index
-                ).total_memory,
-            }
-            for index in range(torch.cuda.device_count())
-        ]
-    dirty_output = _git_value(["status", "--porcelain"])
-    return {
-        "seed": cfg.seed,
-        "git_commit": _git_value(["rev-parse", "HEAD"]),
-        "git_dirty": None if dirty_output is None else bool(dirty_output),
-        "dependencies": _dependency_versions(),
-        "gpu": gpu,
-        "cuda": {
-            "available": torch.cuda.is_available(),
-            "runtime_version": torch.version.cuda,
-            "device_count": torch.cuda.device_count(),
-            "selected_device": str(device),
-        },
-        "started_at_utc": started_at.isoformat(),
-        "finished_at_utc": None,
-        "elapsed_seconds": None,
-        "peak_allocated_memory_bytes": 0,
-        "manifest_sha256": manifest_fingerprint(manifest_dir),
-        "model_name": model_name,
-        "pretrained_weights": cfg.pretrained_weights,
-        "load_provenance": dict(load_provenance),
-        "amp_enabled": device.type == "cuda",
-        "status": "running",
-    }
 
 
 def _move_batch(
@@ -516,11 +521,153 @@ def _training_record_count(manifest_dir: Path) -> int:
         raise ValueError(f"failed to read overfit manifest: {path}") from exc
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _component_state(component: Any) -> Any | None:
+    state_dict = getattr(component, "state_dict", None)
+    if callable(state_dict):
+        return state_dict()
+    return None
+
+
+def _capture_reproducibility_state(train_loader: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python_random": random.getstate(),
+        "numpy_random": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": (
+            torch.cuda.get_rng_state_all()
+            if torch.cuda.is_available()
+            else None
+        ),
+        "loader": _component_state(train_loader),
+        "dataset": _component_state(getattr(train_loader, "dataset", None)),
+        "sampler": _component_state(getattr(train_loader, "sampler", None)),
+    }
+    generator = getattr(train_loader, "generator", None)
+    if isinstance(generator, torch.Generator):
+        state["loader_generator"] = generator.get_state()
+    sampler_generator = getattr(
+        getattr(train_loader, "sampler", None),
+        "generator",
+        None,
+    )
+    if isinstance(sampler_generator, torch.Generator):
+        state["sampler_generator"] = sampler_generator.get_state()
+    return state
+
+
+def _restore_component_state(component: Any, state: Any | None) -> None:
+    if state is None:
+        return
+    load_state_dict = getattr(component, "load_state_dict", None)
+    if not callable(load_state_dict):
+        raise ValueError(
+            "checkpoint contains state for a component that cannot restore it"
+        )
+    load_state_dict(state)
+
+
+def _restore_reproducibility_state(
+    state: Mapping[str, Any],
+    train_loader: Any,
+) -> None:
+    try:
+        random.setstate(state["python_random"])
+        np.random.set_state(state["numpy_random"])
+        torch.set_rng_state(state["torch_cpu"])
+        if torch.cuda.is_available() and state.get("torch_cuda") is not None:
+            torch.cuda.set_rng_state_all(state["torch_cuda"])
+        _restore_component_state(train_loader, state.get("loader"))
+        _restore_component_state(
+            getattr(train_loader, "dataset", None),
+            state.get("dataset"),
+        )
+        _restore_component_state(
+            getattr(train_loader, "sampler", None),
+            state.get("sampler"),
+        )
+        generator = getattr(train_loader, "generator", None)
+        if state.get("loader_generator") is not None:
+            if not isinstance(generator, torch.Generator):
+                raise ValueError("training loader generator cannot be restored")
+            generator.set_state(state["loader_generator"])
+        sampler_generator = getattr(
+            getattr(train_loader, "sampler", None),
+            "generator",
+            None,
+        )
+        if state.get("sampler_generator") is not None:
+            if not isinstance(sampler_generator, torch.Generator):
+                raise ValueError("training sampler generator cannot be restored")
+            sampler_generator.set_state(state["sampler_generator"])
+    except (KeyError, TypeError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            "resume checkpoint has invalid reproducibility state"
+        ) from exc
+
+
+def _evaluate_full_loss(
+    model: nn.Module,
+    loader: Iterable[Mapping[str, Any]],
+    device: torch.device,
+    *,
+    use_amp: bool,
+) -> float:
+    was_training = model.training
+    buffers = {
+        name: value.detach().clone()
+        for name, value in model.named_buffers()
+    }
+    model.train()
+    weighted_loss = 0.0
+    sample_count = 0
+    try:
+        with torch.no_grad():
+            for raw_batch in loader:
+                batch = _move_batch(raw_batch, device)
+                batch_size = _batch_size(batch)
+                with torch.amp.autocast(
+                    device_type=device.type,
+                    enabled=use_amp,
+                ):
+                    loss, _components = model.loss(batch)
+                if (
+                    not isinstance(loss, Tensor)
+                    or loss.ndim != 0
+                    or not bool(torch.isfinite(loss).item())
+                ):
+                    raise FloatingPointError(
+                        "non-finite gate evidence loss detected"
+                    )
+                weighted_loss += float(loss.detach().cpu()) * batch_size
+                sample_count += batch_size
+    finally:
+        named_buffers = dict(model.named_buffers())
+        with torch.no_grad():
+            for name, value in buffers.items():
+                named_buffers[name].copy_(value)
+        model.train(was_training)
+    if sample_count != 64:
+        raise ValueError(
+            f"gate evidence loader must contain exactly 64 samples, got "
+            f"{sample_count}"
+        )
+    return weighted_loss / sample_count
+
+
 def _failed_gate_payload(
     *,
     initial_loss: float | None,
     final_loss: float | None,
     optimizer_steps: int,
+    error: str | None = None,
 ) -> dict[str, Any]:
     return {
         "initial_loss": initial_loss,
@@ -529,6 +676,7 @@ def _failed_gate_payload(
         "recall_at_riou_025": None,
         "finite_gradients": False,
         "optimizer_steps": optimizer_steps,
+        "error": error,
         "passed": False,
     }
 
@@ -540,140 +688,284 @@ def train_model(
     output_dir: Path,
     max_steps: int | None = None,
     *,
+    init_checkpoint: Path | None = None,
     resume_checkpoint: Path | None = None,
     hooks: TrainingHooks | None = None,
 ) -> TrainResult:
     """Train a model with deterministic provenance and internal checkpoints."""
-    if not isinstance(cfg, TemporalOBBConfig):
-        raise ValueError("cfg must be a TemporalOBBConfig")
-    if max_steps is not None and (
-        isinstance(max_steps, bool)
-        or not isinstance(max_steps, int)
-        or max_steps <= 0
-    ):
-        raise ValueError("max_steps must be a positive integer")
-
-    manifest_root = Path(manifest_dir)
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
-    manifest_sha256 = manifest_fingerprint(manifest_root)
-    if max_steps is not None and _training_record_count(manifest_root) != 64:
-        raise ValueError("overfit mode requires exactly 64 frozen train samples")
-
-    selected_hooks = hooks or TrainingHooks()
-    loader_factory = (
-        selected_hooks.loader_factory or _default_loader_factory
-    )
-    validator = selected_hooks.validator or _default_validator
-    device = torch.device(
-        selected_hooks.device
-        if selected_hooks.device is not None
-        else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA device requested but CUDA is unavailable")
-
-    torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.seed)
-    weights: Path | str | None = (
-        None if resume_checkpoint is not None else cfg.pretrained_weights
-    )
-    model = selected_hooks.model_factory(model_name, weights, cfg).to(device)
-    optimizer = build_optimizer(model, cfg)
-    train_loader, validation_loader = loader_factory(
-        model_name,
-        cfg,
-        manifest_root,
-    )
-    if not hasattr(train_loader, "__len__") or len(train_loader) == 0:
-        raise ValueError("training loader must be non-empty and sized")
-
-    start_epoch = 0
-    optimizer_steps = 0
-    best_map50 = -math.inf
-    epochs_without_improvement = 0
-    load_provenance: dict[str, Any] = {
-        "kind": "pretrained",
-        "checkpoint": None,
-        "weights": str(weights) if weights is not None else None,
-        "manifest_sha256": manifest_sha256,
-    }
-    resume_payload: dict[str, Any] | None = None
-    if resume_checkpoint is not None:
-        resume_payload = load_experiment_checkpoint(
-            model,
-            Path(resume_checkpoint),
-            manifest_root,
-        )
-        try:
-            start_epoch = int(resume_payload["epoch"]) + 1
-            optimizer_steps = int(resume_payload.get("optimizer_steps", 0))
-            best_map50 = float(resume_payload["best_map50"])
-            epochs_without_improvement = int(
-                resume_payload.get("epochs_without_improvement", 0)
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "resume checkpoint lacks compatible training state"
-            ) from exc
-        load_provenance = {
-            "kind": "resume",
-            "checkpoint": str(Path(resume_checkpoint)),
-            "weights": None,
-            "manifest_sha256": resume_payload["manifest_sha256"],
-            "model_name": resume_payload.get("model_name"),
-            "epoch": resume_payload["epoch"],
-        }
-
-    scheduler = LambdaLR(
-        optimizer,
-        lr_lambda=lambda epoch: _lr_multiplier(
-            epoch,
-            warmup_epochs=cfg.warmup_epochs,
-            total_epochs=cfg.pilot_epochs,
-        ),
-    )
-    if resume_payload is not None:
-        try:
-            optimizer.load_state_dict(resume_payload["optimizer"])
-            scheduler.load_state_dict(resume_payload["scheduler"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                "resume checkpoint has invalid optimizer or scheduler state"
-            ) from exc
-
-    use_amp = device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-    if use_amp:
-        torch.cuda.reset_peak_memory_stats(device)
-
     started_at = datetime.now(timezone.utc)
     started_clock = time.perf_counter()
-    run = _runtime_provenance(
-        model_name,
-        cfg,
-        manifest_root,
-        device=device,
-        load_provenance=load_provenance,
-        started_at=started_at,
-    )
-    _atomic_json_write(output_root / "run.json", run)
+    load_provenance: dict[str, Any] = {
+        "kind": "pending",
+        "checkpoint": None,
+        "weights": None,
+        "manifest_sha256": None,
+    }
+    run: dict[str, Any] = {
+        "seed": getattr(cfg, "seed", None),
+        "git_commit": None,
+        "git_dirty": None,
+        "dependencies": {},
+        "gpu": [],
+        "cuda": {
+            "available": None,
+            "runtime_version": None,
+            "device_count": None,
+            "selected_device": None,
+        },
+        "started_at_utc": started_at.isoformat(),
+        "finished_at_utc": None,
+        "elapsed_seconds": None,
+        "peak_allocated_memory_bytes": 0,
+        "manifest_sha256": None,
+        "model_name": model_name,
+        "pretrained_weights": getattr(cfg, "pretrained_weights", None),
+        "load_provenance": load_provenance,
+        "amp_enabled": False,
+        "status": "setup",
+    }
 
+    manifest_root = Path(manifest_dir)
     last_checkpoint = output_root / "last.pt"
     best_checkpoint = output_root / "best.pt"
+    history_path = output_root / "history.json"
     stopped_early = False
-    completed_epochs = start_epoch
+    completed_epochs = 0
+    optimizer_steps = 0
+    best_map50 = -math.inf
+    gate_passed: bool | None = None
+    initial_evidence_loss: float | None = None
+    final_evidence_loss: float | None = None
+    use_amp = False
     group_losses: list[float] = []
     optimizer_losses: list[float] = []
-    physical_batch_size: int | None = None
-    accumulation_steps: int | None = None
-    last_recall = 0.0
 
     try:
+        selected_hooks = hooks or TrainingHooks()
+        device = torch.device(
+            selected_hooks.device
+            if selected_hooks.device is not None
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        use_amp = device.type == "cuda"
+        run["git_commit"] = _git_value(["rev-parse", "HEAD"])
+        dirty_output = _git_value(["status", "--porcelain"])
+        run["git_dirty"] = (
+            None if dirty_output is None else bool(dirty_output)
+        )
+        run["dependencies"] = _dependency_versions()
+        run["cuda"] = {
+            "available": torch.cuda.is_available(),
+            "runtime_version": torch.version.cuda,
+            "device_count": torch.cuda.device_count(),
+            "selected_device": str(device),
+        }
+        run["amp_enabled"] = use_amp
+        if torch.cuda.is_available():
+            run["gpu"] = [
+                {
+                    "index": index,
+                    "name": torch.cuda.get_device_name(index),
+                    "total_memory_bytes": torch.cuda.get_device_properties(
+                        index
+                    ).total_memory,
+                }
+                for index in range(torch.cuda.device_count())
+            ]
+        _atomic_json_write(output_root / "run.json", run)
+
+        if not isinstance(cfg, TemporalOBBConfig):
+            raise ValueError("cfg must be a TemporalOBBConfig")
+        if max_steps is not None and (
+            isinstance(max_steps, bool)
+            or not isinstance(max_steps, int)
+            or max_steps <= 0
+        ):
+            raise ValueError("max_steps must be a positive integer")
+        if init_checkpoint is not None and resume_checkpoint is not None:
+            raise ValueError(
+                "init_checkpoint and resume_checkpoint are mutually exclusive"
+            )
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA device requested but CUDA is unavailable")
+
+        manifest_sha256 = manifest_fingerprint(manifest_root)
+        run["manifest_sha256"] = manifest_sha256
+        if (
+            max_steps is not None
+            and _training_record_count(manifest_root) != 64
+        ):
+            raise ValueError(
+                "overfit mode requires exactly 64 frozen train samples"
+            )
+
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cfg.seed)
+
+        loader_factory = (
+            selected_hooks.loader_factory or _default_loader_factory
+        )
+        gate_loader_factory = (
+            selected_hooks.gate_loader_factory
+            or _default_gate_loader_factory
+        )
+        validator = selected_hooks.validator or _default_validator
+        internal_load = (
+            Path(resume_checkpoint)
+            if resume_checkpoint is not None
+            else (
+                Path(init_checkpoint)
+                if init_checkpoint is not None
+                else None
+            )
+        )
+        weights: Path | str | None = (
+            None if internal_load is not None else cfg.pretrained_weights
+        )
+        model = selected_hooks.model_factory(
+            model_name,
+            weights,
+            cfg,
+        ).to(device)
+        resume_payload: dict[str, Any] | None = None
+        history: list[dict[str, Any]] = []
+        start_epoch = 0
+        epochs_without_improvement = 0
+
+        if init_checkpoint is not None:
+            source = Path(init_checkpoint)
+            init_payload = load_experiment_checkpoint(
+                model,
+                source,
+                manifest_root,
+            )
+            load_provenance = {
+                "kind": "internal_init",
+                "checkpoint": str(source),
+                "checkpoint_sha256": _file_sha256(source),
+                "weights": None,
+                "manifest_sha256": init_payload["manifest_sha256"],
+                "source_model_name": init_payload.get("model_name"),
+                "source_epoch": init_payload.get("epoch"),
+            }
+        elif resume_checkpoint is not None:
+            source = Path(resume_checkpoint)
+            resume_payload = load_experiment_checkpoint(
+                model,
+                source,
+                manifest_root,
+            )
+            try:
+                start_epoch = int(resume_payload["epoch"]) + 1
+                completed_epochs = start_epoch
+                optimizer_steps = int(
+                    resume_payload.get("optimizer_steps", 0)
+                )
+                best_map50 = float(resume_payload["best_map50"])
+                epochs_without_improvement = int(
+                    resume_payload.get("epochs_without_improvement", 0)
+                )
+                raw_history = resume_payload["history"]
+                if not isinstance(raw_history, list):
+                    raise TypeError("history is not a list")
+                history = [dict(record) for record in raw_history]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "resume checkpoint lacks compatible training state"
+                ) from exc
+            load_provenance = {
+                "kind": "resume",
+                "checkpoint": str(source),
+                "checkpoint_sha256": _file_sha256(source),
+                "weights": None,
+                "manifest_sha256": resume_payload["manifest_sha256"],
+                "model_name": resume_payload.get("model_name"),
+                "epoch": resume_payload["epoch"],
+            }
+        else:
+            load_provenance = {
+                "kind": "pretrained",
+                "checkpoint": None,
+                "checkpoint_sha256": None,
+                "weights": str(weights) if weights is not None else None,
+                "manifest_sha256": manifest_sha256,
+            }
+        run["load_provenance"] = load_provenance
+        run["status"] = "running"
+        _atomic_json_write(output_root / "run.json", run)
+
+        optimizer = build_optimizer(model, cfg)
+        train_loader, validation_loader = loader_factory(
+            model_name,
+            cfg,
+            manifest_root,
+        )
+        if not hasattr(train_loader, "__len__") or len(train_loader) == 0:
+            raise ValueError("training loader must be non-empty and sized")
+        gate_loader = (
+            gate_loader_factory(model_name, cfg, manifest_root)
+            if max_steps is not None
+            else None
+        )
+        scheduler = LambdaLR(
+            optimizer,
+            lr_lambda=lambda epoch: _lr_multiplier(
+                epoch,
+                warmup_epochs=cfg.warmup_epochs,
+                total_epochs=cfg.pilot_epochs,
+            ),
+        )
+        if resume_payload is not None:
+            try:
+                optimizer.load_state_dict(resume_payload["optimizer"])
+                scheduler.load_state_dict(resume_payload["scheduler"])
+                _restore_reproducibility_state(
+                    resume_payload["reproducibility_state"],
+                    train_loader,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "resume checkpoint has invalid optimizer, scheduler, "
+                    "or reproducibility state"
+                ) from exc
+
+            source_best_path = Path(resume_checkpoint).parent / "best.pt"
+            source_best = _load_checkpoint_payload(source_best_path)
+            _verify_manifest_sha256(
+                source_best["manifest_sha256"],
+                manifest_root,
+            )
+            _validate_model_state(model, source_best["model"])
+            if float(source_best.get("best_map50", -math.inf)) != best_map50:
+                raise ValueError(
+                    "resume best checkpoint does not match resume state"
+                )
+            _atomic_torch_save(source_best, best_checkpoint)
+            _atomic_json_write(history_path, history)
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp:
+            torch.cuda.reset_peak_memory_stats(device)
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+        if gate_loader is not None:
+            initial_evidence_loss = _evaluate_full_loss(
+                model,
+                gate_loader,
+                device,
+                use_amp=use_amp,
+            )
+
         epoch = start_epoch
+        physical_batch_size: int | None = None
+        accumulation_steps: int | None = None
+        last_recall = 0.0
         while epoch < cfg.pilot_epochs:
             dataset = getattr(train_loader, "dataset", None)
             set_epoch = getattr(dataset, "set_epoch", None)
@@ -681,6 +973,8 @@ def train_model(
                 set_epoch(epoch)
 
             steps_at_epoch_start = optimizer_steps
+            epoch_loss_start = len(optimizer_losses)
+            epoch_learning_rate = float(optimizer.param_groups[0]["lr"])
             micro_batches = 0
             for raw_batch in train_loader:
                 batch = _move_batch(raw_batch, device)
@@ -728,23 +1022,6 @@ def train_model(
                     bool(torch.isfinite(gradient).all().item())
                     for gradient in gradients
                 ):
-                    if max_steps is not None:
-                        _atomic_json_write(
-                            output_root / "gate.json",
-                            _failed_gate_payload(
-                                initial_loss=(
-                                    optimizer_losses[0]
-                                    if optimizer_losses
-                                    else group_losses[0]
-                                ),
-                                final_loss=(
-                                    optimizer_losses[-1]
-                                    if optimizer_losses
-                                    else group_losses[-1]
-                                ),
-                                optimizer_steps=optimizer_steps,
-                            ),
-                        )
                     raise FloatingPointError("non-finite gradient detected")
 
                 if selected_hooks.on_optimizer_step is not None:
@@ -772,10 +1049,16 @@ def train_model(
                     "effective batch size"
                 )
 
+            evidence_or_validation = (
+                gate_loader
+                if gate_loader is not None
+                else validation_loader
+            )
+            assert evidence_or_validation is not None
             map50, last_recall = _metrics(
                 validator,
                 model,
-                validation_loader,
+                evidence_or_validation,
                 device,
             )
             improved = map50 > best_map50
@@ -784,6 +1067,26 @@ def train_model(
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
+
+            epoch_optimizer_losses = optimizer_losses[epoch_loss_start:]
+            train_loss = sum(epoch_optimizer_losses) / len(
+                epoch_optimizer_losses
+            )
+            if not math.isfinite(train_loss):
+                raise FloatingPointError(
+                    "non-finite epoch training loss detected"
+                )
+            history.append(
+                {
+                    "epoch": epoch,
+                    "optimizer_steps": optimizer_steps,
+                    "train_loss": train_loss,
+                    "map50": map50,
+                    "recall_at_riou_025": last_recall,
+                    "learning_rate": epoch_learning_rate,
+                }
+            )
+            _atomic_json_write(history_path, history)
 
             scheduler.step()
             checkpoint_state = {
@@ -795,6 +1098,10 @@ def train_model(
                 "epochs_without_improvement": epochs_without_improvement,
                 "best_map50": best_map50,
                 "config": asdict(cfg),
+                "history": history,
+                "reproducibility_state": (
+                    _capture_reproducibility_state(train_loader)
+                ),
             }
             save_checkpoint(
                 model,
@@ -825,12 +1132,17 @@ def train_model(
         if not last_checkpoint.is_file() or not best_checkpoint.is_file():
             raise RuntimeError("training produced no epoch checkpoint")
 
-        gate_passed: bool | None = None
-        if max_steps is not None:
-            initial_loss = optimizer_losses[0]
-            final_loss = optimizer_losses[-1]
+        if gate_loader is not None:
+            final_evidence_loss = _evaluate_full_loss(
+                model,
+                gate_loader,
+                device,
+                use_amp=use_amp,
+            )
+            assert initial_evidence_loss is not None
             loss_reduction = (
-                (initial_loss - final_loss) / max(initial_loss, 1e-12)
+                (initial_evidence_loss - final_evidence_loss)
+                / max(initial_evidence_loss, 1e-12)
             )
             gate_passed = (
                 loss_reduction >= 0.50
@@ -839,8 +1151,8 @@ def train_model(
             _atomic_json_write(
                 output_root / "gate.json",
                 {
-                    "initial_loss": initial_loss,
-                    "final_loss": final_loss,
+                    "initial_loss": initial_evidence_loss,
+                    "final_loss": final_evidence_loss,
                     "loss_reduction": loss_reduction,
                     "recall_at_riou_025": last_recall,
                     "finite_gradients": True,
@@ -851,6 +1163,7 @@ def train_model(
 
         run["status"] = "completed"
         run["gate_passed"] = gate_passed
+        run["history_path"] = str(history_path)
         return TrainResult(
             output_dir=output_root,
             last_checkpoint=last_checkpoint,
@@ -864,6 +1177,16 @@ def train_model(
     except BaseException as exc:
         run["status"] = "failed"
         run["error"] = f"{type(exc).__name__}: {exc}"
+        if max_steps is not None:
+            _atomic_json_write(
+                output_root / "gate.json",
+                _failed_gate_payload(
+                    initial_loss=initial_evidence_loss,
+                    final_loss=final_evidence_loss,
+                    optimizer_steps=optimizer_steps,
+                    error=run["error"],
+                ),
+            )
         raise
     finally:
         run["finished_at_utc"] = datetime.now(timezone.utc).isoformat()
