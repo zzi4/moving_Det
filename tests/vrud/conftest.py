@@ -165,13 +165,16 @@ class TemporalFixture:
     manifest: Path
     config: TemporalOBBConfig
 
-    def set_center_frame(self, frame_index: int) -> None:
+    def update_manifest(self, **updates: object) -> None:
         payload = json.loads(self.manifest.read_text(encoding="utf-8"))
-        payload["center_frame"] = frame_index
+        payload.update(updates)
         self.manifest.write_text(
             json.dumps(payload, allow_nan=False) + "\n",
             encoding="utf-8",
         )
+
+    def set_center_frame(self, frame_index: int) -> None:
+        self.update_manifest(center_frame=frame_index)
 
 
 @pytest.fixture

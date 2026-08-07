@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -11,15 +12,22 @@ from PIL import Image
 import torch
 from torch import Tensor
 import torch.nn.functional as torch_functional
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 from moving_det.geometry.obb import obb_to_points, points_to_obb
 from moving_det.ml.obb_adapter import obb_to_normalized_xywhr
 from moving_det.models import OBB
 from moving_det.temporal_config import TemporalOBBConfig
 from moving_det.vrud.index import load_corrected_frame, load_track_index
-from moving_det.vrud.tiling import Tile
+from moving_det.vrud.tiling import Tile, full_frame_tiles
 from moving_det.vrud.types import TrackKey
+
+
+_SOURCES_BY_SPLIT = {
+    "train": frozenset({"positive", "background"}),
+    "validation": frozenset({"evaluation"}),
+    "test": frozenset({"evaluation", "continuity"}),
+}
 
 
 @dataclass(frozen=True)
@@ -298,6 +306,11 @@ def _parse_manifest_record(
     site = _require_string(value, "site", line_number=line_number)
     sequence = _require_string(value, "sequence", line_number=line_number)
     source = _require_string(value, "source", line_number=line_number)
+    if source not in _SOURCES_BY_SPLIT.get(split, ()):
+        raise ValueError(
+            f"manifest line {line_number}: split {split!r} and source "
+            f"{source!r} are inconsistent"
+        )
     center_frame = value["center_frame"]
     if (
         isinstance(center_frame, bool)
@@ -347,6 +360,14 @@ def _parse_manifest_record(
         track_keys.append(TrackKey(raw_key[0], raw_key[1], raw_key[2]))
     if len(set(track_keys)) != len(track_keys):
         raise ValueError(f"manifest line {line_number}: duplicate track keys")
+    if source == "positive" and not track_keys:
+        raise ValueError(
+            f"manifest line {line_number}: source 'positive' requires track keys"
+        )
+    if source == "background" and track_keys:
+        raise ValueError(
+            f"manifest line {line_number}: source 'background' forbids track keys"
+        )
 
     return _ManifestRecord(
         split=split,
@@ -410,9 +431,40 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
         self.training = training
         self._records = _load_manifest(self.manifest_path, cfg)
         self._tracks = load_track_index(cfg.metadata_root)
+        self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
+        self._draw_counts: dict[tuple[int, int, int], int] = {}
 
     def __len__(self) -> int:
         return len(self._records)
+
+    def set_epoch(self, epoch: int) -> None:
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise ValueError("epoch must be a non-negative integer")
+        self._epoch.fill_(epoch)
+
+    def _augmentation_generator(
+        self,
+        index: int,
+    ) -> tuple[torch.Generator, dict[str, int]]:
+        worker = get_worker_info()
+        worker_id = -1 if worker is None else worker.id
+        epoch = int(self._epoch.item())
+        key = (epoch, worker_id, index)
+        draw = self._draw_counts.get(key, 0)
+        self._draw_counts[key] = draw + 1
+        seed_material = (
+            f"{self.cfg.seed}:{epoch}:{worker_id}:{index}:{draw}".encode("ascii")
+        )
+        draw_seed = int.from_bytes(
+            hashlib.sha256(seed_material).digest()[:8],
+            byteorder="big",
+        )
+        generator = torch.Generator().manual_seed(draw_seed)
+        return generator, {
+            "augmentation_epoch": epoch,
+            "augmentation_worker": worker_id,
+            "augmentation_draw": draw,
+        }
 
     def _frame_path(
         self,
@@ -453,6 +505,36 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             .to(dtype=torch.float32)
             .div_(255.0)
         )
+
+    def _validate_center_tile(
+        self,
+        record: _ManifestRecord,
+        image_path: Path,
+    ) -> None:
+        try:
+            with Image.open(image_path) as image:
+                width, height = image.size
+        except OSError as exc:
+            raise ValueError(
+                f"failed to read center frame dimensions {image_path}: {exc}"
+            ) from exc
+        try:
+            approved_tiles = full_frame_tiles(
+                width,
+                height,
+                self.cfg.tile_size,
+                self.cfg.tile_overlap,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"manifest tile is not on the approved edge-anchored grid: "
+                f"{record.tile}"
+            ) from exc
+        if record.tile not in approved_tiles:
+            raise ValueError(
+                f"manifest tile is not on the approved edge-anchored grid: "
+                f"{record.tile}"
+            )
 
     def _center_targets(
         self,
@@ -506,6 +588,7 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             raise ValueError(
                 f"center frame does not exist: {center_path}"
             )
+        self._validate_center_tile(record, center_path)
 
         frames = []
         valid = []
@@ -526,14 +609,12 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             )
 
         classes, obbs = self._center_targets(record, center_path)
-        generator = torch.Generator().manual_seed(self.cfg.seed + index)
-        spatial_transform = (
-            sample_spatial_transform(generator, image_size=self.cfg.tile_size)
-            if self.training
-            else _identity_spatial_transform(self.cfg.tile_size)
-        )
-
         if self.training:
+            generator, augmentation_metadata = self._augmentation_generator(index)
+            spatial_transform = sample_spatial_transform(
+                generator,
+                image_size=self.cfg.tile_size,
+            )
             frames = [
                 apply_image_transform(frame, spatial_transform)
                 for frame in frames
@@ -559,6 +640,13 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             ]
             classes = [class_id for class_id, _ in transformed]
             obbs = [obb for _, obb in transformed]
+        else:
+            spatial_transform = _identity_spatial_transform(self.cfg.tile_size)
+            augmentation_metadata = {
+                "augmentation_epoch": int(self._epoch.item()),
+                "augmentation_worker": -1,
+                "augmentation_draw": -1,
+            }
 
         local_tile = Tile(
             0,
@@ -594,6 +682,7 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             "offsets": self.clip_spec.offsets,
             "support_paths": tuple(support_paths),
             "spatial_transform": asdict(spatial_transform),
+            **augmentation_metadata,
         }
         return {
             "frames": torch.stack(frames),
@@ -617,15 +706,36 @@ def collate_temporal_obb(
     if not samples:
         raise ValueError("at least one temporal sample is required")
 
-    frames = torch.stack(
-        [torch.as_tensor(sample["frames"]) for sample in samples]
-    )
-    valid = torch.stack(
-        [torch.as_tensor(sample["valid"]) for sample in samples]
-    )
-    transforms = torch.stack(
-        [torch.as_tensor(sample["transforms"]) for sample in samples]
-    )
+    frame_tensors = [torch.as_tensor(sample["frames"]) for sample in samples]
+    valid_tensors = [torch.as_tensor(sample["valid"]) for sample in samples]
+    transform_tensors = [
+        torch.as_tensor(sample["transforms"])
+        for sample in samples
+    ]
+    temporal_lengths = [int(frames.shape[0]) for frames in frame_tensors]
+    if len(set(temporal_lengths)) != 1:
+        raise ValueError(
+            "all samples must have the same temporal length; "
+            f"got {temporal_lengths}"
+        )
+    for sample_index, (frames, valid_mask, transform) in enumerate(
+        zip(frame_tensors, valid_tensors, transform_tensors, strict=True)
+    ):
+        temporal_length = temporal_lengths[sample_index]
+        if (
+            valid_mask.ndim != 1
+            or transform.ndim != 3
+            or valid_mask.shape[0] != temporal_length
+            or transform.shape[0] != temporal_length
+        ):
+            raise ValueError(
+                f"sample {sample_index} temporal fields do not share length "
+                f"{temporal_length}"
+            )
+
+    frames = torch.stack(frame_tensors)
+    valid = torch.stack(valid_tensors)
+    transforms = torch.stack(transform_tensors)
     zero_indices = [int(sample["zero_index"]) for sample in samples]
     image = torch.stack(
         [frames[index, zero_index] for index, zero_index in enumerate(zero_indices)]
