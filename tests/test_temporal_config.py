@@ -1,4 +1,5 @@
 from pathlib import Path
+import shlex
 
 import pytest
 import yaml
@@ -13,6 +14,28 @@ def test_temporal_config_loads_pinned_geometry_and_seed():
     assert cfg.tile_overlap == 256
     assert cfg.mg_offsets == (-4, -2, 0, 2, 4)
     assert cfg.lstfe_offsets == (-30, -15, -2, 0, 2, 15, 30)
+
+
+def test_temporal_environment_editable_install_resolves_to_project_root():
+    environment_path = Path("environment/temporal-obb.yml")
+    with environment_path.open(encoding="utf-8") as stream:
+        environment = yaml.safe_load(stream)
+
+    pip_requirements = next(
+        dependency["pip"]
+        for dependency in environment["dependencies"]
+        if isinstance(dependency, dict) and "pip" in dependency
+    )
+    editable_requirement = next(
+        requirement
+        for requirement in pip_requirements
+        if requirement.startswith("-e ")
+    )
+    target_with_extras = shlex.split(editable_requirement)[1]
+    target = target_with_extras.split("[", 1)[0]
+    resolved_target = (environment_path.parent / target).resolve()
+
+    assert (resolved_target / "pyproject.toml").is_file()
 
 
 def test_temporal_config_rejects_unknown_keys(tmp_path):

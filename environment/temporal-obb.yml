@@ -8,4 +8,4 @@ dependencies:
   - pip
   - pip:
       - ultralytics==8.4.115
-      - -e ".[dev,ml]"
+      - -e "..[dev,ml]"
