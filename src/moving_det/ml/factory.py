@@ -30,5 +30,5 @@ def create_model(
             raise RuntimeError(
                 "LSTFE is not available; implement the temporal model first"
             ) from exc
-        return LSTFEOBB(weights=weights)
+        return LSTFEOBB(weights=weights, offsets=cfg.lstfe_offsets)
     raise ValueError(f"unknown model name: {name!r}")
