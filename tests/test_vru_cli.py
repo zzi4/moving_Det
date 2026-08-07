@@ -11,6 +11,7 @@ import numpy as np
 from PIL import Image
 import pytest
 
+import moving_det.vru_cli as vru_cli_module
 from moving_det.temporal_config import load_temporal_config
 from moving_det.vru_cli import (
     EvaluationArtifacts,
@@ -1321,6 +1322,543 @@ def test_data_smoke_selection_covers_two_sites_four_classes_background_and_edge(
     assert any(row["edge_anchored"] for row in selected)
 
 
+def _write_temporal_smoke_fixture(
+    tmp_path: Path,
+    *,
+    center_frame: int = 4,
+    omitted_cache_key: tuple[str, str, int] | None = None,
+):
+    from moving_det.motion.alignment import AlignmentResult
+    from moving_det.vrud.alignment import AlignmentCache, AlignmentKey
+
+    image_root = tmp_path / "images"
+    metadata_root = tmp_path / "metadata"
+    sequences = (
+        ("site19", "ADS_KHR_19", "sequence_a", ((1, 3), (2, 4))),
+        ("site22", "ADS_WZY_22", "sequence_b", ((3, 5), (4, 6))),
+    )
+    mg_offsets = (-2, -1, 0, 1, 2)
+    lstfe_offsets = (-3, -2, -1, 0, 1, 2, 3)
+    frame_numbers = range(1, center_frame + 4)
+    for site, site_code, sequence, tracks in sequences:
+        sequence_root = image_root / f"{site}_sequence" / sequence
+        sequence_root.mkdir(parents=True)
+        for frame in frame_numbers:
+            Image.new(
+                "RGB",
+                (64, 64),
+                color=(20 + frame, 30, 40),
+            ).save(sequence_root / f"{frame:06d}.jpg")
+        shapes = [
+            {
+                "label": "car",
+                "points": [
+                    [8.0 + index * 20, 16.0],
+                    [20.0 + index * 20, 16.0],
+                    [20.0 + index * 20, 24.0],
+                    [8.0 + index * 20, 24.0],
+                ],
+                "group_id": group_id,
+                "description": str(group_id),
+                "difficult": False,
+                "shape_type": "rotation",
+                "flags": {},
+                "attributes": {},
+                "direction": 0.0,
+            }
+            for index, (group_id, _class_id) in enumerate(tracks)
+        ]
+        center_path = sequence_root / f"{center_frame:06d}.jpg"
+        center_path.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "version": "2.4.0",
+                    "flags": {},
+                    "shapes": shapes,
+                    "imagePath": center_path.name,
+                    "imageData": None,
+                    "imageHeight": 64,
+                    "imageWidth": 64,
+                },
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        tracks_root = (
+            metadata_root
+            / site
+            / "output"
+            / site_code
+            / sequence
+            / "Tracksfiles"
+        )
+        tracks_root.mkdir(parents=True)
+        header = (
+            "id,class,width,height,initialFrame,finalFrame,numFrames,"
+            "traveledDistance,meanVelocity,minDHW,minTHW,minTTC,"
+            "numLaneChanges\n"
+        )
+        rows = "".join(
+            f"{group_id},{vrud_class},1.0,1.0,0,10,11,10.0,1.0,,,,0\n"
+            for group_id, vrud_class in tracks
+        )
+        (tracks_root / f"{sequence}_STD_TRK_META.csv").write_text(
+            header + rows,
+            encoding="utf-8",
+        )
+
+    manifest = tmp_path / "manifest"
+    _manifest_children(
+        manifest,
+        [
+            {
+                "split": "train",
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": center_frame,
+                "tile_xywh": [0, 0, 64, 64],
+                "track_keys": [
+                    ["site19", "sequence_a", 1],
+                    ["site19", "sequence_a", 2],
+                ],
+                "source": "positive",
+            },
+            {
+                "split": "train",
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": center_frame,
+                "tile_xywh": [0, 0, 64, 64],
+                "track_keys": [],
+                "source": "background",
+            },
+            {
+                "split": "train",
+                "site": "site22",
+                "sequence": "sequence_b",
+                "center_frame": center_frame,
+                "tile_xywh": [0, 0, 64, 64],
+                "track_keys": [["site22", "sequence_b", 3]],
+                "source": "positive",
+            },
+            {
+                "split": "train",
+                "site": "site22",
+                "sequence": "sequence_b",
+                "center_frame": center_frame,
+                "tile_xywh": [0, 0, 64, 64],
+                "track_keys": [["site22", "sequence_b", 4]],
+                "source": "positive",
+            },
+        ],
+    )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=image_root,
+        metadata_root=metadata_root,
+        output_root=tmp_path / "runs",
+        tile_size=64,
+        tile_overlap=16,
+        mg_offsets=mg_offsets,
+        lstfe_offsets=lstfe_offsets,
+    )
+    cache_root = tmp_path / "alignment-cache"
+    cache = AlignmentCache(cache_root)
+    for site, _site_code, sequence, _tracks in sequences:
+        for offset in sorted(
+            (set(mg_offsets) | set(lstfe_offsets)) - {0}
+        ):
+            support_frame = center_frame + offset
+            support_path = (
+                image_root
+                / f"{site}_sequence"
+                / sequence
+                / f"{support_frame:06d}.jpg"
+            )
+            if (
+                support_frame <= 0
+                or not support_path.is_file()
+                or omitted_cache_key == (site, sequence, support_frame)
+            ):
+                continue
+            cache.put(
+                AlignmentKey(
+                    site,
+                    sequence,
+                    center_frame,
+                    support_frame,
+                ),
+                AlignmentResult(
+                    matrix=np.float32(
+                        [
+                            [1.0, 0.0, float(offset)],
+                            [0.0, 1.0, 1.0 if site == "site19" else 2.0],
+                        ]
+                    ),
+                    correlation=0.95,
+                    used_fallback=False,
+                    reason=None,
+                ),
+            )
+    snapshot = cache.snapshot()
+    (cache_root / "summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "manifest_sha256": _manifest_fingerprint(manifest),
+                "alignment_cache_sha256": snapshot.fingerprint,
+                "seed": cfg.seed,
+                "job_count": len(
+                    json.loads(
+                        (cache_root / "index.json").read_text(encoding="utf-8")
+                    )["entries"]
+                ),
+                "fallback_count": 0,
+                "fallback_fraction": 0.0,
+                "fallback_reasons": {},
+                "offsets": sorted(
+                    (set(mg_offsets) | set(lstfe_offsets)) - {0}
+                ),
+            },
+            allow_nan=False,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return cfg, manifest, cache_root, snapshot.fingerprint
+
+
+@REQUIRES_TORCH
+def test_visualize_without_cache_names_honest_current_frame_geometry_smoke(
+    tmp_path,
+):
+    cfg, manifest, _cache_root, _fingerprint = _write_temporal_smoke_fixture(
+        tmp_path
+    )
+    output = tmp_path / "pre-cache-smoke"
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+        ]
+    )
+
+    run_visualize(args, config_loader=lambda _path: cfg)
+
+    index = json.loads((output / "index.json").read_text(encoding="utf-8"))
+    assert index["mode"] == "pre-cache-current-frame-geometry-smoke"
+    assert index["alignment_cache_sha256"] is None
+    assert all(
+        panel["manual_support_strip"]["evidence_kind"]
+        == "manual-display-only"
+        and panel["temporal_dataset_evidence"] is None
+        for panel in index["panels"]
+    )
+
+
+@REQUIRES_TORCH
+def test_visualize_with_cache_consumes_real_mg_and_lstfe_dataset_samples(
+    tmp_path,
+):
+    cfg, manifest, cache_root, fingerprint = _write_temporal_smoke_fixture(
+        tmp_path
+    )
+    output = tmp_path / "post-cache-smoke"
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(cache_root),
+            "--output",
+            str(output),
+        ]
+    )
+
+    run_visualize(args, config_loader=lambda _path: cfg)
+
+    index = json.loads((output / "index.json").read_text(encoding="utf-8"))
+    assert index["mode"] == "post-cache-temporal-dataset-smoke"
+    assert index["alignment_cache_sha256"] == fingerprint
+    for panel in index["panels"]:
+        assert (
+            panel["manual_support_strip"]["evidence_kind"]
+            == "manual-display-only"
+        )
+        evidence = panel["temporal_dataset_evidence"]
+        assert evidence["evidence_kind"] == "temporal-clip-dataset"
+        assert evidence["alignment_snapshot_sha256"] == fingerprint
+        assert set(evidence["models"]) == {"mg_vtod", "lstfe"}
+        for model, offsets in (
+            ("mg_vtod", cfg.mg_offsets),
+            ("lstfe", cfg.lstfe_offsets),
+        ):
+            record = evidence["models"][model]
+            assert record["offsets"] == list(offsets)
+            assert record["valid_support_mask"] == [True] * len(offsets)
+            assert record["alignment_cache_sha256"] == fingerprint
+            assert record["center_identity"] == {
+                "site": panel["site"],
+                "sequence": panel["sequence"],
+                "center_frame": panel["center_frame"],
+            }
+            assert record["frame_tensor_shape"] == [
+                len(offsets),
+                3,
+                64,
+                64,
+            ]
+            assert len(record["local_affine_matrices"]) == len(offsets)
+            assert all(path is not None for path in record["support_paths"])
+
+
+@REQUIRES_TORCH
+@pytest.mark.parametrize(
+    ("field", "drifted_value"),
+    [
+        ("source", "background"),
+        ("tile_xywh", (1, 0, 64, 64)),
+    ],
+    ids=["source", "tile"],
+)
+def test_temporal_smoke_sample_rejects_manifest_record_drift(
+    field,
+    drifted_value,
+):
+    import torch
+
+    descriptor = {
+        "site": "site19",
+        "sequence": "sequence_a",
+        "center_frame": 4,
+        "source": "positive",
+        "tile_xywh": [0, 0, 64, 64],
+    }
+    metadata = {
+        "site": "site19",
+        "sequence": "sequence_a",
+        "center_frame": 4,
+        "source": "positive",
+        "tile_xywh": (0, 0, 64, 64),
+        "offsets": (0,),
+        "support_paths": ("/safe/000004.jpg",),
+    }
+    metadata[field] = drifted_value
+    sample = {
+        "frames": torch.zeros(1, 3, 64, 64),
+        "valid": torch.ones(1, dtype=torch.bool),
+        "transforms": torch.eye(2, 3).unsqueeze(0),
+        "metadata": metadata,
+    }
+
+    with pytest.raises(WorkflowError, match="identity|drift"):
+        vru_cli_module._temporal_smoke_sample_evidence(
+            sample,
+            descriptor,
+            offsets=(0,),
+            alignment_cache_sha256="a" * 64,
+        )
+
+
+@REQUIRES_TORCH
+def test_temporal_smoke_sample_rejects_support_path_for_wrong_frame(
+    tmp_path,
+):
+    import torch
+
+    center_path = (
+        tmp_path
+        / "images"
+        / "site19_sequence"
+        / "sequence_a"
+        / "000004.jpg"
+    )
+    descriptor = {
+        "site": "site19",
+        "sequence": "sequence_a",
+        "center_frame": 4,
+        "source": "positive",
+        "tile_xywh": [0, 0, 64, 64],
+        "image_path": str(center_path),
+    }
+    sample = {
+        "frames": torch.zeros(3, 3, 64, 64),
+        "valid": torch.ones(3, dtype=torch.bool),
+        "transforms": torch.eye(2, 3).repeat(3, 1, 1),
+        "metadata": {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "center_frame": 4,
+            "source": "positive",
+            "tile_xywh": (0, 0, 64, 64),
+            "offsets": (-1, 0, 1),
+            "support_paths": (
+                str(center_path.with_name("000003.jpg")),
+                str(center_path),
+                str(center_path.with_name("000006.jpg")),
+            ),
+        },
+    }
+
+    with pytest.raises(WorkflowError, match="support path"):
+        vru_cli_module._temporal_smoke_sample_evidence(
+            sample,
+            descriptor,
+            offsets=(-1, 0, 1),
+            alignment_cache_sha256="a" * 64,
+        )
+
+
+@REQUIRES_TORCH
+def test_temporal_smoke_records_boundary_support_as_invalid_without_cache_entry(
+    tmp_path,
+):
+    cfg, manifest, cache_root, _fingerprint = _write_temporal_smoke_fixture(
+        tmp_path,
+        center_frame=2,
+    )
+    output = tmp_path / "boundary-smoke"
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(cache_root),
+            "--output",
+            str(output),
+        ]
+    )
+
+    run_visualize(args, config_loader=lambda _path: cfg)
+
+    index = json.loads((output / "index.json").read_text(encoding="utf-8"))
+    lstfe = index["panels"][0]["temporal_dataset_evidence"]["models"]["lstfe"]
+    assert lstfe["valid_support_mask"] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+        True,
+        True,
+    ]
+    assert lstfe["support_paths"][:2] == [None, None]
+    assert lstfe["local_affine_matrices"][:2] == [
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+    ]
+
+
+@REQUIRES_TORCH
+def test_temporal_smoke_rejects_cache_fingerprint_mismatch_before_replace(
+    tmp_path,
+):
+    cfg, manifest, cache_root, _fingerprint = _write_temporal_smoke_fixture(
+        tmp_path
+    )
+    summary_path = cache_root / "summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["alignment_cache_sha256"] = "0" * 64
+    summary_path.write_text(
+        json.dumps(summary, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "fingerprint-output"
+    output.mkdir()
+    sentinel = output / "sentinel.txt"
+    sentinel.write_text("preserve\n", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(cache_root),
+            "--output",
+            str(output),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="fingerprint"):
+        run_visualize(args, config_loader=lambda _path: cfg)
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+
+
+@REQUIRES_TORCH
+def test_temporal_smoke_rejects_missing_valid_support_cache_entry(
+    tmp_path,
+):
+    cfg, manifest, cache_root, _fingerprint = _write_temporal_smoke_fixture(
+        tmp_path,
+        omitted_cache_key=("site19", "sequence_a", 2),
+    )
+    output = tmp_path / "missing-entry-output"
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(cache_root),
+            "--output",
+            str(output),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="alignment.*missing|missing.*alignment"):
+        run_visualize(args, config_loader=lambda _path: cfg)
+
+    assert not output.exists()
+
+
+@REQUIRES_TORCH
+def test_temporal_smoke_rejects_center_identity_drift(
+    tmp_path,
+    monkeypatch,
+):
+    cfg, manifest, cache_root, _fingerprint = _write_temporal_smoke_fixture(
+        tmp_path
+    )
+    original = vru_cli_module._data_smoke_descriptors
+
+    def drifted_descriptors(config, manifest_dir):
+        descriptors = [dict(item) for item in original(config, manifest_dir)]
+        descriptors[0]["center_frame"] = int(
+            descriptors[0]["center_frame"]
+        ) + 1
+        return tuple(descriptors)
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_data_smoke_descriptors",
+        drifted_descriptors,
+    )
+    output = tmp_path / "identity-output"
+    args = build_parser().parse_args(
+        [
+            "visualize",
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(cache_root),
+            "--output",
+            str(output),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="center_frame|identity"):
+        run_visualize(args, config_loader=lambda _path: cfg)
+
+    assert not output.exists()
+
+
 def test_overfit_manifest_is_exact_deterministic_and_preserves_source(
     tmp_path,
 ):
@@ -1440,6 +1978,11 @@ def test_cache_alignments_runs_real_ecc_and_writes_strict_atomic_cache(
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert summary["schema_version"] == 1
     assert summary["job_count"] == 8
+    from moving_det.vrud.alignment import AlignmentCache
+
+    assert summary["alignment_cache_sha256"] == (
+        AlignmentCache(output).snapshot().fingerprint
+    )
     assert summary["manifest_sha256"] == hashlib.sha256(
         b"".join(
             len(name.encode()).to_bytes(8, "big")

@@ -181,6 +181,79 @@ def test_temporal_dataset_freezes_one_alignment_snapshot_for_its_lifetime(
     )
 
 
+def test_mg_and_lstfe_can_reuse_one_explicit_alignment_snapshot(
+    temporal_fixture,
+):
+    original = np.float32(
+        [[1.0, 0.0, 3.0], [0.0, 1.0, -2.0]]
+    )
+    cache = _cache_required_supports(
+        temporal_fixture,
+        matrices={offset: original for offset in (-4, -2, 2, 4)},
+    )
+    snapshot = cache.snapshot()
+    cache.put(
+        AlignmentKey("site22", "sequence_a", 5, 3),
+        AlignmentResult(
+            matrix=np.float32(
+                [[1.0, 0.0, 30.0], [0.0, 1.0, -20.0]]
+            ),
+            correlation=0.95,
+            used_fallback=False,
+            reason=None,
+        ),
+    )
+
+    mg = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod", temporal_fixture.config.mg_offsets),
+        training=False,
+        alignment_snapshot=snapshot,
+    )
+    lstfe = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("lstfe", temporal_fixture.config.lstfe_offsets),
+        training=False,
+        alignment_snapshot=snapshot,
+    )
+    mg_sample = mg[0]
+    lstfe_sample = lstfe[0]
+
+    assert mg.alignment_cache_sha256 == snapshot.fingerprint
+    assert lstfe.alignment_cache_sha256 == snapshot.fingerprint
+    torch.testing.assert_close(
+        mg_sample["transforms"][1],
+        torch.from_numpy(original),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        lstfe_sample["transforms"][2],
+        torch.from_numpy(original),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_current_frame_clip_rejects_unused_explicit_alignment_snapshot(
+    temporal_fixture,
+):
+    snapshot = AlignmentCache(
+        temporal_fixture.config.output_root / "alignment-cache"
+    ).snapshot()
+
+    with pytest.raises(ValueError, match="temporal clip"):
+        TemporalClipDataset(
+            temporal_fixture.manifest,
+            temporal_fixture.config,
+            ClipSpec("current", (0,)),
+            training=False,
+            alignment_snapshot=snapshot,
+        )
+
+
 def test_temporal_clip_fails_closed_when_valid_support_cache_entry_is_missing(
     temporal_fixture,
 ):

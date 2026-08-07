@@ -42,7 +42,10 @@ _MANIFEST_CHILDREN = (
 
 @pytest.fixture
 def temporal_config():
-    return load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    return replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        pretrained_weights=None,
+    )
 
 
 def _write_manifest_set(
@@ -502,6 +505,134 @@ def test_best_map50_checkpoint_patience_and_run_provenance(
     assert best["alignment_cache_sha256"] is None
 
 
+def test_public_weight_fingerprint_is_content_bound_and_persisted_consistently(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    weights = tmp_path / "public.pt"
+    observed = []
+    for label, content in (("first", b"public-a"), ("second", b"public-b")):
+        weights.write_bytes(content)
+        expected_digest = hashlib.sha256(content).hexdigest()
+        result = train_model(
+            "baseline",
+            replace(
+                temporal_config,
+                pilot_epochs=1,
+                pretrained_weights=str(weights),
+            ),
+            manifest,
+            tmp_path / label,
+            hooks=_tiny_hooks(TinyOBB(), map50_values=[0.1]),
+        )
+        run = json.loads((result.output_dir / "run.json").read_text())
+        last = torch.load(
+            result.last_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        best = torch.load(
+            result.best_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+        provenance = run["load_provenance"]
+        assert provenance["kind"] == "pretrained"
+        assert provenance["weights"] == str(weights.resolve())
+        assert provenance["weights_sha256"] == expected_digest
+        assert last["load_provenance"] == provenance
+        assert best["load_provenance"] == provenance
+        observed.append(provenance["weights_sha256"])
+
+    assert observed == [
+        hashlib.sha256(b"public-a").hexdigest(),
+        hashlib.sha256(b"public-b").hexdigest(),
+    ]
+    assert observed[0] != observed[1]
+
+
+def test_public_weight_fingerprint_waits_for_model_factory_materialization(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    weights = tmp_path / "materialized-public.pt"
+    content = b"materialized-during-model-construction"
+    expected_digest = hashlib.sha256(content).hexdigest()
+    hooks = _tiny_hooks(TinyOBB(), map50_values=[0.1])
+
+    def materializing_factory(_name, requested, _cfg):
+        assert requested == str(weights)
+        weights.write_bytes(content)
+        return TinyOBB()
+
+    result = train_model(
+        "baseline",
+        replace(
+            temporal_config,
+            pilot_epochs=1,
+            pretrained_weights=str(weights),
+        ),
+        manifest,
+        tmp_path / "run",
+        hooks=replace(hooks, model_factory=materializing_factory),
+    )
+
+    run = json.loads((result.output_dir / "run.json").read_text())
+    last = torch.load(
+        result.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    best = torch.load(
+        result.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert run["load_provenance"]["weights"] == str(weights.resolve())
+    assert run["load_provenance"]["weights_sha256"] == expected_digest
+    assert last["load_provenance"] == run["load_provenance"]
+    assert best["load_provenance"] == run["load_provenance"]
+
+
+@pytest.mark.parametrize("unsafe_kind", ["missing", "symlink"])
+def test_public_weight_fingerprint_fails_closed_without_safe_local_content(
+    tmp_path,
+    temporal_config,
+    unsafe_kind,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    weights = tmp_path / "public.pt"
+    if unsafe_kind == "symlink":
+        external = tmp_path / "external.pt"
+        external.write_bytes(b"public")
+        weights.symlink_to(external)
+    factory_calls = []
+    hooks = _tiny_hooks(TinyOBB(), map50_values=[0.1])
+    hooks = replace(
+        hooks,
+        model_factory=lambda name, requested, cfg: (
+            factory_calls.append((name, requested, cfg)) or TinyOBB()
+        ),
+    )
+
+    with pytest.raises(ValueError, match="public.*weights"):
+        train_model(
+            "baseline",
+            replace(
+                temporal_config,
+                pilot_epochs=1,
+                pretrained_weights=str(weights),
+            ),
+            manifest,
+            tmp_path / "run",
+            hooks=hooks,
+        )
+
+    assert len(factory_calls) == 1
+
+
 def test_resume_restores_model_optimizer_epoch_and_records_load_provenance(
     tmp_path,
     temporal_config,
@@ -541,6 +672,8 @@ def test_resume_restores_model_optimizer_epoch_and_records_load_provenance(
     run = json.loads((tmp_path / "resumed" / "run.json").read_text())
     assert run["load_provenance"]["kind"] == "resume"
     assert run["load_provenance"]["checkpoint"] == str(first.last_checkpoint)
+    assert run["load_provenance"]["weights"] is None
+    assert run["load_provenance"]["weights_sha256"] is None
     assert (
         run["load_provenance"]["manifest_sha256"]
         == manifest_fingerprint(manifest)
@@ -548,6 +681,13 @@ def test_resume_restores_model_optimizer_epoch_and_records_load_provenance(
     history = json.loads((tmp_path / "resumed" / "history.json").read_text())
     assert [record["epoch"] for record in history] == [0, 1, 2]
     assert checkpoint["history"] == history
+    assert checkpoint["load_provenance"] == run["load_provenance"]
+    best = torch.load(
+        resumed.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert best["load_provenance"] == run["load_provenance"]
 
 
 def test_internal_initialization_is_separate_from_resume_and_pretrained_route(
@@ -591,6 +731,8 @@ def test_internal_initialization_is_separate_from_resume_and_pretrained_route(
     assert run["load_provenance"]["checkpoint_sha256"] == hashlib.sha256(
         source_checkpoint.read_bytes()
     ).hexdigest()
+    assert run["load_provenance"]["weights"] is None
+    assert run["load_provenance"]["weights_sha256"] is None
     assert run["load_provenance"]["source_epoch"] == 7
     initialized = torch.load(
         result.last_checkpoint,
@@ -605,6 +747,13 @@ def test_internal_initialization_is_separate_from_resume_and_pretrained_route(
     assert source_payload["alignment_cache_sha256"] is None
     assert run["alignment_cache_sha256"] is None
     assert initialized["alignment_cache_sha256"] is None
+    assert initialized["load_provenance"] == run["load_provenance"]
+    best = torch.load(
+        result.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert best["load_provenance"] == run["load_provenance"]
 
 
 def test_default_temporal_training_records_one_frozen_alignment_fingerprint(
@@ -1796,6 +1945,7 @@ def test_temporal_resume_rejects_changed_alignment_snapshot_side_effect_free(
         temporal_fixture.config,
         pilot_epochs=1,
         effective_batch_size=1,
+        pretrained_weights=None,
     )
     first = train_model(
         "mg_vtod",

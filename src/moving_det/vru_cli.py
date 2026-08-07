@@ -184,6 +184,9 @@ class VisualizationRequest:
     manifest_dir: Path
     run_dirs: tuple[Path, ...]
     manifest_sha256: str
+    alignment_cache: Path | None = None
+    alignment_snapshot: object | None = None
+    alignment_cache_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -276,6 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs=3,
         metavar=("BASELINE", "MG_VTOD", "LSTFE"),
     )
+    visualize.add_argument("--alignment-cache", type=_path_argument)
     visualize.add_argument("--output", type=_path_argument, required=True)
 
     compare = subparsers.add_parser(
@@ -1260,6 +1264,7 @@ def run_cache_alignments(
         summary = {
             "schema_version": 1,
             "manifest_sha256": manifest_sha256,
+            "alignment_cache_sha256": cache.snapshot().fingerprint,
             "seed": getattr(cfg, "seed"),
             "job_count": len(jobs),
             "fallback_count": sum(reasons.values()),
@@ -3591,8 +3596,8 @@ def _write_data_smoke_panel(
     draw.text(
         (24, 1010),
         (
-            "support validity and exact augmentation/local-global coordinates "
-            "are frozen in index.json"
+            "support strip is manual display only; dataset-consumed temporal "
+            "evidence is frozen separately in index.json"
         ),
         fill=(220, 224, 230),
         font=ImageFont.load_default(),
@@ -3606,6 +3611,121 @@ def _write_data_smoke_panel(
         optimize=False,
         progressive=False,
     )
+
+
+def _temporal_smoke_sample_evidence(
+    sample: object,
+    descriptor: Mapping[str, object],
+    *,
+    offsets: tuple[int, ...],
+    alignment_cache_sha256: str,
+) -> dict[str, object]:
+    import torch
+
+    if not isinstance(sample, Mapping):
+        raise WorkflowError("temporal data-smoke dataset sample is malformed")
+    metadata = sample.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise WorkflowError("temporal data-smoke metadata is malformed")
+    center_identity = {
+        "site": descriptor["site"],
+        "sequence": descriptor["sequence"],
+        "center_frame": descriptor["center_frame"],
+    }
+    for field, expected in center_identity.items():
+        if metadata.get(field) != expected:
+            raise WorkflowError(
+                f"temporal data-smoke center identity drifted at {field}"
+            )
+    manifest_identity = {
+        "source": descriptor["source"],
+        "tile_xywh": tuple(int(value) for value in descriptor["tile_xywh"]),
+    }
+    for field, expected in manifest_identity.items():
+        if metadata.get(field) != expected:
+            raise WorkflowError(
+                f"temporal data-smoke manifest identity drifted at {field}"
+            )
+    if metadata.get("offsets") != offsets:
+        raise WorkflowError("temporal data-smoke dataset offsets drifted")
+
+    frames = torch.as_tensor(sample.get("frames"))
+    valid = torch.as_tensor(sample.get("valid"))
+    transforms = torch.as_tensor(sample.get("transforms"))
+    raw_paths = metadata.get("support_paths")
+    tile_values = descriptor["tile_xywh"]
+    assert isinstance(tile_values, Sequence)
+    tile_width = int(tile_values[2])
+    tile_height = int(tile_values[3])
+    if (
+        frames.shape != (len(offsets), 3, tile_height, tile_width)
+        or not bool(torch.isfinite(frames).all())
+        or valid.dtype != torch.bool
+        or valid.shape != (len(offsets),)
+        or transforms.shape != (len(offsets), 2, 3)
+        or not bool(torch.isfinite(transforms).all())
+        or isinstance(raw_paths, (str, bytes))
+        or not isinstance(raw_paths, Sequence)
+        or len(raw_paths) != len(offsets)
+    ):
+        raise WorkflowError(
+            "temporal data-smoke dataset evidence shape is malformed"
+        )
+    paths = list(raw_paths)
+    valid_mask = [bool(value) for value in valid.detach().cpu().tolist()]
+    if any(
+        (path is not None) != is_valid
+        or (path is not None and not isinstance(path, str))
+        for path, is_valid in zip(paths, valid_mask, strict=True)
+    ):
+        raise WorkflowError(
+            "temporal data-smoke support paths disagree with valid mask"
+        )
+    center_path = _absolute_resolved_path(
+        descriptor.get("image_path"),
+        field="temporal data-smoke center path",
+    )
+    center_frame = int(descriptor["center_frame"])
+    if center_path.name != f"{center_frame:06d}.jpg":
+        raise WorkflowError(
+            "temporal data-smoke center path drifted from its identity"
+        )
+    sequence_root = center_path.parent
+    for offset, path, is_valid in zip(
+        offsets,
+        paths,
+        valid_mask,
+        strict=True,
+    ):
+        if not is_valid:
+            continue
+        support_frame = center_frame + offset
+        support = _absolute_resolved_path(
+            path,
+            field="temporal data-smoke support path",
+        )
+        expected_support = (
+            sequence_root / f"{support_frame:06d}.jpg"
+        ).resolve(strict=False)
+        if (
+            support_frame <= 0
+            or support != expected_support
+            or not support.is_relative_to(sequence_root)
+        ):
+            raise WorkflowError(
+                "temporal data-smoke support path drifted from its offset"
+            )
+    return {
+        "offsets": list(offsets),
+        "valid_support_mask": valid_mask,
+        "local_affine_matrices": (
+            transforms.detach().cpu().to(dtype=torch.float32).tolist()
+        ),
+        "support_paths": paths,
+        "alignment_cache_sha256": alignment_cache_sha256,
+        "center_identity": center_identity,
+        "frame_tensor_shape": list(frames.shape),
+    }
 
 
 def _visualize_gt_workflow(
@@ -3626,15 +3746,43 @@ def _visualize_gt_workflow(
     inspection = TemporalClipDataset(
         request.manifest_dir / "train.jsonl",
         request.cfg,
-        ClipSpec("data-smoke-current", (0,)),
+        ClipSpec("pre-cache-current-frame-geometry", (0,)),
         training=False,
     )
     augmented_dataset = TemporalClipDataset(
         request.manifest_dir / "train.jsonl",
         request.cfg,
-        ClipSpec("data-smoke-augmented", (0,)),
+        ClipSpec("pre-cache-current-frame-augmentation", (0,)),
         training=True,
     )
+    temporal_datasets = {}
+    if request.alignment_snapshot is not None:
+        if not _is_sha256(request.alignment_cache_sha256):
+            raise WorkflowError(
+                "temporal data-smoke cache fingerprint is invalid"
+            )
+        for model_name, offsets in (
+            ("mg_vtod", tuple(getattr(request.cfg, "mg_offsets"))),
+            ("lstfe", tuple(getattr(request.cfg, "lstfe_offsets"))),
+        ):
+            try:
+                dataset = TemporalClipDataset(
+                    request.manifest_dir / "train.jsonl",
+                    request.cfg,
+                    ClipSpec(model_name, offsets),
+                    training=False,
+                    alignment_snapshot=request.alignment_snapshot,
+                )
+            except ValueError as exc:
+                raise WorkflowError(
+                    f"failed to construct {model_name} temporal "
+                    f"data-smoke dataset: {exc}"
+                ) from exc
+            if dataset.alignment_cache_sha256 != request.alignment_cache_sha256:
+                raise WorkflowError(
+                    f"{model_name} temporal data-smoke cache fingerprint drifted"
+                )
+            temporal_datasets[model_name] = (dataset, offsets)
     panels = []
     for panel_index, descriptor in enumerate(selected):
         manifest_index = int(descriptor["manifest_index"])
@@ -3687,6 +3835,38 @@ def _visualize_gt_workflow(
             request.cfg,
             descriptor,
         )
+        temporal_evidence = None
+        if temporal_datasets:
+            model_evidence = {}
+            for model_name, (dataset, model_offsets) in (
+                temporal_datasets.items()
+            ):
+                try:
+                    temporal_sample = dataset[manifest_index]
+                    model_evidence[model_name] = (
+                        _temporal_smoke_sample_evidence(
+                            temporal_sample,
+                            descriptor,
+                            offsets=model_offsets,
+                            alignment_cache_sha256=str(
+                                request.alignment_cache_sha256
+                            ),
+                        )
+                    )
+                except WorkflowError:
+                    raise
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise WorkflowError(
+                        f"{model_name} temporal data-smoke dataset "
+                        f"validation failed: {exc}"
+                    ) from exc
+            temporal_evidence = {
+                "evidence_kind": "temporal-clip-dataset",
+                "alignment_snapshot_sha256": (
+                    request.alignment_cache_sha256
+                ),
+                "models": model_evidence,
+            }
         frames = torch.as_tensor(sample["frames"])
         augmented_frames = torch.as_tensor(augmented_sample["frames"])
         current = _tensor_rgb(frames[0])
@@ -3726,7 +3906,12 @@ def _visualize_gt_workflow(
                 "tile_xywh": descriptor["tile_xywh"],
                 "frame_size": descriptor["frame_size"],
                 "edge_anchored": descriptor["edge_anchored"],
-                "support_frames": list(support_evidence),
+                "manual_support_strip": {
+                    "evidence_kind": "manual-display-only",
+                    "offsets": list(offsets),
+                    "support_frames": list(support_evidence),
+                },
+                "temporal_dataset_evidence": temporal_evidence,
                 "local_obbs": local_obbs,
                 "full_frame_obbs": full_obbs,
                 "augmentation": dict(
@@ -3745,7 +3930,19 @@ def _visualize_gt_workflow(
             {
                 "schema_version": 1,
                 "manifest_sha256": request.manifest_sha256,
-                "mode": "strict-dataset-data-smoke",
+                "mode": (
+                    "pre-cache-current-frame-geometry-smoke"
+                    if request.alignment_snapshot is None
+                    else "post-cache-temporal-dataset-smoke"
+                ),
+                "alignment_cache": (
+                    None
+                    if request.alignment_cache is None
+                    else str(request.alignment_cache.resolve())
+                ),
+                "alignment_cache_sha256": (
+                    request.alignment_cache_sha256
+                ),
                 "selection_policy": (
                     "two-sequence site/class/background/edge cover"
                 ),
@@ -3766,6 +3963,23 @@ def run_visualize(
     manifest = Path(args.manifest)
     manifest_sha256 = _manifest_fingerprint(manifest)
     run_dirs = tuple(Path(path) for path in (args.runs or ()))
+    alignment_cache = (
+        None
+        if args.alignment_cache is None
+        else Path(args.alignment_cache)
+    )
+    if run_dirs and alignment_cache is not None:
+        raise WorkflowError(
+            "--alignment-cache is only valid for GT data-smoke visualization"
+        )
+    alignment_snapshot = (
+        None
+        if alignment_cache is None
+        else _verified_alignment_snapshot(
+            alignment_cache,
+            source_manifest=manifest,
+        )
+    )
     preloaded_records = (
         _load_compatible_run_records(run_dirs)
         if run_dirs
@@ -3784,7 +3998,11 @@ def run_visualize(
         )
     output = _validate_output(
         Path(args.output),
-        inputs=(manifest, *run_dirs),
+        inputs=(
+            manifest,
+            *run_dirs,
+            *((alignment_cache,) if alignment_cache is not None else ()),
+        ),
         source_roots=(
             Path(getattr(cfg, "image_root")),
             Path(getattr(cfg, "metadata_root")),
@@ -3796,6 +4014,13 @@ def run_visualize(
         manifest_dir=manifest,
         run_dirs=run_dirs,
         manifest_sha256=manifest_sha256,
+        alignment_cache=alignment_cache,
+        alignment_snapshot=alignment_snapshot,
+        alignment_cache_sha256=(
+            None
+            if alignment_snapshot is None
+            else alignment_snapshot.fingerprint
+        ),
     )
     if visualizer is None:
         if preloaded_records is not None:
@@ -3842,6 +4067,36 @@ def _verify_alignment_cache_summary(
         or not isinstance(index.get("entries"), Mapping)
     ):
         raise WorkflowError("alignment cache index schema is invalid")
+
+
+def _verified_alignment_snapshot(
+    cache_root: Path,
+    *,
+    source_manifest: Path,
+) -> object:
+    _verify_alignment_cache_summary(
+        cache_root,
+        source_manifest=source_manifest,
+    )
+    summary = _read_json(Path(cache_root) / "summary.json")
+    assert isinstance(summary, Mapping)
+    expected_fingerprint = summary.get("alignment_cache_sha256")
+    if not _is_sha256(expected_fingerprint):
+        raise WorkflowError("alignment cache fingerprint is invalid")
+
+    from moving_det.vrud.alignment import AlignmentCache
+
+    try:
+        snapshot = AlignmentCache(cache_root).snapshot()
+    except ValueError as exc:
+        raise WorkflowError(
+            f"alignment cache snapshot is invalid: {exc}"
+        ) from exc
+    if snapshot.fingerprint != expected_fingerprint:
+        raise WorkflowError(
+            "alignment cache fingerprint does not match its immutable snapshot"
+        )
+    return snapshot
 
 
 def _verify_checkpoint_alignment_provenance(

@@ -145,6 +145,11 @@ conda run -n moving-det-vru moving-det-vru visualize \
   --manifest runs/vrud-pilot/manifest \
   --output runs/vrud-pilot/data-smoke
 
+conda run -n moving-det-vru moving-det-vru visualize \
+  --manifest runs/vrud-pilot/manifest \
+  --alignment-cache runs/vrud-pilot/alignment-cache \
+  --output runs/vrud-pilot/temporal-data-smoke
+
 conda run -n moving-det-vru moving-det-vru audit-sample \
   --manifest runs/vrud-pilot/manifest \
   --count 20 \
@@ -153,10 +158,18 @@ conda run -n moving-det-vru moving-det-vru audit-sample \
 
 `audit-sample` 只读取冻结 manifest、原始 GT 和类别元数据，固定种子
 `20260806`，在可用时覆盖四类和两个站点；它不打开 prediction 或 checkpoint。
-`visualize` 的 data-smoke 同样不读取模型产物：它从 train manifest 确定性选择
-一个 site19 与一个 site22 序列，覆盖四个修正类别、至少一个背景 tile 和一个
-边缘锚定 tile，并把 MG/LSTFE 支持帧有效性、局部/全图 OBB、类别修正与一次固定
-增强一并写入 `index.json` 和面板。
+不带 `--alignment-cache` 的 `visualize` 是
+`pre-cache-current-frame-geometry-smoke`：它从 train manifest 确定性选择一个
+site19 与一个 site22 序列，覆盖四个修正类别、至少一个背景 tile 和一个边缘锚定
+tile，只验证当前帧的 dataset 几何、局部/全图 OBB、类别修正和一次固定增强。面板中
+的时序支持条是 `manual-display-only`，不能作为支持帧有效掩码或缓存仿射已被模型
+dataset 消费的证据。
+
+显式传入 `--alignment-cache` 后，模式变为
+`post-cache-temporal-dataset-smoke`。命令先核对 cache summary、manifest 和
+immutable snapshot 指纹，再把同一个 snapshot 注入真实 MG-VTOD 与 LSTFE
+`TemporalClipDataset`。`index.json` 分模型记录配置 offsets、有效掩码、dataset
+实际返回的局部仿射矩阵、支持路径、中心身份、帧 tensor 形状和 cache SHA-256。
 
 ## VRUD artifact 含义
 
@@ -166,8 +179,13 @@ conda run -n moving-det-vru moving-det-vru audit-sample \
   `(site, sequence, center_frame, support_frame)` 索引的严格仿射变换。ECC
   接收原分辨率帧并在内部下采样，缓存矩阵仍使用原图像素坐标；训练与评测冻结同一
   内容指纹。
+- `<train-output>/run.json`：训练环境、manifest/cache 指纹和
+  `load_provenance`；公开权重的实际绝对路径与内容 SHA-256 和 checkpoint
+  使用同一份 provenance。
 - `<train-output>/checkpoints/{best,last}.pt`：包含 manifest 指纹、模型名、
-  优化器和恢复状态的内部实验 checkpoint；不能当作公开 YOLO 权重读取。
+  优化器、恢复状态和 `load_provenance` 的内部实验 checkpoint；从公开 YOLO
+  权重初始化时，后者记录实际已加载本地文件的绝对路径与 SHA-256。内部
+  init/resume 与公开权重字段严格分离；checkpoint 不能当作公开 YOLO 权重读取。
 - `<evaluation>/run.json`：模型、split、manifest/checkpoint SHA-256、类别 schema、
   冻结逐帧全集、阈值和缓存来源。
 - `<evaluation>/predictions.jsonl` 与 `ground-truth.jsonl`：带站点、序列、帧号的

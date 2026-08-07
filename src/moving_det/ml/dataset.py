@@ -506,6 +506,7 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
         training: bool,
         *,
         alignment_cache: AlignmentCache | None = None,
+        alignment_snapshot: AlignmentSnapshot | None = None,
     ) -> None:
         if not isinstance(cfg, TemporalOBBConfig):
             raise ValueError("cfg must be a TemporalOBBConfig")
@@ -518,19 +519,33 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             and not isinstance(alignment_cache, AlignmentCache)
         ):
             raise ValueError("alignment_cache must be an AlignmentCache")
+        if (
+            alignment_snapshot is not None
+            and not isinstance(alignment_snapshot, AlignmentSnapshot)
+        ):
+            raise ValueError("alignment_snapshot must be an AlignmentSnapshot")
+        if alignment_cache is not None and alignment_snapshot is not None:
+            raise ValueError(
+                "alignment_cache and alignment_snapshot are mutually exclusive"
+            )
+        if len(clip_spec.offsets) == 1 and alignment_snapshot is not None:
+            raise ValueError(
+                "alignment_snapshot is only valid for a temporal clip"
+            )
 
         self.manifest_path = Path(manifest_path)
         self.cfg = cfg
         self.clip_spec = clip_spec
         self.training = training
         if len(clip_spec.offsets) > 1:
-            selected_cache = (
-                alignment_cache
-                if alignment_cache is not None
-                else AlignmentCache(cfg.output_root / "alignment-cache")
-            )
             self._alignment_snapshot: AlignmentSnapshot | None = (
-                selected_cache.snapshot()
+                alignment_snapshot
+                if alignment_snapshot is not None
+                else (
+                    alignment_cache
+                    if alignment_cache is not None
+                    else AlignmentCache(cfg.output_root / "alignment-cache")
+                ).snapshot()
             )
         else:
             self._alignment_snapshot = None

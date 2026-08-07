@@ -806,6 +806,29 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _public_weight_fingerprint(
+    weights: Path | str | None,
+) -> tuple[str | None, str | None]:
+    if weights is None:
+        return None, None
+    requested = Path(weights)
+    if requested.is_symlink():
+        raise ValueError(
+            f"public pretrained weights are missing or unsafe: {requested}"
+        )
+    try:
+        resolved = requested.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            f"public pretrained weights are missing or unsafe: {requested}"
+        ) from exc
+    if resolved.is_symlink() or not resolved.is_file():
+        raise ValueError(
+            f"public pretrained weights are missing or unsafe: {requested}"
+        )
+    return str(resolved), _file_sha256(resolved)
+
+
 def _component_state(component: Any) -> Any | None:
     state_dict = getattr(component, "state_dict", None)
     if callable(state_dict):
@@ -1410,6 +1433,7 @@ def train_model(
         "kind": "pending",
         "checkpoint": None,
         "weights": None,
+        "weights_sha256": None,
         "manifest_sha256": None,
     }
     run: dict[str, Any] = {
@@ -1606,7 +1630,11 @@ def train_model(
             model_name,
             weights,
             cfg,
-        ).to(device)
+        )
+        public_weights, public_weights_sha256 = _public_weight_fingerprint(
+            weights
+        )
+        model = model.to(device)
         history: list[dict[str, Any]] = []
         start_epoch = 0
         epochs_without_improvement = 0
@@ -1623,6 +1651,7 @@ def train_model(
                 "checkpoint": str(source),
                 "checkpoint_sha256": _file_sha256(source),
                 "weights": None,
+                "weights_sha256": None,
                 "manifest_sha256": init_payload["manifest_sha256"],
                 "source_model_name": init_payload.get("model_name"),
                 "source_epoch": init_payload.get("epoch"),
@@ -1636,6 +1665,7 @@ def train_model(
                 "checkpoint": str(source),
                 "checkpoint_sha256": _file_sha256(source),
                 "weights": None,
+                "weights_sha256": None,
                 "manifest_sha256": resume_payload["manifest_sha256"],
                 "model_name": resume_payload.get("model_name"),
                 "epoch": resume_payload.get("epoch"),
@@ -1645,7 +1675,8 @@ def train_model(
                 "kind": "pretrained",
                 "checkpoint": None,
                 "checkpoint_sha256": None,
-                "weights": str(weights) if weights is not None else None,
+                "weights": public_weights,
+                "weights_sha256": public_weights_sha256,
                 "manifest_sha256": manifest_sha256,
             }
         run["load_provenance"] = load_provenance
@@ -1720,7 +1751,11 @@ def train_model(
                     f"{exc}"
                 ) from exc
 
-            _atomic_torch_save(source_best, best_checkpoint)
+            resumed_best = {
+                **source_best,
+                "load_provenance": load_provenance,
+            }
+            _atomic_torch_save(resumed_best, best_checkpoint)
             _atomic_json_write(history_path, history)
 
         run["status"] = "running"
@@ -1880,6 +1915,7 @@ def train_model(
                 "reproducibility_state": (
                     _capture_reproducibility_state(train_loader)
                 ),
+                "load_provenance": load_provenance,
             }
             save_checkpoint(
                 model,
