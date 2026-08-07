@@ -1769,7 +1769,11 @@ def _validate_diagnostic_rows(
                 / sequence
                 / f"{support_frame:06d}.jpg"
             ).resolve(strict=False)
-            if support_frame <= 0 or support != expected_support:
+            if (
+                support_frame <= 0
+                or support != expected_support
+                or not support.is_relative_to(expected_root)
+            ):
                 raise WorkflowError(
                     "diagnostic support path does not match its frame identity"
                 )

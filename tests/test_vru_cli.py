@@ -2048,6 +2048,32 @@ def test_diagnostic_rejects_repeated_path_for_different_offsets(tmp_path):
         )
 
 
+def test_diagnostic_rejects_support_path_resolved_outside_image_root(
+    tmp_path,
+):
+    image_root = tmp_path / "images"
+    site_root = image_root / "site19_sequence"
+    external_sequence = tmp_path / "external_sequence"
+    site_root.mkdir(parents=True)
+    external_sequence.mkdir()
+    external_support = external_sequence / "000031.jpg"
+    external_support.write_bytes(b"frame")
+    (site_root / "sequence_a").symlink_to(
+        external_sequence,
+        target_is_directory=True,
+    )
+    request = _evaluation_request(tmp_path)
+    diagnostic = _valid_diagnostic(tmp_path)
+    diagnostic["support_paths"] = [str(external_support.resolve())]
+    bundle = replace(
+        _evaluation_bundle(validation=True),
+        diagnostics=(diagnostic,),
+    )
+
+    with pytest.raises(WorkflowError, match="support path"):
+        _validate_evaluation_artifacts(bundle, request)
+
+
 def test_lstfe_diagnostic_accepts_four_relative_long_indices_independent_of_offsets(
     tmp_path,
 ):
