@@ -90,7 +90,12 @@ ScalerFactory = Callable[[torch.device], torch.amp.GradScaler]
 
 @dataclass(frozen=True)
 class TrainingHooks:
-    """Narrow seams for fast tests and future full-frame validation."""
+    """Narrow seams for fast tests and future full-frame validation.
+
+    Supplying a custom loader factory is an explicit synthetic/no-cache seam:
+    such runs record a null alignment-cache fingerprint.  Default loaders
+    always resolve and validate frozen dataset snapshots.
+    """
 
     model_factory: ModelFactory = create_model
     loader_factory: LoaderFactory | None = None
@@ -255,9 +260,15 @@ def save_checkpoint(
     model: nn.Module,
     manifest_dir: Path,
     path: Path,
+    *,
+    alignment_cache_sha256: str | None = None,
     **state: Any,
 ) -> Path:
-    reserved = {"model", "manifest_sha256"}
+    reserved = {
+        "model",
+        "manifest_sha256",
+        "alignment_cache_sha256",
+    }
     overlap = reserved.intersection(state)
     if overlap:
         raise ValueError(
@@ -266,6 +277,7 @@ def save_checkpoint(
     payload = {
         "model": model.state_dict(),
         "manifest_sha256": manifest_fingerprint(Path(manifest_dir)),
+        "alignment_cache_sha256": alignment_cache_sha256,
         **state,
     }
     return _atomic_torch_save(payload, Path(path))
@@ -469,6 +481,73 @@ def _default_gate_loader_factory(
         num_workers=0,
         collate_fn=collate_temporal_obb,
     )
+
+
+def _alignment_cache_sha256_for_default_loaders(
+    model_name: str,
+    train_loader: Any,
+    validation_loader: Any,
+    gate_loader: Any | None,
+) -> str | None:
+    loaders = [
+        ("training", train_loader),
+        ("validation", validation_loader),
+    ]
+    if gate_loader is not None:
+        loaders.append(("gate", gate_loader))
+
+    fingerprints = []
+    for label, loader in loaders:
+        dataset = getattr(loader, "dataset", None)
+        if dataset is None or not hasattr(
+            dataset,
+            "alignment_cache_sha256",
+        ):
+            raise ValueError(
+                f"default {label} loader has no alignment fingerprint"
+            )
+        fingerprints.append(
+            (label, dataset.alignment_cache_sha256)
+        )
+
+    if model_name == "baseline":
+        if any(value is not None for _, value in fingerprints):
+            raise ValueError(
+                "baseline default loaders must not use alignment fingerprints"
+            )
+        return None
+
+    for label, value in fingerprints:
+        if (
+            not isinstance(value, str)
+            or len(value) != 64
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError(
+                f"default {label} loader has an invalid alignment fingerprint"
+            )
+    unique = {value for _, value in fingerprints}
+    if len(unique) != 1:
+        raise ValueError(
+            "default loader alignment fingerprints do not match"
+        )
+    return fingerprints[0][1]
+
+
+def _verify_resume_alignment_cache_sha256(
+    last_payload: Mapping[str, Any],
+    best_payload: Mapping[str, Any],
+    current: str | None,
+) -> None:
+    for label, payload in (
+        ("last", last_payload),
+        ("best", best_payload),
+    ):
+        if payload.get("alignment_cache_sha256") != current:
+            raise ValueError(
+                f"resume {label} checkpoint alignment fingerprint does not "
+                "match the current frozen cache snapshot"
+            )
 
 
 def _default_validator(
@@ -996,11 +1075,17 @@ def _validate_resume_checkpoint_payload(
     scaler: torch.amp.GradScaler,
     train_loader: Any,
     manifest_dir: Path,
+    alignment_cache_sha256: str | None,
 ) -> list[dict[str, Any]]:
     _verify_manifest_sha256(
         payload["manifest_sha256"],
         manifest_dir,
     )
+    if payload.get("alignment_cache_sha256") != alignment_cache_sha256:
+        raise ValueError(
+            f"resume {label} checkpoint alignment fingerprint does not "
+            "match the current frozen cache snapshot"
+        )
     payload_model_name = payload.get("model_name")
     if (
         not isinstance(payload_model_name, str)
@@ -1096,6 +1181,7 @@ def _validate_resume_pair(
     scaler: torch.amp.GradScaler,
     train_loader: Any,
     manifest_dir: Path,
+    alignment_cache_sha256: str | None,
 ) -> list[dict[str, Any]]:
     last_history = _validate_resume_checkpoint_payload(
         last_payload,
@@ -1107,6 +1193,7 @@ def _validate_resume_pair(
         scaler=scaler,
         train_loader=train_loader,
         manifest_dir=manifest_dir,
+        alignment_cache_sha256=alignment_cache_sha256,
     )
     best_history = _validate_resume_checkpoint_payload(
         best_payload,
@@ -1118,6 +1205,7 @@ def _validate_resume_pair(
         scaler=scaler,
         train_loader=train_loader,
         manifest_dir=manifest_dir,
+        alignment_cache_sha256=alignment_cache_sha256,
     )
     if (
         last_payload["manifest_sha256"]
@@ -1340,6 +1428,7 @@ def train_model(
         "elapsed_seconds": None,
         "peak_allocated_memory_bytes": 0,
         "manifest_sha256": None,
+        "alignment_cache_sha256": None,
         "model_name": model_name,
         "pretrained_weights": getattr(cfg, "pretrained_weights", None),
         "load_provenance": load_provenance,
@@ -1420,12 +1509,6 @@ def train_model(
                 "overfit mode requires exactly 64 frozen train samples"
             )
 
-        random.seed(cfg.seed)
-        np.random.seed(cfg.seed)
-        torch.manual_seed(cfg.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(cfg.seed)
-
         loader_factory = (
             selected_hooks.loader_factory or _default_loader_factory
         )
@@ -1437,6 +1520,66 @@ def train_model(
             selected_hooks.scaler_factory or _default_scaler_factory
         )
         validator = selected_hooks.validator or _default_validator
+        resume_payload: dict[str, Any] | None = None
+        source_best: dict[str, Any] | None = None
+        if resume_checkpoint is not None:
+            source = Path(resume_checkpoint)
+            resume_payload = _load_checkpoint_payload(source)
+            source_best = _load_checkpoint_payload(source.parent / "best.pt")
+
+        train_loader: Any | None = None
+        validation_loader: Any | None = None
+        gate_loader: Any | None = None
+        alignment_cache_sha256: str | None = None
+
+        def build_loaders() -> None:
+            nonlocal train_loader
+            nonlocal validation_loader
+            nonlocal gate_loader
+            nonlocal alignment_cache_sha256
+            train_loader, validation_loader = loader_factory(
+                model_name,
+                cfg,
+                manifest_root,
+            )
+            if not hasattr(train_loader, "__len__") or len(train_loader) == 0:
+                raise ValueError("training loader must be non-empty and sized")
+            gate_loader = (
+                gate_loader_factory(model_name, cfg, manifest_root)
+                if max_steps is not None
+                else None
+            )
+            alignment_cache_sha256 = (
+                _alignment_cache_sha256_for_default_loaders(
+                    model_name,
+                    train_loader,
+                    validation_loader,
+                    (
+                        gate_loader
+                        if selected_hooks.gate_loader_factory is None
+                        else None
+                    ),
+                )
+                if selected_hooks.loader_factory is None
+                else None
+            )
+            run["alignment_cache_sha256"] = alignment_cache_sha256
+
+        if resume_payload is not None:
+            assert source_best is not None
+            build_loaders()
+            _verify_resume_alignment_cache_sha256(
+                resume_payload,
+                source_best,
+                alignment_cache_sha256,
+            )
+
+        random.seed(cfg.seed)
+        np.random.seed(cfg.seed)
+        torch.manual_seed(cfg.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(cfg.seed)
+
         internal_load = (
             Path(resume_checkpoint)
             if resume_checkpoint is not None
@@ -1454,8 +1597,6 @@ def train_model(
             weights,
             cfg,
         ).to(device)
-        resume_payload: dict[str, Any] | None = None
-        source_best: dict[str, Any] | None = None
         history: list[dict[str, Any]] = []
         start_epoch = 0
         epochs_without_improvement = 0
@@ -1478,8 +1619,8 @@ def train_model(
             }
         elif resume_checkpoint is not None:
             source = Path(resume_checkpoint)
-            resume_payload = _load_checkpoint_payload(source)
-            source_best = _load_checkpoint_payload(source.parent / "best.pt")
+            assert resume_payload is not None
+            assert source_best is not None
             load_provenance = {
                 "kind": "resume",
                 "checkpoint": str(source),
@@ -1500,18 +1641,10 @@ def train_model(
         run["load_provenance"] = load_provenance
 
         optimizer = build_optimizer(model, cfg)
-        train_loader, validation_loader = loader_factory(
-            model_name,
-            cfg,
-            manifest_root,
-        )
-        if not hasattr(train_loader, "__len__") or len(train_loader) == 0:
-            raise ValueError("training loader must be non-empty and sized")
-        gate_loader = (
-            gate_loader_factory(model_name, cfg, manifest_root)
-            if max_steps is not None
-            else None
-        )
+        if train_loader is None:
+            build_loaders()
+        assert train_loader is not None
+        assert validation_loader is not None
         scheduler = LambdaLR(
             optimizer,
             lr_lambda=lambda epoch: _lr_multiplier(
@@ -1538,6 +1671,7 @@ def train_model(
                     scaler=scaler,
                     train_loader=train_loader,
                     manifest_dir=manifest_root,
+                    alignment_cache_sha256=alignment_cache_sha256,
                 )
                 resume_validation_committed = True
                 checkpoint_epoch = resume_payload["epoch"]
@@ -1741,6 +1875,7 @@ def train_model(
                 model,
                 manifest_root,
                 last_checkpoint,
+                alignment_cache_sha256=alignment_cache_sha256,
                 **checkpoint_state,
             )
             if improved:
@@ -1748,6 +1883,7 @@ def train_model(
                     model,
                     manifest_root,
                     best_checkpoint,
+                    alignment_cache_sha256=alignment_cache_sha256,
                     **checkpoint_state,
                 )
 

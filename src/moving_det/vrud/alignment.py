@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from collections.abc import Mapping
 import errno
 import fcntl
 import hashlib
@@ -13,6 +14,7 @@ import re
 import stat
 import tempfile
 import threading
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -61,6 +63,17 @@ class AlignmentKey:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{field} must be a positive integer")
+
+
+@dataclass(frozen=True)
+class AlignmentSnapshot:
+    fingerprint: str
+    _results: Mapping[AlignmentKey, AlignmentResult]
+
+    def get(self, key: AlignmentKey) -> AlignmentResult | None:
+        if not isinstance(key, AlignmentKey):
+            raise ValueError("snapshot key must be an AlignmentKey")
+        return self._results.get(key)
 
 
 def _validate_affine(matrix: object) -> np.ndarray:
@@ -395,6 +408,48 @@ class AlignmentCache:
         if entry["key"] != _key_payload(key):
             raise ValueError("alignment cache requested key is mismatched")
         return self._load_result(entry["artifact"], entry["sha256"])
+
+    def _snapshot_from_index(
+        self,
+        index: dict[str, object],
+    ) -> AlignmentSnapshot:
+        entries = index["entries"]
+        assert isinstance(entries, dict)
+        results: dict[AlignmentKey, AlignmentResult] = {}
+        for digest in sorted(entries):
+            entry = entries[digest]
+            assert isinstance(entry, dict)
+            key_payload = entry["key"]
+            assert isinstance(key_payload, dict)
+            key = AlignmentKey(**key_payload)
+            loaded = self._load_result(
+                entry["artifact"],
+                entry["sha256"],
+            )
+            immutable_matrix = np.frombuffer(
+                loaded.matrix.tobytes(order="C"),
+                dtype=np.float32,
+            ).reshape(2, 3)
+            results[key] = AlignmentResult(
+                matrix=immutable_matrix,
+                correlation=loaded.correlation,
+                used_fallback=loaded.used_fallback,
+                reason=loaded.reason,
+            )
+        fingerprint = hashlib.sha256(_canonical_json(index)).hexdigest()
+        return AlignmentSnapshot(
+            fingerprint=fingerprint,
+            _results=MappingProxyType(results),
+        )
+
+    def snapshot(self) -> AlignmentSnapshot:
+        with _root_thread_lock(self.root):
+            if not self.root.exists():
+                return self._snapshot_from_index(self._empty_index())
+            if not self.root.is_dir():
+                raise ValueError("alignment cache root is not a directory")
+            with self._exclusive_process_lock():
+                return self._snapshot_from_index(self._read_index())
 
     def put(self, key: AlignmentKey, result: AlignmentResult) -> None:
         if not isinstance(key, AlignmentKey):

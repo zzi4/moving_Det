@@ -200,6 +200,108 @@ def test_cache_round_trips_alignment_fields(tmp_path):
     assert actual.reason is None
 
 
+def test_snapshot_fingerprint_is_deterministic_and_binds_immutable_results(
+    tmp_path,
+):
+    cache = AlignmentCache(tmp_path / "alignment-cache")
+    cache.put(_key(), _result())
+
+    first = cache.snapshot()
+    repeated = cache.snapshot()
+    frozen_result = first.get(_key())
+
+    assert first.fingerprint == repeated.fingerprint
+    assert len(first.fingerprint) == 64
+    assert frozen_result is not None
+    with pytest.raises(ValueError, match="read-only"):
+        frozen_result.matrix[0, 2] = 99.0
+
+    cache.put(
+        _key(),
+        _result(
+            np.float32([[1, 0, 9], [0, 1, 4]]),
+            correlation=0.99,
+        ),
+    )
+    changed = cache.snapshot()
+
+    assert changed.fingerprint != first.fingerprint
+    np.testing.assert_array_equal(
+        first.get(_key()).matrix,
+        np.float32([[1, 0, 2], [0, 1, -1]]),
+    )
+    np.testing.assert_array_equal(
+        changed.get(_key()).matrix,
+        np.float32([[1, 0, 9], [0, 1, 4]]),
+    )
+
+
+def test_snapshot_holds_cache_transaction_across_index_and_artifact_reads(
+    tmp_path,
+    monkeypatch,
+):
+    cache = AlignmentCache(tmp_path / "alignment-cache")
+    cache.put(_key(), _result())
+    entered_load = threading.Event()
+    release_load = threading.Event()
+    put_finished = threading.Event()
+    snapshot_rows = []
+    errors = []
+    real_load_result = cache._load_result
+
+    def blocking_load_result(artifact, checksum):
+        entered_load.set()
+        if not release_load.wait(timeout=10):
+            raise TimeoutError("snapshot test did not release artifact read")
+        return real_load_result(artifact, checksum)
+
+    monkeypatch.setattr(cache, "_load_result", blocking_load_result)
+
+    def take_snapshot():
+        try:
+            snapshot_rows.append(cache.snapshot())
+        except BaseException as exc:
+            errors.append(exc)
+
+    def rewrite_cache():
+        try:
+            AlignmentCache(cache.root).put(
+                _key(),
+                _result(
+                    np.float32([[1, 0, 11], [0, 1, 7]]),
+                    correlation=0.98,
+                ),
+            )
+            put_finished.set()
+        except BaseException as exc:
+            errors.append(exc)
+
+    snapshot_thread = threading.Thread(target=take_snapshot)
+    snapshot_thread.start()
+    assert entered_load.wait(timeout=10)
+    put_thread = threading.Thread(target=rewrite_cache)
+    put_thread.start()
+    assert not put_finished.wait(timeout=0.2)
+
+    release_load.set()
+    snapshot_thread.join(timeout=10)
+    put_thread.join(timeout=10)
+
+    assert not snapshot_thread.is_alive()
+    assert not put_thread.is_alive()
+    assert errors == []
+    assert put_finished.is_set()
+    assert len(snapshot_rows) == 1
+    np.testing.assert_array_equal(
+        snapshot_rows[0].get(_key()).matrix,
+        np.float32([[1, 0, 2], [0, 1, -1]]),
+    )
+    np.testing.assert_array_equal(
+        cache.snapshot().get(_key()).matrix,
+        np.float32([[1, 0, 11], [0, 1, 7]]),
+    )
+
+
 def test_textureless_ecc_fallback_and_reason_are_cached(tmp_path):
     blank = np.zeros((128, 128), dtype=np.uint8)
     fallback = estimate_euclidean_ecc(blank, blank, _Limits())

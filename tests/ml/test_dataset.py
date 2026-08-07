@@ -135,6 +135,52 @@ def test_temporal_clip_loads_each_exact_cached_support_key(temporal_fixture):
     assert bool(torch.isfinite(sample["transforms"]).all())
 
 
+def test_temporal_dataset_freezes_one_alignment_snapshot_for_its_lifetime(
+    temporal_fixture,
+    monkeypatch,
+):
+    original = np.float32([[1.0, 0.0, -4.0], [0.0, 1.0, 1.0]])
+    cache = _cache_required_supports(
+        temporal_fixture,
+        matrices={-4: original},
+    )
+    dataset = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod", (-4, -2, 0, 2, 4)),
+        training=False,
+        alignment_cache=cache,
+    )
+    frozen_fingerprint = dataset.alignment_cache_sha256
+    cache.put(
+        AlignmentKey("site22", "sequence_a", 5, 1),
+        AlignmentResult(
+            matrix=np.float32(
+                [[1.0, 0.0, 77.0], [0.0, 1.0, 55.0]]
+            ),
+            correlation=0.99,
+            used_fallback=False,
+            reason=None,
+        ),
+    )
+    monkeypatch.setattr(
+        cache,
+        "get",
+        lambda _key: pytest.fail("dataset performed a live cache read"),
+    )
+
+    sample = dataset[0]
+
+    assert dataset.alignment_cache_sha256 == frozen_fingerprint
+    assert cache.snapshot().fingerprint != frozen_fingerprint
+    torch.testing.assert_close(
+        sample["transforms"][0],
+        torch.from_numpy(original),
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_temporal_clip_fails_closed_when_valid_support_cache_entry_is_missing(
     temporal_fixture,
 ):

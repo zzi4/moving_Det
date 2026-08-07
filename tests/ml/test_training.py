@@ -24,7 +24,10 @@ from moving_det.ml.training import (
     train_model,
     verify_checkpoint_manifest,
 )
+from moving_det.motion.alignment import AlignmentResult
 from moving_det.temporal_config import load_temporal_config
+from moving_det.vrud.alignment import AlignmentCache, AlignmentKey
+from tests.vrud.conftest import temporal_fixture
 
 
 _MANIFEST_CHILDREN = (
@@ -71,6 +74,65 @@ def _write_manifest_set(
     return directory
 
 
+def _prepare_default_temporal_training(temporal_fixture):
+    manifest_root = temporal_fixture.manifest.parent
+    payload = json.loads(
+        temporal_fixture.manifest.read_text(encoding="utf-8")
+    )
+    validation = {
+        **payload,
+        "split": "validation",
+        "source": "evaluation",
+    }
+    test = {
+        **payload,
+        "split": "test",
+        "source": "evaluation",
+    }
+    (manifest_root / "validation.jsonl").write_text(
+        json.dumps(validation, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    (manifest_root / "test.jsonl").write_text(
+        json.dumps(test, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    (manifest_root / "exclusions.csv").write_text(
+        "reason\n",
+        encoding="utf-8",
+    )
+    (manifest_root / "class-audit.json").write_text(
+        "{}\n",
+        encoding="utf-8",
+    )
+    (manifest_root / "manifest.json").write_text(
+        json.dumps({"seed": temporal_fixture.config.seed}) + "\n",
+        encoding="utf-8",
+    )
+
+    cache = AlignmentCache(
+        temporal_fixture.config.output_root / "alignment-cache"
+    )
+    for offset in (-4, -2, 2, 4):
+        cache.put(
+            AlignmentKey(
+                "site22",
+                "sequence_a",
+                5,
+                5 + offset,
+            ),
+            AlignmentResult(
+                matrix=np.float32(
+                    [[1.0, 0.0, float(offset)], [0.0, 1.0, 0.0]]
+                ),
+                correlation=0.95,
+                used_fallback=False,
+                reason=None,
+            ),
+        )
+    return manifest_root, cache
+
+
 class TinyOBB(nn.Module):
     def __init__(self, initial: float = 0.0004) -> None:
         super().__init__()
@@ -96,6 +158,16 @@ class TinyTemporalOBB(TinyOBB):
 
     def temporal_parameter_names(self) -> set[str]:
         return {"temporal.weight", "temporal.bias"}
+
+
+class DatasetTinyOBB(TinyOBB):
+    def loss(
+        self,
+        _batch: dict[str, Any],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        self.loss_calls += 1
+        loss = torch.square(self.detector.weight).mean()
+        return loss, {"tiny_loss": loss.detach()}
 
 
 class FiniteLossNanGradient(torch.autograd.Function):
@@ -157,6 +229,17 @@ def _tiny_hooks(
         ),
         validator=validator,
         on_optimizer_step=observe_step,
+        device="cpu",
+    )
+
+
+def _default_dataset_hooks(model):
+    return TrainingHooks(
+        model_factory=lambda _name, _weights, _cfg: model,
+        validator=lambda _model, _loader, _device: {
+            "map50": 0.25,
+            "recall_at_riou_025": 0.9,
+        },
         device="cpu",
     )
 
@@ -415,6 +498,8 @@ def test_best_map50_checkpoint_patience_and_run_provenance(
     )
     assert all(math.isfinite(record["train_loss"]) for record in history)
     assert best["history"] == history[:2]
+    assert run["alignment_cache_sha256"] is None
+    assert best["alignment_cache_sha256"] is None
 
 
 def test_resume_restores_model_optimizer_epoch_and_records_load_provenance(
@@ -507,6 +592,100 @@ def test_internal_initialization_is_separate_from_resume_and_pretrained_route(
         source_checkpoint.read_bytes()
     ).hexdigest()
     assert run["load_provenance"]["source_epoch"] == 7
+    initialized = torch.load(
+        result.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    source_payload = torch.load(
+        source_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert source_payload["alignment_cache_sha256"] is None
+    assert run["alignment_cache_sha256"] is None
+    assert initialized["alignment_cache_sha256"] is None
+
+
+def test_default_temporal_training_records_one_frozen_alignment_fingerprint(
+    temporal_fixture,
+):
+    manifest, cache = _prepare_default_temporal_training(temporal_fixture)
+    expected = cache.snapshot().fingerprint
+    baseline_checkpoint = save_checkpoint(
+        DatasetTinyOBB(initial=0.125),
+        manifest,
+        temporal_fixture.config.output_root / "baseline-init.pt",
+        model_name="baseline",
+        epoch=7,
+    )
+    cfg = replace(
+        temporal_fixture.config,
+        pilot_epochs=1,
+        effective_batch_size=1,
+    )
+
+    result = train_model(
+        "mg_vtod",
+        cfg,
+        manifest,
+        temporal_fixture.config.output_root / "temporal-run",
+        init_checkpoint=baseline_checkpoint,
+        hooks=_default_dataset_hooks(DatasetTinyOBB()),
+    )
+
+    run = json.loads((result.output_dir / "run.json").read_text())
+    last = torch.load(
+        result.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    best = torch.load(
+        result.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    source = torch.load(
+        baseline_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert source["alignment_cache_sha256"] is None
+    assert run["load_provenance"]["kind"] == "internal_init"
+    assert run["alignment_cache_sha256"] == expected
+    assert last["alignment_cache_sha256"] == expected
+    assert best["alignment_cache_sha256"] == expected
+
+
+def test_default_temporal_loader_snapshots_must_share_one_fingerprint():
+    class Dataset:
+        def __init__(self, fingerprint):
+            self.alignment_cache_sha256 = fingerprint
+
+    class Loader:
+        def __init__(self, fingerprint):
+            self.dataset = Dataset(fingerprint)
+
+    first = "1" * 64
+    changed = "2" * 64
+
+    with pytest.raises(ValueError, match="alignment.*fingerprint"):
+        training_module._alignment_cache_sha256_for_default_loaders(
+            "mg_vtod",
+            Loader(first),
+            Loader(first),
+            Loader(changed),
+        )
+
+    assert (
+        training_module._alignment_cache_sha256_for_default_loaders(
+            "baseline",
+            Loader(None),
+            Loader(None),
+            Loader(None),
+        )
+        is None
+    )
 
 
 def test_overfit_mode_writes_gate_and_disables_early_stopping(
@@ -1085,6 +1264,7 @@ def test_invalid_last_history_is_rejected_before_target_model_mutation(
         name: value.detach().clone()
         for name, value in target.state_dict().items()
     }
+
     output = tmp_path / "invalid-last"
     output.mkdir()
     sentinels = {
@@ -1563,6 +1743,89 @@ def test_rejected_resume_restores_every_caller_global_rng(
     _assert_global_rng_equal(_global_rng_snapshot(), incoming_rng)
     run = json.loads((output / "run.json").read_text())
     assert run["status"] == "failed"
+
+
+def test_temporal_resume_rejects_changed_alignment_snapshot_side_effect_free(
+    temporal_fixture,
+):
+    manifest, cache = _prepare_default_temporal_training(temporal_fixture)
+    first_cfg = replace(
+        temporal_fixture.config,
+        pilot_epochs=1,
+        effective_batch_size=1,
+    )
+    first = train_model(
+        "mg_vtod",
+        first_cfg,
+        manifest,
+        temporal_fixture.config.output_root / "first-temporal",
+        hooks=_default_dataset_hooks(DatasetTinyOBB(initial=0.01)),
+    )
+    original_payload = torch.load(
+        first.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    original_fingerprint = original_payload["alignment_cache_sha256"]
+    cache.put(
+        AlignmentKey("site22", "sequence_a", 5, 1),
+        AlignmentResult(
+            matrix=np.float32(
+                [[1.0, 0.0, 99.0], [0.0, 1.0, 0.0]]
+            ),
+            correlation=0.99,
+            used_fallback=False,
+            reason=None,
+        ),
+    )
+    changed_fingerprint = cache.snapshot().fingerprint
+    assert changed_fingerprint != original_fingerprint
+
+    target = DatasetTinyOBB(initial=0.875)
+    target_before = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+    }
+    factory_calls = 0
+
+    def model_factory(_name, _weights, _cfg):
+        nonlocal factory_calls
+        factory_calls += 1
+        return target
+
+    random.seed(2701)
+    np.random.seed(2702)
+    torch.manual_seed(2703)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(2704)
+    rng_before = _global_rng_snapshot()
+    output = temporal_fixture.config.output_root / "rejected-temporal-resume"
+
+    with pytest.raises(ValueError, match="alignment.*fingerprint"):
+        train_model(
+            "mg_vtod",
+            replace(first_cfg, pilot_epochs=2),
+            manifest,
+            output,
+            resume_checkpoint=first.last_checkpoint,
+            hooks=replace(
+                _default_dataset_hooks(target),
+                model_factory=model_factory,
+            ),
+        )
+
+    assert factory_calls == 0
+    for name, value in target.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            target_before[name],
+            rtol=0,
+            atol=0,
+        )
+    _assert_global_rng_equal(_global_rng_snapshot(), rng_before)
+    failed_run = json.loads((output / "run.json").read_text())
+    assert failed_run["status"] == "failed"
+    assert failed_run["alignment_cache_sha256"] == changed_fingerprint
 
 
 def test_tied_maximum_cannot_move_inherited_best_to_later_epoch(

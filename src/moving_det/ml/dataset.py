@@ -21,6 +21,7 @@ from moving_det.temporal_config import TemporalOBBConfig
 from moving_det.vrud.alignment import (
     AlignmentCache,
     AlignmentKey,
+    AlignmentSnapshot,
     localize_affine,
 )
 from moving_det.vrud.index import load_corrected_frame, load_track_index
@@ -522,14 +523,21 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
         self.cfg = cfg
         self.clip_spec = clip_spec
         self.training = training
-        self._alignment_cache = (
-            alignment_cache
-            if alignment_cache is not None
-            else (
-                AlignmentCache(cfg.output_root / "alignment-cache")
-                if len(clip_spec.offsets) > 1
-                else None
+        if len(clip_spec.offsets) > 1:
+            selected_cache = (
+                alignment_cache
+                if alignment_cache is not None
+                else AlignmentCache(cfg.output_root / "alignment-cache")
             )
+            self._alignment_snapshot: AlignmentSnapshot | None = (
+                selected_cache.snapshot()
+            )
+        else:
+            self._alignment_snapshot = None
+        self.alignment_cache_sha256 = (
+            None
+            if self._alignment_snapshot is None
+            else self._alignment_snapshot.fingerprint
         )
         self._records = _load_manifest(self.manifest_path, cfg)
         self._tracks = load_track_index(cfg.metadata_root)
@@ -696,14 +704,14 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
         ):
             matrix = np.eye(2, 3, dtype=np.float32)
             if offset != 0 and is_valid:
-                assert self._alignment_cache is not None
+                assert self._alignment_snapshot is not None
                 key = AlignmentKey(
                     record.site,
                     record.sequence,
                     record.center_frame,
                     record.center_frame + offset,
                 )
-                result = self._alignment_cache.get(key)
+                result = self._alignment_snapshot.get(key)
                 if result is None:
                     raise ValueError(
                         "required alignment cache entry is missing: "
