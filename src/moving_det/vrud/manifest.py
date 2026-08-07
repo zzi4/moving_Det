@@ -219,8 +219,16 @@ def _paired_paths(
 
 def _tile_origins(length: int, tile_size: int, overlap: int) -> tuple[int, ...]:
     """Temporary private grid helper; Task 4 replaces it with the public API."""
+    if length < tile_size:
+        raise ValueError(
+            f"source dimension {length} is smaller than tile size {tile_size}"
+        )
     stride = tile_size - overlap
-    return tuple(range(0, length, stride))
+    last_origin = length - tile_size
+    origins = list(range(0, last_origin + 1, stride))
+    if origins[-1] != last_origin:
+        origins.append(last_origin)
+    return tuple(origins)
 
 
 def _frame_tiles(
@@ -468,14 +476,22 @@ def _positive_records(
     selected_records: dict[tuple[object, ...], dict[str, object]] = {}
     positive_clip_counts: Counter[int] = Counter()
     for class_id in sorted(_EXPECTED_CLASSES):
-        candidates = candidates_by_class[class_id]
-        candidates.sort(
-            key=lambda item: (
-                item[0].sequence_key.site,
-                item[0].sequence_key.sequence,
-                item[0].frame_index,
-                item[1],
+        distinct_candidates: dict[
+            tuple[object, ...],
+            dict[str, object],
+        ] = {}
+        for frame, tile in candidates_by_class[class_id]:
+            record = _record(
+                "train",
+                frame,
+                tile,
+                assignments_by_path[frame.image_path].get(tile, ()),
+                "positive",
             )
+            distinct_candidates[_record_identity(record)] = record
+        candidates = sorted(
+            distinct_candidates.values(),
+            key=_record_sort_key,
         )
         selected = _deterministic_sample(
             candidates,
@@ -484,14 +500,7 @@ def _positive_records(
             namespace=f"positive:{class_id}",
         )
         positive_clip_counts[class_id] = len(selected)
-        for frame, tile in selected:
-            record = _record(
-                "train",
-                frame,
-                tile,
-                assignments_by_path[frame.image_path].get(tile, ()),
-                "positive",
-            )
+        for record in selected:
             selected_records[_record_identity(record)] = record
 
     return (
@@ -519,10 +528,15 @@ def _background_records(
             candidates.append(_record("train", frame, tile, (), "background"))
     candidates.sort(key=_record_sort_key)
     requested_count = int(positive_count * cfg.negative_fraction)
+    if len(candidates) < requested_count:
+        raise ValueError(
+            "insufficient distinct clean background clips: "
+            f"required {requested_count}, found {len(candidates)}"
+        )
     return list(
         _deterministic_sample(
             candidates,
-            min(requested_count, len(candidates)),
+            requested_count,
             seed=cfg.seed,
             namespace="background",
         )
@@ -858,15 +872,19 @@ def build_manifests(
         )
 
     exclusion_rows = _exclusion_rows(frames_by_split)
-    exclusion_counts_by_split = {
+    geometry_exclusion_counts_by_split = {
         split: Counter(
-            (
-                row["geometry_reason"]
-                or row["metadata_reason"]
-                or "unknown"
-            )
+            str(row["geometry_reason"])
             for row in exclusion_rows
-            if row["split"] == split
+            if row["split"] == split and row["geometry_reason"]
+        )
+        for split in _SPLIT_NAMES
+    }
+    metadata_exclusion_counts_by_split = {
+        split: Counter(
+            str(row["metadata_reason"])
+            for row in exclusion_rows
+            if row["split"] == split and row["metadata_reason"]
         )
         for split in _SPLIT_NAMES
     }
@@ -897,8 +915,15 @@ def build_manifests(
                     for class_id in sorted(_EXPECTED_CLASSES)
                 },
                 "clip_counts": dict(split_summaries[split].clip_counts),
-                "exclusion_annotation_counts": dict(
-                    sorted(exclusion_counts_by_split[split].items())
+                "geometry_exclusion_counts": dict(
+                    sorted(
+                        geometry_exclusion_counts_by_split[split].items()
+                    )
+                ),
+                "metadata_exclusion_counts": dict(
+                    sorted(
+                        metadata_exclusion_counts_by_split[split].items()
+                    )
                 ),
             }
             for split in _SPLIT_NAMES

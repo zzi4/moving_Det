@@ -134,6 +134,7 @@ def manifest_config(tmp_path: Path) -> TemporalOBBConfig:
                 _shape(6, 64, 116),
                 _shape(7, 0, 64),
                 _shape(99, 64, 64),
+                _shape(100, 0, 96),
             ],
         )
         _write_frame(sequence_dir, 2, [])
@@ -378,3 +379,155 @@ def test_missing_metadata_for_an_approved_sequence_aborts(
         build_manifests(manifest_config, output_dir)
 
     assert not output_dir.exists()
+
+
+def test_class_audit_counts_geometry_and_metadata_exclusions_independently(
+    manifest_config,
+    tmp_path,
+):
+    output_dir = tmp_path / "manifest"
+
+    build_manifests(manifest_config, output_dir)
+
+    audit = json.loads(
+        (output_dir / "class-audit.json").read_text(encoding="utf-8")
+    )
+    train_audit = audit["splits"]["train"]
+    assert train_audit["geometry_exclusion_counts"] == {
+        "edge_clipped": 12,
+    }
+    assert train_audit["metadata_exclusion_counts"] == {
+        "below_mean_velocity": 6,
+        "non_vru_class": 6,
+        "unmatched_metadata": 12,
+    }
+
+
+def test_manifest_tiles_are_edge_anchored_and_stay_inside_image(
+    manifest_config,
+    tmp_path,
+):
+    output_dir = tmp_path / "manifest"
+
+    build_manifests(manifest_config, output_dir)
+
+    records = [
+        json.loads(line)
+        for name in ("train.jsonl", "validation.jsonl", "test.jsonl")
+        for line in (output_dir / name).read_text(encoding="utf-8").splitlines()
+    ]
+    assert any(record["tile_xywh"][:2] == [64, 64] for record in records)
+    assert all(
+        x >= 0
+        and y >= 0
+        and x + width <= 128
+        and y + height <= 128
+        for record in records
+        for x, y, width, height in [record["tile_xywh"]]
+    )
+
+
+def test_background_underfill_preserves_existing_frozen_manifest(
+    manifest_config,
+    tmp_path,
+):
+    cfg = replace(
+        manifest_config,
+        tile_size=128,
+        tile_overlap=64,
+    )
+    output_dir = tmp_path / "manifest"
+    build_manifests(cfg, output_dir)
+    frozen = {
+        path.name: path.read_bytes()
+        for path in sorted(output_dir.iterdir())
+    }
+    for key in PILOT_SPLITS["train"]:
+        for frame_index in (2, 3):
+            json_path = (
+                _sequence_dir(cfg.image_root, key)
+                / f"{frame_index:06d}.json"
+            )
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            payload["shapes"] = [_shape(99, 64, 64)]
+            json_path.write_text(
+                json.dumps(payload, allow_nan=False),
+                encoding="utf-8",
+            )
+
+    with pytest.raises(ValueError, match="background"):
+        build_manifests(cfg, output_dir)
+
+    assert {
+        path.name: path.read_bytes()
+        for path in sorted(output_dir.iterdir())
+    } == frozen
+
+
+def test_per_class_caps_count_distinct_serialized_clips_after_deduplication(
+    manifest_config,
+    tmp_path,
+):
+    train_keys = PILOT_SPLITS["train"]
+    first_frame_path = (
+        _sequence_dir(manifest_config.image_root, train_keys[0])
+        / "000001.json"
+    )
+    first_payload = json.loads(first_frame_path.read_text(encoding="utf-8"))
+    first_payload["shapes"].append(_shape(8, 14, 14))
+    first_frame_path.write_text(
+        json.dumps(first_payload, allow_nan=False),
+        encoding="utf-8",
+    )
+    first_meta_path = _meta_path(manifest_config.metadata_root, train_keys[0])
+    with first_meta_path.open(encoding="utf-8", newline="") as stream:
+        first_meta_rows = list(csv.DictReader(stream))
+    first_meta_rows.append(
+        {name: str(value) for name, value in _meta_row(8, 3).items()}
+    )
+    with first_meta_path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=_META_FIELDS)
+        writer.writeheader()
+        writer.writerows(first_meta_rows)
+
+    for key in train_keys[2:]:
+        json_path = _sequence_dir(
+            manifest_config.image_root,
+            key,
+        ) / "000001.json"
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        payload["shapes"] = [
+            shape
+            for shape in payload["shapes"]
+            if shape["group_id"] != 1
+        ]
+        json_path.write_text(
+            json.dumps(payload, allow_nan=False),
+            encoding="utf-8",
+        )
+
+    cfg = replace(manifest_config, seed=3)
+    output_dir = tmp_path / "manifest"
+    build_manifests(cfg, output_dir)
+
+    train_records = [
+        json.loads(line)
+        for line in (output_dir / "train.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    positive_records = [
+        record
+        for record in train_records
+        if record["source"] == "positive"
+    ]
+    class_zero_records = [
+        record
+        for record in positive_records
+        if any(track_key[2] in {1, 8} for track_key in record["track_keys"])
+    ]
+    audit = json.loads(
+        (output_dir / "class-audit.json").read_text(encoding="utf-8")
+    )
+    assert len(class_zero_records) == 2
+    assert audit["splits"]["train"]["positive_clip_counts"]["0"] == 2

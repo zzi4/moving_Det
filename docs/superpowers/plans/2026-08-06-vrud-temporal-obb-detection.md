@@ -381,7 +381,7 @@ Each clip line must contain:
   "site": "site22",
   "sequence": "DJI_20240719181521_0002_V",
   "center_frame": 4710,
-  "tile_xywh": [3072, 768, 1024, 1024],
+  "tile_xywh": [2816, 768, 1024, 1024],
   "track_keys": [["site22", "DJI_20240719181521_0002_V", 563]],
   "source": "positive"
 }
