@@ -1,9 +1,8 @@
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 import cv2
 import numpy as np
-
-from moving_det.config import ExperimentConfig
 
 
 _SUPPORTED_FRAME_DTYPES = {
@@ -13,6 +12,13 @@ _SUPPORTED_FRAME_DTYPES = {
     np.dtype(np.float32),
     np.dtype(np.float64),
 }
+
+
+@runtime_checkable
+class AlignmentLimits(Protocol):
+    ecc_min_correlation: float
+    ecc_max_translation: float
+    ecc_max_rotation_degrees: float
 
 
 @dataclass(frozen=True)
@@ -41,7 +47,7 @@ def _has_supported_frame_shape(image: np.ndarray) -> bool:
 def estimate_euclidean_ecc(
     reference: np.ndarray,
     moving: np.ndarray,
-    cfg: ExperimentConfig,
+    cfg: AlignmentLimits,
     exclude_mask: np.ndarray | None = None,
 ) -> AlignmentResult:
     if reference.size == 0 or moving.size == 0:

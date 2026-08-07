@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from moving_det.motion.alignment import (
+    AlignmentLimits,
     AlignmentResult,
     estimate_euclidean_ecc,
     warp_to_reference,
@@ -12,6 +13,23 @@ from moving_det.motion.alignment import (
 def synthetic_checkerboard(height: int, width: int) -> np.ndarray:
     yy, xx = np.indices((height, width))
     return ((((xx // 16) + (yy // 16)) % 2) * 255).astype(np.uint8)
+
+
+def test_alignment_limits_is_runtime_checkable_and_minimal():
+    class Limits:
+        ecc_min_correlation = 0.8
+        ecc_max_translation = 20.0
+        ecc_max_rotation_degrees = 2.0
+
+    limits = Limits()
+
+    assert isinstance(limits, AlignmentLimits)
+    result = estimate_euclidean_ecc(
+        synthetic_checkerboard(128, 128),
+        synthetic_checkerboard(128, 128),
+        limits,
+    )
+    assert result.used_fallback is False
 
 
 def test_ecc_recovers_small_translation(config):
