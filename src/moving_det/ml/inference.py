@@ -20,6 +20,19 @@ _CLASS_COUNT = 4
 _DEFAULT_CONFIDENCE_THRESHOLD = 0.25
 
 
+def _namespace_component(value: object, field: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or ":" in value
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(
+            f"{field} must be a non-empty colon-free identifier"
+        )
+    return value
+
+
 def _strict_int(value: object, field: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise ValueError(f"{field} must be an integer at least {minimum}")
@@ -50,6 +63,20 @@ def _validate_obb(obb: object) -> OBB:
     return obb
 
 
+@dataclass(frozen=True, order=True)
+class FrameKey:
+    """A collision-safe site, sequence, and frame identity."""
+
+    site: str
+    sequence: str
+    frame: int
+
+    def __post_init__(self) -> None:
+        _namespace_component(self.site, "site")
+        _namespace_component(self.sequence, "sequence")
+        _strict_int(self.frame, "frame")
+
+
 @dataclass(frozen=True)
 class Detection:
     """A decoded full-frame OBB prediction with its winning source tile."""
@@ -59,6 +86,8 @@ class Detection:
     class_id: int
     confidence: float
     tile: Tile
+    site: str
+    sequence: str
 
     def __post_init__(self) -> None:
         _strict_int(self.frame, "frame")
@@ -71,12 +100,22 @@ class Detection:
             raise ValueError("confidence must be within [0, 1]")
         if not isinstance(self.tile, Tile):
             raise ValueError("tile must be a Tile")
+        _namespace_component(self.site, "site")
+        _namespace_component(self.sequence, "sequence")
+
+    @property
+    def frame_key(self) -> FrameKey:
+        return FrameKey(self.site, self.sequence, self.frame)
 
 
-def _detection_sort_key(detection: Detection) -> tuple[float | int, ...]:
+def _detection_sort_key(
+    detection: Detection,
+) -> tuple[float | int | str, ...]:
     obb = detection.obb
     return (
         -detection.confidence,
+        detection.site,
+        detection.sequence,
         detection.class_id,
         detection.frame,
         obb.cx,
@@ -106,7 +145,7 @@ def merge_tile_detections(
     kept: list[Detection] = []
     for candidate in sorted(validated, key=_detection_sort_key):
         if any(
-            winner.frame == candidate.frame
+            winner.frame_key == candidate.frame_key
             and winner.class_id == candidate.class_id
             and rotated_iou(winner.obb, candidate.obb) > threshold
             for winner in kept
@@ -139,6 +178,8 @@ class _ValidatedClip:
     transforms: Tensor
     zero_index: int
     frame: int
+    site: str
+    sequence: str
     metadata: Mapping[str, Any]
 
 
@@ -188,6 +229,11 @@ def _validate_clip(clip: object) -> _ValidatedClip:
     metadata = clip.get("metadata")
     if not isinstance(metadata, Mapping):
         raise ValueError("clip metadata must be a mapping")
+    site = _namespace_component(metadata.get("site"), "clip metadata site")
+    sequence = _namespace_component(
+        metadata.get("sequence"),
+        "clip metadata sequence",
+    )
     offsets = metadata.get("offsets")
     if (
         not isinstance(offsets, (tuple, list))
@@ -203,6 +249,8 @@ def _validate_clip(clip: object) -> _ValidatedClip:
         transforms=transforms,
         zero_index=zero_index,
         frame=frame,
+        site=site,
+        sequence=sequence,
         metadata=metadata,
     )
 
@@ -320,10 +368,13 @@ def infer_full_frame(
     tiles = full_frame_tiles(width, height, tile_size, overlap)
     device, dtype = _model_device_and_dtype(model, validated.frames)
 
-    was_training = model.training
-    model.eval()
+    training_states = tuple(
+        (module, module.training)
+        for module in model.modules()
+    )
     rows_with_tiles: list[tuple[Tile, Tensor]] = []
     try:
+        model.eval()
         with torch.inference_mode():
             for start in range(0, len(tiles), inference_batch_size):
                 chunk = tiles[start : start + inference_batch_size]
@@ -354,7 +405,8 @@ def infer_full_frame(
                     for tile, rows in zip(chunk, rows_by_tile, strict=True)
                 )
     finally:
-        model.train(was_training)
+        for module, was_training in training_states:
+            module.training = was_training
 
     decoded = []
     for tile, rows in rows_with_tiles:
@@ -382,6 +434,16 @@ def infer_full_frame(
                     class_id=rounded_class,
                     confidence=score,
                     tile=tile,
+                    site=validated.site,
+                    sequence=validated.sequence,
                 )
             )
     return merge_tile_detections(decoded, nms_iou)
+
+
+__all__ = [
+    "Detection",
+    "FrameKey",
+    "infer_full_frame",
+    "merge_tile_detections",
+]

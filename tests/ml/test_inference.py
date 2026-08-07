@@ -7,6 +7,7 @@ import pytest
 import torch
 from torch import nn
 
+import moving_det.ml.inference as inference_module
 from moving_det.models import OBB
 from moving_det.ml.inference import (
     Detection,
@@ -45,6 +46,8 @@ def _detection(
         class_id=class_id,
         confidence=confidence,
         tile=Tile(tile_x, tile_y, 1024, 1024),
+        site="site19",
+        sequence="sequence_a",
     )
 
 
@@ -111,7 +114,11 @@ def test_full_frame_inference_builds_all_temporal_model_contracts(
         "transforms": transforms,
         "zero_index": zero_index,
         "frame": 91,
-        "metadata": {"offsets": offsets, "sequence": "s"},
+        "metadata": {
+            "offsets": offsets,
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
     }
 
     detections = infer_full_frame(model, clip, _cfg())
@@ -139,6 +146,11 @@ def test_full_frame_inference_builds_all_temporal_model_contracts(
         edge.obb.theta,
     ) == pytest.approx((2916.0, 1216.0, 40.0, 20.0, 0.2))
     assert edge.frame == 91
+    assert edge.frame_key == inference_module.FrameKey(
+        "site19",
+        "sequence_a",
+        91,
+    )
 
 
 def test_default_inference_batches_one_tile_at_a_time_to_bound_memory():
@@ -149,7 +161,11 @@ def test_default_inference_batches_one_tile_at_a_time_to_bound_memory():
         "transforms": torch.eye(2, 3).reshape(1, 2, 3),
         "zero_index": 0,
         "frame": 1,
-        "metadata": {"offsets": (0,)},
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
     }
 
     detections = infer_full_frame(model, clip, _cfg())
@@ -171,7 +187,11 @@ def test_full_frame_inference_localizes_affine_to_each_crop():
             "transforms": transforms,
             "zero_index": 0,
             "frame": 1,
-            "metadata": {"offsets": (0,)},
+            "metadata": {
+                "offsets": (0,),
+                "site": "site19",
+                "sequence": "sequence_a",
+            },
         },
         _cfg(inference_batch_size=2),
     )
@@ -206,6 +226,48 @@ def test_rotated_nms_tie_is_deterministic_and_preserves_source_tile():
     assert merge_tile_detections((second, first), 0.5) == (second,)
 
 
+def test_rotated_nms_never_suppresses_across_site_or_sequence_identity():
+    first = Detection(
+        frame=1,
+        obb=OBB(10, 10, 8, 4, 0),
+        class_id=0,
+        confidence=0.9,
+        tile=Tile(0, 0, 32, 32),
+        site="site19",
+        sequence="sequence_a",
+    )
+    other_site = Detection(
+        frame=1,
+        obb=first.obb,
+        class_id=0,
+        confidence=0.8,
+        tile=first.tile,
+        site="site22",
+        sequence="sequence_a",
+    )
+    other_sequence = Detection(
+        frame=1,
+        obb=first.obb,
+        class_id=0,
+        confidence=0.7,
+        tile=first.tile,
+        site="site19",
+        sequence="sequence_b",
+    )
+
+    merged = merge_tile_detections(
+        (first, other_site, other_sequence),
+        0.5,
+    )
+
+    assert len(merged) == 3
+    assert {item.frame_key for item in merged} == {
+        inference_module.FrameKey("site19", "sequence_a", 1),
+        inference_module.FrameKey("site22", "sequence_a", 1),
+        inference_module.FrameKey("site19", "sequence_b", 1),
+    }
+
+
 def test_inference_empty_predictions_and_model_state_are_preserved():
     model = RecordingModel(
         1,
@@ -217,11 +279,86 @@ def test_inference_empty_predictions_and_model_state_are_preserved():
         "transforms": torch.eye(2, 3).reshape(1, 2, 3),
         "zero_index": 0,
         "frame": 1,
-        "metadata": {"offsets": (0,)},
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
     }
 
     assert infer_full_frame(model, clip, _cfg()) == ()
     assert model.training
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_inference_restores_heterogeneous_module_training_flags(failure):
+    class HeterogeneousModel(RecordingModel):
+        def __init__(self):
+            super().__init__(1)
+            self.child = nn.Linear(1, 1)
+
+        def forward(self, batch):
+            if failure:
+                raise RuntimeError("synthetic forward failure")
+            return super().forward(batch)
+
+    model = HeterogeneousModel().train()
+    model.child.eval()
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1024),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
+    }
+
+    if failure:
+        with pytest.raises(RuntimeError, match="synthetic"):
+            infer_full_frame(model, clip, _cfg())
+    else:
+        infer_full_frame(model, clip, _cfg())
+
+    assert model.training
+    assert not model.child.training
+
+
+def test_inference_restores_flags_when_recursive_eval_raises():
+    class EvalRaises(RecordingModel):
+        def __init__(self):
+            super().__init__(1)
+            self.child = nn.Linear(1, 1)
+
+        def train(self, mode=True):
+            result = super().train(mode)
+            if mode is False:
+                raise RuntimeError("synthetic eval failure")
+            return result
+
+    model = EvalRaises().train()
+    model.child.eval()
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1024),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="synthetic eval"):
+        infer_full_frame(model, clip, _cfg())
+
+    assert model.training
+    assert not model.child.training
 
 
 def test_pinned_within_tile_nms_suppresses_same_class_not_other_classes():
@@ -244,7 +381,11 @@ def test_pinned_within_tile_nms_suppresses_same_class_not_other_classes():
         "transforms": torch.eye(2, 3).reshape(1, 2, 3),
         "zero_index": 0,
         "frame": 1,
-        "metadata": {"offsets": (0,)},
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
     }
 
     detections = infer_full_frame(model, clip, _cfg())
@@ -271,6 +412,8 @@ def test_detection_rejects_malformed_values(field, value):
         "class_id": 0,
         "confidence": 0.5,
         "tile": Tile(0, 0, 8, 8),
+        "site": "site19",
+        "sequence": "sequence_a",
     }
     values[field] = value
 
@@ -289,7 +432,11 @@ def test_inference_rejects_nonfinite_pinned_output_and_restores_state():
         "transforms": torch.eye(2, 3).reshape(1, 2, 3),
         "zero_index": 0,
         "frame": 1,
-        "metadata": {"offsets": (0,)},
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
     }
 
     with pytest.raises(ValueError, match="finite"):
@@ -305,7 +452,11 @@ def test_inference_rejects_clip_smaller_than_tile():
         "transforms": torch.eye(2, 3).reshape(1, 2, 3),
         "zero_index": 0,
         "frame": 1,
-        "metadata": {"offsets": (0,)},
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
     }
 
     with pytest.raises(ValueError, match="smaller"):

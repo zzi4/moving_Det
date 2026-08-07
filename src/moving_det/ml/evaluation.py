@@ -20,7 +20,7 @@ from moving_det.evaluation.metrics import (
 )
 from moving_det.geometry.obb import normalize_theta, rotated_iou
 from moving_det.models import OBB
-from moving_det.ml.inference import Detection
+from moving_det.ml.inference import Detection, FrameKey
 
 
 _CLASS_COUNT = 4
@@ -81,13 +81,14 @@ def _validate_obb(obb: object) -> OBB:
 
 @dataclass(frozen=True)
 class GroundTruth:
-    """One evaluable object state from a single sequence."""
+    """One evaluable object state with full frame and track namespace."""
 
     frame: int
     obb: OBB
     class_id: int
     track_id: int | str
     site: str
+    sequence: str
     speed_mps: float
 
     def __post_init__(self) -> None:
@@ -101,13 +102,23 @@ class GroundTruth:
             or not isinstance(self.track_id, (int, str))
             or (isinstance(self.track_id, int) and self.track_id < 0)
             or (isinstance(self.track_id, str) and not self.track_id)
+            or (isinstance(self.track_id, str) and ":" in self.track_id)
+            or (
+                isinstance(self.track_id, str)
+                and any(ord(character) < 32 for character in self.track_id)
+            )
         ):
-            raise ValueError("track_id must be a non-negative integer or non-empty string")
-        if not isinstance(self.site, str) or not self.site:
-            raise ValueError("site must be a non-empty string")
+            raise ValueError(
+                "track_id must be a non-negative integer or colon-free string"
+            )
+        FrameKey(self.site, self.sequence, self.frame)
         speed = _finite(self.speed_mps, "speed_mps")
         if speed < 0:
             raise ValueError("speed_mps must be non-negative")
+
+    @property
+    def frame_key(self) -> FrameKey:
+        return FrameKey(self.site, self.sequence, self.frame)
 
 
 @dataclass(frozen=True)
@@ -178,11 +189,15 @@ class _MatchResult:
     prediction_to_gt: Mapping[int, int]
 
 
-def _prediction_key(item: tuple[int, Detection]) -> tuple[float | int, ...]:
+def _prediction_key(
+    item: tuple[int, Detection],
+) -> tuple[float | int | str, ...]:
     index, detection = item
     obb = detection.obb
     return (
         -detection.confidence,
+        detection.site,
+        detection.sequence,
         detection.frame,
         detection.class_id,
         obb.cx,
@@ -199,9 +214,10 @@ def _prediction_key(item: tuple[int, Detection]) -> tuple[float | int, ...]:
 def _ground_truth_key(item: tuple[int, GroundTruth]) -> tuple[str | int, ...]:
     index, truth = item
     return (
+        truth.site,
+        truth.sequence,
         truth.frame,
         truth.class_id,
-        truth.site,
         str(truth.track_id),
         index,
     )
@@ -220,12 +236,110 @@ def _validate_records(
     if not all(isinstance(item, GroundTruth) for item in truth_rows):
         raise ValueError("ground_truth must contain GroundTruth records")
     identities = [
-        (item.site, item.track_id, item.frame)
+        (item.site, item.sequence, item.track_id, item.frame)
         for item in truth_rows
     ]
     if len(identities) != len(set(identities)):
         raise ValueError("ground_truth contains duplicate track states")
     return prediction_rows, truth_rows
+
+
+def _cfg_required(cfg: object, field: str) -> object:
+    if isinstance(cfg, Mapping):
+        if field not in cfg:
+            raise ValueError(f"evaluation config is missing {field}")
+        return cfg[field]
+    if not hasattr(cfg, field):
+        raise ValueError(f"evaluation config is missing {field}")
+    return getattr(cfg, field)
+
+
+def _serialized_frame_key(value: object) -> FrameKey:
+    if isinstance(value, FrameKey):
+        return value
+    if isinstance(value, Mapping):
+        if set(value) != {"site", "sequence", "frame"}:
+            raise ValueError("serialized evaluated frame has invalid fields")
+        return FrameKey(
+            value["site"],
+            value["sequence"],
+            value["frame"],
+        )
+    if isinstance(value, (tuple, list)) and len(value) == 3:
+        return FrameKey(value[0], value[1], value[2])
+    raise ValueError(
+        "evaluated frame keys must be FrameKey or site/sequence/frame records"
+    )
+
+
+@dataclass(frozen=True)
+class _EvaluationScope:
+    prediction_rows: tuple[Detection, ...]
+    truth_rows: tuple[GroundTruth, ...]
+    frame_keys: tuple[FrameKey, ...]
+    split: str
+    threshold_evidence: ThresholdEvidence | None
+
+
+def _evaluation_scope(
+    predictions: Sequence[Detection],
+    ground_truth: Sequence[GroundTruth],
+    cfg: object,
+    *,
+    allow_test: bool,
+) -> _EvaluationScope:
+    prediction_rows, truth_rows = _validate_records(predictions, ground_truth)
+    raw_frame_keys = _cfg_required(cfg, "evaluated_frame_keys")
+    if (
+        isinstance(raw_frame_keys, (str, bytes))
+        or not isinstance(raw_frame_keys, Sequence)
+    ):
+        raise ValueError("evaluated_frame_keys must be a sequence")
+    frame_keys = tuple(
+        _serialized_frame_key(value)
+        for value in raw_frame_keys
+    )
+    if len(frame_keys) != len(set(frame_keys)):
+        raise ValueError("evaluated frame keys must be unique")
+    frame_universe = frozenset(frame_keys)
+    outside = {
+        item.frame_key
+        for item in (*prediction_rows, *truth_rows)
+        if item.frame_key not in frame_universe
+    }
+    if outside:
+        raise ValueError(
+            "prediction or ground truth lies outside the evaluated frame universe"
+        )
+
+    split = _cfg_required(cfg, "evaluation_split")
+    if split not in {"validation", "test"}:
+        raise ValueError("evaluation_split must be validation or test")
+    evidence = None
+    if split == "test":
+        if not allow_test:
+            raise ValueError(
+                "validation threshold selection requires the validation split"
+            )
+        evidence = load_validation_threshold(
+            _cfg_required(cfg, "threshold_path"),
+            model_name=_cfg_required(cfg, "model_name"),
+            manifest_sha256=_cfg_required(cfg, "manifest_sha256"),
+            checkpoint_sha256=_cfg_required(cfg, "checkpoint_sha256"),
+            evaluation_split="test",
+        )
+        prediction_rows = tuple(
+            item
+            for item in prediction_rows
+            if item.confidence >= evidence.threshold
+        )
+    return _EvaluationScope(
+        prediction_rows=prediction_rows,
+        truth_rows=truth_rows,
+        frame_keys=frame_keys,
+        split=split,
+        threshold_evidence=evidence,
+    )
 
 
 def _match(
@@ -246,11 +360,16 @@ def _match(
         for index, item in enumerate(ground_truth)
         if class_id is None or item.class_id == class_id
     ]
-    truths_by_frame_class: dict[tuple[int, int], list[tuple[int, GroundTruth]]] = (
+    truths_by_frame_class: dict[
+        tuple[FrameKey, int],
+        list[tuple[int, GroundTruth]],
+    ] = (
         defaultdict(list)
     )
     for item in sorted(eligible_truth, key=_ground_truth_key):
-        truths_by_frame_class[(item[1].frame, item[1].class_id)].append(item)
+        truths_by_frame_class[
+            (item[1].frame_key, item[1].class_id)
+        ].append(item)
 
     matched_gt: set[int] = set()
     true_by_prediction = [False] * len(predictions)
@@ -261,7 +380,7 @@ def _match(
     ):
         candidates = []
         for truth_index, truth in truths_by_frame_class.get(
-            (prediction.frame, prediction.class_id),
+            (prediction.frame_key, prediction.class_id),
             (),
         ):
             if truth_index in matched_gt:
@@ -361,7 +480,7 @@ def _speed_bin(speed: float) -> str:
 
 
 def _track_key(truth: GroundTruth) -> str:
-    return f"{truth.site}:{truth.track_id}"
+    return f"{truth.site}:{truth.sequence}:{truth.track_id}"
 
 
 def _stopped_indices(
@@ -411,6 +530,22 @@ def _population_std(values: Sequence[float]) -> float:
     return float(np.std(np.asarray(values, dtype=np.float64))) if values else 0.0
 
 
+def _period_pi_circular_std(values: Sequence[float]) -> float:
+    """Finite doubled-angle circular standard deviation for period-pi data."""
+    if not values:
+        return 0.0
+    doubled = 2.0 * np.asarray(values, dtype=np.float64)
+    resultant = math.hypot(
+        float(np.mean(np.cos(doubled))),
+        float(np.mean(np.sin(doubled))),
+    )
+    safe_resultant = min(
+        1.0,
+        max(resultant, np.finfo(np.float64).tiny),
+    )
+    return 0.5 * math.sqrt(max(0.0, -2.0 * math.log(safe_resultant)))
+
+
 def _jitter_metrics(
     predictions: tuple[Detection, ...],
     ground_truth: tuple[GroundTruth, ...],
@@ -442,7 +577,7 @@ def _jitter_metrics(
                 _population_std(row["dy"]),
             ),
             "size_log": _population_std(row["size"]),
-            "angle_rad": _population_std(row["angle"]),
+            "angle_rad": _period_pi_circular_std(row["angle"]),
         }
     aggregate = {
         name: (
@@ -460,14 +595,24 @@ def evaluate_temporal_obb(
     ground_truth: Sequence[GroundTruth],
     cfg: object,
 ) -> dict[str, Any]:
-    """Evaluate one sequence using real, confidence-ordered rotated matching.
+    """Evaluate a frozen frame universe using confidence-ordered matching.
 
     AP uses COCO's 101 recall points and is macro-averaged only across classes
     containing ground truth. Recall is pooled over ground-truth states.
     Absent classes are retained in ``per_class`` with ``ap50=None``. Empty
     inputs produce finite zero aggregate metrics.
+
+    Test-split evaluation always loads and enforces validation threshold
+    evidence from ``cfg`` before any metric is computed.
     """
-    prediction_rows, truth_rows = _validate_records(predictions, ground_truth)
+    scope = _evaluation_scope(
+        predictions,
+        ground_truth,
+        cfg,
+        allow_test=True,
+    )
+    prediction_rows = scope.prediction_rows
+    truth_rows = scope.truth_rows
     match_025 = _match(prediction_rows, truth_rows, 0.25)
     match_050 = _match(prediction_rows, truth_rows, 0.50)
     gt_count = len(truth_rows)
@@ -500,10 +645,7 @@ def evaluate_temporal_obb(
                 coco_by_class[class_id].append(value)
     map50_95 = float(np.mean(coco_values)) if coco_values else 0.0
 
-    frame_count = len(
-        {item.frame for item in prediction_rows}
-        | {item.frame for item in truth_rows}
-    )
+    frame_count = len(scope.frame_keys)
     false_positive_count = (
         len(prediction_rows)
         - sum(match_025.prediction_is_true_positive)
@@ -590,6 +732,12 @@ def evaluate_temporal_obb(
         "ground_truth_count": gt_count,
         "prediction_count": len(prediction_rows),
         "evaluated_frame_count": frame_count,
+        "evaluation_split": scope.split,
+        "threshold_evidence": (
+            asdict(scope.threshold_evidence)
+            if scope.threshold_evidence is not None
+            else None
+        ),
         "false_positive_count_riou_025": false_positive_count,
         "false_positive_count_riou_050": (
             len(prediction_rows)
@@ -798,7 +946,14 @@ def select_validation_threshold(
     manifest_sha256: str,
     checkpoint_sha256: str,
 ) -> ThresholdEvidence:
-    prediction_rows, truth_rows = _validate_records(predictions, ground_truth)
+    scope = _evaluation_scope(
+        predictions,
+        ground_truth,
+        cfg,
+        allow_test=False,
+    )
+    prediction_rows = scope.prediction_rows
+    truth_rows = scope.truth_rows
     thresholds = sorted(
         {item.confidence for item in prediction_rows},
         reverse=True,
@@ -817,10 +972,7 @@ def select_validation_threshold(
         false_negative = len(truth_rows) - true_positive
         denominator = 2 * true_positive + false_positive + false_negative
         f1 = 2 * true_positive / denominator if denominator else 0.0
-        frame_count = len(
-            {item.frame for item in selected}
-            | {item.frame for item in truth_rows}
-        )
+        frame_count = len(scope.frame_keys)
         fp_per_frame = false_positive / frame_count if frame_count else 0.0
         if fp_per_frame <= fp_limit:
             candidates.append((f1, threshold, fp_per_frame))
@@ -929,6 +1081,7 @@ def load_validation_threshold(
 
 
 __all__ = [
+    "FrameKey",
     "GateResult",
     "GroundTruth",
     "ThresholdEvidence",

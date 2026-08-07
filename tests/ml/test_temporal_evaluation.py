@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import moving_det.ml.inference as inference_module
 from moving_det.models import OBB
 from moving_det.ml.evaluation import (
     GroundTruth,
@@ -26,10 +27,21 @@ from moving_det.vrud.tiling import Tile
 TILE = Tile(0, 0, 1024, 1024)
 
 
-def _cfg(**changes):
+def _cfg(
+    *,
+    frames=(1,),
+    site="site19",
+    sequence="sequence_a",
+    **changes,
+):
     values = {
         "max_false_detections_per_frame": 5.0,
         "seed": 20260806,
+        "evaluation_split": "validation",
+        "evaluated_frame_keys": tuple(
+            (site, sequence, frame)
+            for frame in frames
+        ),
     }
     values.update(changes)
     return SimpleNamespace(**values)
@@ -45,6 +57,8 @@ def _pred(
     theta=0.0,
     cls=0,
     confidence=0.9,
+    site="site19",
+    sequence="sequence_a",
 ):
     return Detection(
         frame,
@@ -52,6 +66,8 @@ def _pred(
         cls,
         confidence,
         TILE,
+        site,
+        sequence,
     )
 
 
@@ -66,6 +82,7 @@ def _gt(
     cls=0,
     track=1,
     site="site19",
+    sequence="sequence_a",
     speed=2.0,
 ):
     return GroundTruth(
@@ -74,6 +91,7 @@ def _gt(
         class_id=cls,
         track_id=track,
         site=site,
+        sequence=sequence,
         speed_mps=speed,
     )
 
@@ -91,6 +109,11 @@ def test_stop_recall_uses_15_frame_velocity_rule():
     assert stopped_interval_mask([0.1] * 15, 0.1, 15) == [False] * 15
 
 
+def test_ground_truth_rejects_control_characters_in_track_identity():
+    with pytest.raises(ValueError, match="track_id"):
+        _gt(1, track="unsafe\ntrack")
+
+
 def test_hand_computable_ap_recall_fp_and_duplicate_prediction():
     ground_truth = (_gt(1), _gt(2))
     predictions = (
@@ -99,7 +122,11 @@ def test_hand_computable_ap_recall_fp_and_duplicate_prediction():
         _pred(2, cx=100, confidence=0.7),  # FP, second GT missed
     )
 
-    metrics = evaluate_temporal_obb(predictions, ground_truth, _cfg())
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _cfg(frames=(1, 2)),
+    )
 
     assert metrics["map50"] == pytest.approx(0.504950495049505)
     assert metrics["map50_95"] == pytest.approx(0.504950495049505)
@@ -109,8 +136,8 @@ def test_hand_computable_ap_recall_fp_and_duplicate_prediction():
     assert metrics["per_class"]["0"]["ap50"] == pytest.approx(
         0.504950495049505
     )
-    assert metrics["per_track"]["site19:1"]["coverage"] == 0.5
-    assert metrics["per_track"]["site19:1"]["longest_miss"] == 1
+    assert metrics["per_track"]["site19:sequence_a:1"]["coverage"] == 0.5
+    assert metrics["per_track"]["site19:sequence_a:1"]["longest_miss"] == 1
 
 
 def test_confidence_order_controls_one_to_one_match_and_cross_class_never_matches():
@@ -128,6 +155,101 @@ def test_confidence_order_controls_one_to_one_match_and_cross_class_never_matche
     assert metrics["per_class"]["1"]["gt_count"] == 0
     assert metrics["per_class"]["1"]["ap50"] is None
     assert metrics["per_class"]["1"]["ap50_95"] is None
+
+
+def test_matching_is_namespaced_by_site_and_sequence_identity():
+    predictions = (
+        Detection(
+            frame=1,
+            obb=OBB(100, 10, 20, 10, 0),
+            class_id=0,
+            confidence=0.9,
+            tile=TILE,
+            site="site19",
+            sequence="sequence_a",
+        ),
+        Detection(
+            frame=1,
+            obb=OBB(200, 10, 20, 10, 0),
+            class_id=0,
+            confidence=0.8,
+            tile=TILE,
+            site="site19",
+            sequence="sequence_b",
+        ),
+    )
+    ground_truth = (
+        GroundTruth(
+            frame=1,
+            obb=OBB(10, 10, 20, 10, 0),
+            class_id=0,
+            track_id=1,
+            site="site19",
+            sequence="sequence_a",
+            speed_mps=2.0,
+        ),
+        GroundTruth(
+            frame=1,
+            obb=OBB(100, 10, 20, 10, 0),
+            class_id=0,
+            track_id=1,
+            site="site22",
+            sequence="sequence_a",
+            speed_mps=2.0,
+        ),
+        GroundTruth(
+            frame=1,
+            obb=OBB(200, 10, 20, 10, 0),
+            class_id=0,
+            track_id=1,
+            site="site19",
+            sequence="sequence_c",
+            speed_mps=2.0,
+        ),
+    )
+    universe = (
+        inference_module.FrameKey("site19", "sequence_a", 1),
+        inference_module.FrameKey("site22", "sequence_a", 1),
+        inference_module.FrameKey("site19", "sequence_b", 1),
+        inference_module.FrameKey("site19", "sequence_c", 1),
+    )
+
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _cfg(evaluated_frame_keys=universe),
+    )
+
+    assert metrics["recall_riou_025"] == 0.0
+    assert set(metrics["per_track"]) == {
+        "site19:sequence_a:1",
+        "site22:sequence_a:1",
+        "site19:sequence_c:1",
+    }
+
+
+def test_fp_per_frame_uses_immutable_evaluated_frame_universe_and_rejects_outside():
+    universe = (
+        ("site19", "sequence_a", 1),
+        ("site19", "sequence_a", 2),
+        ("site19", "sequence_a", 3),
+    )
+    predictions = (_pred(1, cx=100),)
+
+    metrics = evaluate_temporal_obb(
+        predictions,
+        (),
+        _cfg(evaluated_frame_keys=universe),
+    )
+
+    assert metrics["evaluated_frame_count"] == 3
+    assert metrics["false_detections_per_frame"] == pytest.approx(1 / 3)
+    with pytest.raises(ValueError, match="evaluated frame"):
+        evaluate_temporal_obb(
+            (_pred(4),),
+            (),
+            _cfg(evaluated_frame_keys=universe),
+        )
 
 
 def test_strata_report_both_quarter_and_half_riou_recall():
@@ -165,9 +287,9 @@ def test_exact_short_side_boundaries(short_side, expected_bin):
 )
 def test_exact_speed_boundaries_and_site_strata(speed, expected_bin):
     metrics = evaluate_temporal_obb(
-        (_pred(1),),
+        (_pred(1, site="site22"),),
         (_gt(1, speed=speed, site="site22"),),
-        _cfg(),
+        _cfg(site="site22"),
     )
 
     assert metrics["per_speed"][expected_bin]["gt_count"] == 1
@@ -178,14 +300,20 @@ def test_stopped_recall_uses_whole_eligible_run():
     ground_truth = tuple(_gt(i, speed=0.05) for i in range(1, 16))
     predictions = tuple(_pred(i) for i in range(1, 11))
 
-    metrics = evaluate_temporal_obb(predictions, ground_truth, _cfg())
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _cfg(frames=tuple(range(1, 16))),
+    )
 
     assert metrics["stopped_gt_count"] == 15
     assert metrics["stopped_recall_riou_025"] == pytest.approx(10 / 15)
-    assert metrics["per_track"]["site19:1"]["stopped_recall"] == pytest.approx(
+    assert metrics["per_track"][
+        "site19:sequence_a:1"
+    ]["stopped_recall"] == pytest.approx(
         10 / 15
     )
-    assert metrics["per_track"]["site19:1"]["longest_miss"] == 5
+    assert metrics["per_track"]["site19:sequence_a:1"]["longest_miss"] == 5
 
 
 def test_periodic_angle_and_center_size_jitter_are_wrap_safe():
@@ -198,7 +326,11 @@ def test_periodic_angle_and_center_size_jitter_are_wrap_safe():
         _pred(2, cx=11, width=21, theta=math.pi / 2 - 0.01),
     )
 
-    metrics = evaluate_temporal_obb(predictions, ground_truth, _cfg())
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _cfg(frames=(1, 2)),
+    )
 
     assert metrics["jitter"]["center_px"] == pytest.approx(1.0)
     assert metrics["jitter"]["size_log"] == pytest.approx(
@@ -207,8 +339,28 @@ def test_periodic_angle_and_center_size_jitter_are_wrap_safe():
     assert metrics["jitter"]["angle_rad"] < 0.03
 
 
+def test_period_pi_angle_jitter_is_circular_at_residual_boundary():
+    epsilon = 0.01
+    ground_truth = (_gt(1, theta=0), _gt(2, theta=0))
+    predictions = (
+        _pred(1, theta=math.pi / 2 - epsilon),
+        _pred(2, theta=-math.pi / 2 + epsilon),
+    )
+
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _cfg(frames=(1, 2)),
+    )
+
+    assert metrics["jitter"]["angle_rad"] == pytest.approx(
+        epsilon,
+        rel=0.02,
+    )
+
+
 def test_empty_behavior_is_explicit_and_finite():
-    empty = evaluate_temporal_obb((), (), _cfg())
+    empty = evaluate_temporal_obb((), (), _cfg(frames=()))
     only_predictions = evaluate_temporal_obb((_pred(1),), (), _cfg())
     only_gt = evaluate_temporal_obb((), (_gt(1),), _cfg())
 
@@ -288,7 +440,7 @@ def test_gate_accepts_the_complete_evaluation_metric_schema():
     metrics = evaluate_temporal_obb(
         tuple(_pred(frame, width=20, height=10) for frame in range(1, 16)),
         truth,
-        _cfg(),
+        _cfg(frames=tuple(range(1, 16))),
     )
 
     gate = evaluate_temporal_gate(
@@ -356,7 +508,10 @@ def test_threshold_sweep_maximizes_f1_under_fp_limit_and_ties_high():
     evidence = select_validation_threshold(
         predictions,
         ground_truth,
-        _cfg(max_false_detections_per_frame=0.5),
+        _cfg(
+            frames=(1, 2),
+            max_false_detections_per_frame=0.5,
+        ),
         model_name="mg_vtod",
         manifest_sha256="a" * 64,
         checkpoint_sha256="b" * 64,
@@ -366,6 +521,108 @@ def test_threshold_sweep_maximizes_f1_under_fp_limit_and_ties_high():
     assert evidence.f1_riou_025 == pytest.approx(0.8)
     assert evidence.false_detections_per_frame == 0.5
     assert evidence.split == "validation"
+    with pytest.raises(ValueError, match="validation split"):
+        select_validation_threshold(
+            predictions,
+            ground_truth,
+            _cfg(
+                frames=(1, 2),
+                evaluation_split="test",
+                max_false_detections_per_frame=0.5,
+            ),
+            model_name="mg_vtod",
+            manifest_sha256="a" * 64,
+            checkpoint_sha256="b" * 64,
+        )
+
+
+def test_threshold_sweep_fp_denominator_includes_empty_evaluated_frames():
+    predictions = (
+        _pred(1, confidence=0.9),
+        _pred(2, confidence=0.8),
+        _pred(1, cx=100, confidence=0.8),
+    )
+    ground_truth = (_gt(1), _gt(2))
+    universe = tuple(
+        ("site19", "sequence_a", frame)
+        for frame in range(1, 5)
+    )
+
+    evidence = select_validation_threshold(
+        predictions,
+        ground_truth,
+        _cfg(
+            evaluated_frame_keys=universe,
+            max_false_detections_per_frame=0.25,
+        ),
+        model_name="baseline",
+        manifest_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+    )
+
+    assert evidence.threshold == 0.8
+    assert evidence.false_detections_per_frame == 0.25
+
+
+def test_primary_test_evaluation_requires_and_enforces_frozen_threshold(
+    tmp_path,
+):
+    threshold_path = tmp_path / "threshold.json"
+    freeze_validation_threshold(
+        threshold_path,
+        ThresholdEvidence(
+            schema_version=1,
+            model_name="mg_vtod",
+            split="validation",
+            manifest_sha256="a" * 64,
+            checkpoint_sha256="b" * 64,
+            threshold=0.8,
+            f1_riou_025=1.0,
+            false_detections_per_frame=0.0,
+        ),
+    )
+    predictions = (
+        _pred(1, confidence=0.9),
+        _pred(1, cx=100, confidence=0.7),
+    )
+    test_cfg = _cfg(
+        evaluated_frame_keys=(("site19", "sequence_a", 1),),
+        evaluation_split="test",
+        threshold_path=threshold_path,
+        model_name="mg_vtod",
+        manifest_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+    )
+
+    metrics = evaluate_temporal_obb(predictions, (_gt(1),), test_cfg)
+
+    assert metrics["prediction_count"] == 1
+    assert metrics["threshold_evidence"]["threshold"] == 0.8
+    with pytest.raises(ValueError, match="model"):
+        evaluate_temporal_obb(
+            predictions,
+            (_gt(1),),
+            _cfg(
+                evaluated_frame_keys=(("site19", "sequence_a", 1),),
+                evaluation_split="test",
+                threshold_path=threshold_path,
+                model_name="baseline",
+                manifest_sha256="a" * 64,
+                checkpoint_sha256="b" * 64,
+            ),
+        )
+    with pytest.raises(ValueError, match="threshold"):
+        evaluate_temporal_obb(
+            predictions,
+            (_gt(1),),
+            _cfg(
+                evaluated_frame_keys=(("site19", "sequence_a", 1),),
+                evaluation_split="test",
+                model_name="mg_vtod",
+                manifest_sha256="a" * 64,
+                checkpoint_sha256="b" * 64,
+            ),
+        )
 
 
 def test_threshold_freeze_is_strict_atomic_and_provenance_bound(
