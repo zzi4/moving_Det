@@ -480,7 +480,10 @@ def _speed_bin(speed: float) -> str:
 
 
 def _track_key(truth: GroundTruth) -> str:
-    return f"{truth.site}:{truth.sequence}:{truth.track_id}"
+    type_tag = "int" if isinstance(truth.track_id, int) else "str"
+    return (
+        f"{truth.site}:{truth.sequence}:{type_tag}:{truth.track_id}"
+    )
 
 
 def _stopped_indices(

@@ -136,8 +136,8 @@ def test_hand_computable_ap_recall_fp_and_duplicate_prediction():
     assert metrics["per_class"]["0"]["ap50"] == pytest.approx(
         0.504950495049505
     )
-    assert metrics["per_track"]["site19:sequence_a:1"]["coverage"] == 0.5
-    assert metrics["per_track"]["site19:sequence_a:1"]["longest_miss"] == 1
+    assert metrics["per_track"]["site19:sequence_a:int:1"]["coverage"] == 0.5
+    assert metrics["per_track"]["site19:sequence_a:int:1"]["longest_miss"] == 1
 
 
 def test_confidence_order_controls_one_to_one_match_and_cross_class_never_matches():
@@ -222,9 +222,9 @@ def test_matching_is_namespaced_by_site_and_sequence_identity():
 
     assert metrics["recall_riou_025"] == 0.0
     assert set(metrics["per_track"]) == {
-        "site19:sequence_a:1",
-        "site22:sequence_a:1",
-        "site19:sequence_c:1",
+        "site19:sequence_a:int:1",
+        "site22:sequence_a:int:1",
+        "site19:sequence_c:int:1",
     }
 
 
@@ -309,11 +309,53 @@ def test_stopped_recall_uses_whole_eligible_run():
     assert metrics["stopped_gt_count"] == 15
     assert metrics["stopped_recall_riou_025"] == pytest.approx(10 / 15)
     assert metrics["per_track"][
-        "site19:sequence_a:1"
+        "site19:sequence_a:int:1"
     ]["stopped_recall"] == pytest.approx(
         10 / 15
     )
-    assert metrics["per_track"]["site19:sequence_a:1"]["longest_miss"] == 5
+    assert metrics["per_track"]["site19:sequence_a:int:1"]["longest_miss"] == 5
+
+
+def test_integer_and_string_track_ids_keep_independent_temporal_metrics():
+    ground_truth = tuple(
+        [
+            _gt(frame, track=1, cx=10, speed=0.05)
+            for frame in range(1, 16)
+        ]
+        + [
+            _gt(frame, track="1", cx=50, speed=2.0)
+            for frame in range(1, 16)
+        ]
+    )
+    predictions = tuple(
+        [
+            _pred(frame, cx=10)
+            for frame in range(1, 11)
+        ]
+        + [
+            _pred(frame, cx=49 if frame % 2 else 51)
+            for frame in range(1, 16)
+        ]
+    )
+
+    metrics = evaluate_temporal_obb(
+        predictions,
+        ground_truth,
+        _cfg(frames=tuple(range(1, 16))),
+    )
+
+    assert set(metrics["per_track"]) == {
+        "site19:sequence_a:int:1",
+        "site19:sequence_a:str:1",
+    }
+    integer_track = metrics["per_track"]["site19:sequence_a:int:1"]
+    string_track = metrics["per_track"]["site19:sequence_a:str:1"]
+    assert integer_track["stopped_recall"] == pytest.approx(10 / 15)
+    assert integer_track["longest_miss"] == 5
+    assert integer_track["jitter"]["center_px"] == 0.0
+    assert string_track["stopped_recall"] is None
+    assert string_track["coverage"] == 1.0
+    assert string_track["jitter"]["center_px"] > 0.9
 
 
 def test_periodic_angle_and_center_size_jitter_are_wrap_safe():
@@ -393,7 +435,10 @@ def _gate_metrics(
     map50=0.6,
     stopped_by_track=None,
 ):
-    stopped_by_track = stopped_by_track or {"site19:1": 0.8, "site22:2": 0.8}
+    stopped_by_track = stopped_by_track or {
+        "site19:sequence_a:int:1": 0.8,
+        "site22:sequence_b:int:2": 0.8,
+    }
     return {
         "map50": map50,
         "recall_riou_025": recall,
@@ -483,8 +528,8 @@ def test_each_gate_condition_fails_independently(failure):
         candidate["map50"] = 0.589
     elif failure == "stopped_recall_not_significantly_lower":
         candidate["per_track"] = {
-            "site19:1": {"stopped_recall": 0.0},
-            "site22:2": {"stopped_recall": 0.0},
+            "site19:sequence_a:int:1": {"stopped_recall": 0.0},
+            "site22:sequence_b:int:2": {"stopped_recall": 0.0},
         }
     else:
         audit["class_mapping_errors"] = 1
