@@ -20,6 +20,7 @@ from moving_det.geometry.obb import obb_to_points
 from moving_det.temporal_config import TemporalOBBConfig
 from moving_det.vrud.index import load_corrected_frame, load_track_index
 from moving_det.vrud.splits import PILOT_SPLITS
+from moving_det.vrud.tiling import Tile, assign_target_tile, full_frame_tiles
 from moving_det.vrud.types import (
     TRAIN_CLASS_NAMES,
     CorrectedAnnotation,
@@ -217,28 +218,15 @@ def _paired_paths(
     )
 
 
-def _tile_origins(length: int, tile_size: int, overlap: int) -> tuple[int, ...]:
-    """Temporary private grid helper; Task 4 replaces it with the public API."""
-    if length < tile_size:
-        raise ValueError(
-            f"source dimension {length} is smaller than tile size {tile_size}"
-        )
-    stride = tile_size - overlap
-    last_origin = length - tile_size
-    origins = list(range(0, last_origin + 1, stride))
-    if origins[-1] != last_origin:
-        origins.append(last_origin)
-    return tuple(origins)
-
-
 def _frame_tiles(
     frame: CorrectedFrame,
     cfg: TemporalOBBConfig,
-) -> tuple[tuple[int, int, int, int], ...]:
-    return tuple(
-        (x, y, cfg.tile_size, cfg.tile_size)
-        for y in _tile_origins(frame.height, cfg.tile_size, cfg.tile_overlap)
-        for x in _tile_origins(frame.width, cfg.tile_size, cfg.tile_overlap)
+) -> tuple[Tile, ...]:
+    return full_frame_tiles(
+        frame.width,
+        frame.height,
+        cfg.tile_size,
+        cfg.tile_overlap,
     )
 
 
@@ -246,53 +234,36 @@ def _assigned_tile(
     annotation: CorrectedAnnotation,
     frame: CorrectedFrame,
     cfg: TemporalOBBConfig,
-) -> tuple[int, int, int, int]:
-    points = obb_to_points(annotation.obb)
-    min_x, min_y = points.min(axis=0)
-    max_x, max_y = points.max(axis=0)
-    candidates = []
-    for tile in _frame_tiles(frame, cfg):
-        x, y, width, height = tile
-        if min_x < x or min_y < y or max_x > x + width or max_y > y + height:
-            continue
-        center_x = x + width / 2
-        center_y = y + height / 2
-        distance = (
-            (annotation.obb.cx - center_x) ** 2
-            + (annotation.obb.cy - center_y) ** 2
-        )
-        candidates.append((distance, y, x, tile))
-    if not candidates:
+) -> Tile:
+    try:
+        return assign_target_tile(annotation.obb, _frame_tiles(frame, cfg))
+    except ValueError as exc:
         raise ValueError(
             "eligible OBB does not fit completely inside a tile: "
             f"{annotation.track_key}"
-        )
-    return min(candidates)[-1]
+        ) from exc
 
 
 def _tile_intersects_annotation(
-    tile: tuple[int, int, int, int],
+    tile: Tile,
     annotation: CorrectedAnnotation,
 ) -> bool:
     points = obb_to_points(annotation.obb)
     min_x, min_y = points.min(axis=0)
     max_x, max_y = points.max(axis=0)
-    x, y, width, height = tile
     return (
-        min_x < x + width
-        and x < max_x
-        and min_y < y + height
-        and y < max_y
+        min_x < tile.x + tile.width
+        and tile.x < max_x
+        and min_y < tile.y + tile.height
+        and tile.y < max_y
     )
 
 
 def _frame_assignments(
     frame: CorrectedFrame,
     cfg: TemporalOBBConfig,
-) -> dict[tuple[int, int, int, int], tuple[TrackKey, ...]]:
-    assignments: dict[tuple[int, int, int, int], list[TrackKey]] = defaultdict(
-        list
-    )
+) -> dict[Tile, tuple[TrackKey, ...]]:
+    assignments: dict[Tile, list[TrackKey]] = defaultdict(list)
     seen_tracks: set[TrackKey] = set()
     for annotation in frame.annotations:
         if annotation.geometry_reason is not None:
@@ -321,7 +292,7 @@ def _frame_assignments(
 def _record(
     split: str,
     frame: CorrectedFrame,
-    tile: tuple[int, int, int, int],
+    tile: Tile,
     track_keys: Sequence[TrackKey],
     source: str,
 ) -> dict[str, object]:
@@ -330,7 +301,7 @@ def _record(
         "site": frame.sequence_key.site,
         "sequence": frame.sequence_key.sequence,
         "center_frame": frame.frame_index,
-        "tile_xywh": list(tile),
+        "tile_xywh": [tile.x, tile.y, tile.width, tile.height],
         "track_keys": [
             [track.site, track.sequence, track.group_id]
             for track in track_keys
@@ -420,7 +391,7 @@ def _positive_records(
     frame_by_track: dict[TrackKey, list[CorrectedFrame]] = defaultdict(list)
     assignments_by_path: dict[
         Path,
-        dict[tuple[int, int, int, int], tuple[TrackKey, ...]],
+        dict[Tile, tuple[TrackKey, ...]],
     ] = {}
     annotation_by_frame_track: dict[
         tuple[Path, TrackKey],
@@ -436,7 +407,7 @@ def _positive_records(
 
     candidates_by_class: dict[
         int,
-        list[tuple[CorrectedFrame, tuple[int, int, int, int]]],
+        list[tuple[CorrectedFrame, Tile]],
     ] = defaultdict(list)
     for track_key, track_frames in sorted(
         frame_by_track.items(),
