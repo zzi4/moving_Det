@@ -499,19 +499,31 @@ def _background_records(
             candidates.append(_record("train", frame, tile, (), "background"))
     candidates.sort(key=_record_sort_key)
     requested_count = int(positive_count * cfg.negative_fraction)
-    if len(candidates) < requested_count:
+    if requested_count <= len(candidates):
+        return list(
+            _deterministic_sample(
+                candidates,
+                requested_count,
+                seed=cfg.seed,
+                namespace="background",
+            )
+        )
+    if not candidates:
         raise ValueError(
             "insufficient distinct clean background clips: "
             f"required {requested_count}, found {len(candidates)}"
         )
-    return list(
+    full_cycles, remainder = divmod(requested_count, len(candidates))
+    selected = candidates * full_cycles
+    selected.extend(
         _deterministic_sample(
             candidates,
-            requested_count,
+            remainder,
             seed=cfg.seed,
             namespace="background",
         )
     )
+    return selected
 
 
 def _evaluation_records(
@@ -859,6 +871,27 @@ def build_manifests(
         )
         for split in _SPLIT_NAMES
     }
+    serialized_background_records = [
+        record
+        for record in records_by_split["train"]
+        if record["source"] == "background"
+    ]
+    background_selected_total = len(serialized_background_records)
+    background_selected_distinct_count = len(
+        {
+            _record_identity(record)
+            for record in serialized_background_records
+        }
+    )
+    background_audit = {
+        "background_selected_total": background_selected_total,
+        "background_selected_distinct_count": (
+            background_selected_distinct_count
+        ),
+        "background_repeated_row_count": (
+            background_selected_total - background_selected_distinct_count
+        ),
+    }
     audit_payload = {
         "classes": {
             str(class_id): TRAIN_CLASS_NAMES[class_id]
@@ -896,6 +929,7 @@ def build_manifests(
                         metadata_exclusion_counts_by_split[split].items()
                     )
                 ),
+                **(background_audit if split == "train" else {}),
             }
             for split in _SPLIT_NAMES
         },

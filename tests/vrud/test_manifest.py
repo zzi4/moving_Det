@@ -1,4 +1,5 @@
 import csv
+from collections import Counter
 from dataclasses import replace
 import hashlib
 import json
@@ -241,6 +242,18 @@ def test_build_manifests_writes_strict_hashed_audit_artifacts(
     }
     assert sum(record["source"] == "positive" for record in train_records) == 8
     assert sum(record["source"] == "background" for record in train_records) == 2
+    assert len(
+        {
+            (
+                record["site"],
+                record["sequence"],
+                record["center_frame"],
+                tuple(record["tile_xywh"]),
+            )
+            for record in train_records
+            if record["source"] == "background"
+        }
+    ) == 2
     assert all(
         set(record)
         == {
@@ -286,6 +299,16 @@ def test_build_manifests_writes_strict_hashed_audit_artifacts(
         "2": 2,
         "3": 2,
     }
+    train_audit = audit["splits"]["train"]
+    assert train_audit["background_selected_total"] == 2
+    assert train_audit["background_selected_distinct_count"] == 2
+    assert train_audit["background_repeated_row_count"] == 0
+    assert all(
+        "background_selected_total" not in audit["splits"][split]
+        and "background_selected_distinct_count" not in audit["splits"][split]
+        and "background_repeated_row_count" not in audit["splits"][split]
+        for split in ("validation", "test")
+    )
 
     frozen = json.loads(
         (output_dir / "manifest.json").read_text(encoding="utf-8")
@@ -427,7 +450,7 @@ def test_manifest_tiles_are_edge_anchored_and_stay_inside_image(
     )
 
 
-def test_background_underfill_preserves_existing_frozen_manifest(
+def test_zero_clean_background_candidates_preserve_existing_frozen_manifest(
     manifest_config,
     tmp_path,
 ):
@@ -462,6 +485,135 @@ def test_background_underfill_preserves_existing_frozen_manifest(
         path.name: path.read_bytes()
         for path in sorted(output_dir.iterdir())
     } == frozen
+
+
+def test_zero_requested_backgrounds_allow_an_empty_candidate_pool(
+    manifest_config,
+    tmp_path,
+):
+    cfg = replace(
+        manifest_config,
+        tile_size=128,
+        tile_overlap=64,
+    )
+    for key in PILOT_SPLITS["train"]:
+        for frame_index in (1, 2, 3):
+            json_path = (
+                _sequence_dir(cfg.image_root, key)
+                / f"{frame_index:06d}.json"
+            )
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            payload["shapes"] = [_shape(99, 64, 64)]
+            json_path.write_text(
+                json.dumps(payload, allow_nan=False),
+                encoding="utf-8",
+            )
+    output_dir = tmp_path / "manifest"
+
+    build_manifests(cfg, output_dir)
+
+    assert (output_dir / "train.jsonl").read_bytes() == b""
+    audit = json.loads(
+        (output_dir / "class-audit.json").read_text(encoding="utf-8")
+    )
+    train_audit = audit["splits"]["train"]
+    assert train_audit["background_selected_total"] == 0
+    assert train_audit["background_selected_distinct_count"] == 0
+    assert train_audit["background_repeated_row_count"] == 0
+
+
+def test_background_underfill_fills_quota_fairly_and_deterministically(
+    manifest_config,
+    tmp_path,
+):
+    cfg = replace(
+        manifest_config,
+        tile_size=128,
+        tile_overlap=64,
+        negative_fraction=1.0,
+    )
+    clean_frames = {
+        (PILOT_SPLITS["train"][0], 2),
+        (PILOT_SPLITS["train"][0], 3),
+        (PILOT_SPLITS["train"][1], 2),
+    }
+    for key in PILOT_SPLITS["train"]:
+        for frame_index in (2, 3):
+            if (key, frame_index) in clean_frames:
+                continue
+            json_path = (
+                _sequence_dir(cfg.image_root, key)
+                / f"{frame_index:06d}.json"
+            )
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            payload["shapes"] = [_shape(99, 64, 64)]
+            json_path.write_text(
+                json.dumps(payload, allow_nan=False),
+                encoding="utf-8",
+            )
+    output_dir = tmp_path / "manifest"
+
+    build_manifests(cfg, output_dir)
+
+    first = {
+        path.name: path.read_bytes()
+        for path in sorted(output_dir.iterdir())
+    }
+    train_records = [
+        json.loads(line)
+        for line in (output_dir / "train.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    backgrounds = [
+        record
+        for record in train_records
+        if record["source"] == "background"
+    ]
+    multiplicities = Counter(
+        (
+            record["site"],
+            record["sequence"],
+            record["center_frame"],
+            tuple(record["tile_xywh"]),
+        )
+        for record in backgrounds
+    )
+    assert multiplicities == {
+        (
+            "site19",
+            "DJI_20240919154443_0005_V",
+            2,
+            (0, 0, 128, 128),
+        ): 2,
+        (
+            "site19",
+            "DJI_20240919154443_0005_V",
+            3,
+            (0, 0, 128, 128),
+        ): 1,
+        (
+            "site19",
+            "DJI_20240919162906_0003_V",
+            2,
+            (0, 0, 128, 128),
+        ): 1,
+    }
+
+    audit = json.loads(
+        (output_dir / "class-audit.json").read_text(encoding="utf-8")
+    )
+    train_audit = audit["splits"]["train"]
+    assert train_audit["background_selected_total"] == 4
+    assert train_audit["background_selected_distinct_count"] == 3
+    assert train_audit["background_repeated_row_count"] == 1
+
+    build_manifests(cfg, output_dir)
+
+    assert {
+        path.name: path.read_bytes()
+        for path in sorted(output_dir.iterdir())
+    } == first
 
 
 def test_per_class_caps_count_distinct_serialized_clips_after_deduplication(
