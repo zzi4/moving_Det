@@ -370,6 +370,29 @@ def test_bulk_put_rejects_invalid_later_item_before_mutation(
     invalid_tail,
 ):
     cache = AlignmentCache(tmp_path / "cache")
+    new_key = AlignmentKey("site22", "sequence_b", 41, 43)
+    first = (new_key, _result(correlation=0.96))
+
+    with pytest.raises(ValueError, match="batch|key|result|pair|duplicate"):
+        cache.put_many((first, invalid_tail(new_key)))
+
+    assert not cache.root.exists()
+
+
+@pytest.mark.parametrize(
+    "invalid_tail",
+    [
+        pytest.param(lambda key: ("not-a-key", _result()), id="invalid-key"),
+        pytest.param(lambda key: (key, object()), id="invalid-result"),
+        pytest.param(lambda key: (key,), id="non-pair"),
+        pytest.param(lambda key: (key, _result()), id="duplicate-key"),
+    ],
+)
+def test_bulk_put_rejects_invalid_later_item_without_changing_existing_cache(
+    tmp_path,
+    invalid_tail,
+):
+    cache = AlignmentCache(tmp_path / "cache")
     cache.put(_key(), _result())
     before = {
         path.name: path.read_bytes()

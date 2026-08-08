@@ -1921,6 +1921,8 @@ def test_cache_alignments_runs_real_ecc_and_writes_strict_atomic_cache(
     capsys,
     monkeypatch,
 ):
+    from moving_det.vrud.alignment import AlignmentCache, AlignmentKey
+
     image_root = tmp_path / "images"
     sequence = image_root / "site19_sequence" / "sequence_a"
     sequence.mkdir(parents=True)
@@ -1971,11 +1973,27 @@ def test_cache_alignments_runs_real_ecc_and_writes_strict_atomic_cache(
     def reject_process_pool(*args, **kwargs):
         raise AssertionError("single center must not create a process pool")
 
+    put_calls = 0
+    put_many_batches = []
+    real_put_many = AlignmentCache.put_many
+
+    def reject_single_put(self, key, result):
+        nonlocal put_calls
+        put_calls += 1
+        raise AssertionError("cache workflow used single-item put")
+
+    def record_put_many(self, pairs):
+        batch = tuple(pairs)
+        put_many_batches.append(batch)
+        return real_put_many(self, batch)
+
     monkeypatch.setattr(
         vru_cli_module.multiprocessing,
         "get_context",
         reject_process_pool,
     )
+    monkeypatch.setattr(AlignmentCache, "put", reject_single_put)
+    monkeypatch.setattr(AlignmentCache, "put_many", record_put_many)
 
     result = run_cache_alignments(args, config_loader=lambda path: cfg)
 
@@ -1993,7 +2011,13 @@ def test_cache_alignments_runs_real_ecc_and_writes_strict_atomic_cache(
     assert summary["opencv_threads_per_worker"] == 1
     assert summary["center_decode_reuse"] is True
     assert summary["cache_write_mode"] == "single_bulk_index_publication"
-    from moving_det.vrud.alignment import AlignmentCache
+    assert put_calls == 0
+    assert len(put_many_batches) == 1
+    assert tuple(key for key, _ in put_many_batches[0]) == tuple(
+        AlignmentKey("site19", "sequence_a", 31, support)
+        for support in (1, 16, 27, 29, 33, 35, 46, 61)
+    )
+    assert len(put_many_batches[0]) == 8
 
     assert summary["alignment_cache_sha256"] == (
         AlignmentCache(output).snapshot().fingerprint
@@ -2142,6 +2166,7 @@ def test_alignment_center_group_loads_reference_once_and_preserves_order(
 
     def estimator(reference, moving, received_cfg):
         assert received_cfg is cfg
+        assert opencv_threads == [1]
         references.append(reference)
         support = int(moving[0, 0, 0])
         return AlignmentResult(
