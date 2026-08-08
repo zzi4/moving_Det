@@ -313,6 +313,197 @@ def test_snapshot_holds_cache_transaction_across_index_and_artifact_reads(
     )
 
 
+def test_bulk_put_matches_sequential_index_snapshot_and_results(tmp_path):
+    existing_key = AlignmentKey("site19", "sequence_a", 31, 29)
+    pairs = (
+        (
+            AlignmentKey("site19", "sequence_a", 31, 27),
+            _result(
+                np.float32([[1, 0, -4], [0, 1, 1]]),
+                correlation=0.91,
+            ),
+        ),
+        (
+            AlignmentKey("site22", "sequence_b", 41, 43),
+            _result(
+                np.float32([[1, 0, 3], [0, 1, -2]]),
+                correlation=0.97,
+            ),
+        ),
+    )
+    sequential = AlignmentCache(tmp_path / "sequential")
+    bulk = AlignmentCache(tmp_path / "bulk")
+    for cache in (sequential, bulk):
+        cache.put(existing_key, _result(correlation=0.89))
+    for key, result in pairs:
+        sequential.put(key, result)
+
+    bulk.put_many(iter(pairs))
+
+    assert (tmp_path / "bulk" / "index.json").read_bytes() == (
+        tmp_path / "sequential" / "index.json"
+    ).read_bytes()
+    sequential_snapshot = sequential.snapshot()
+    bulk_snapshot = bulk.snapshot()
+    assert bulk_snapshot.fingerprint == sequential_snapshot.fingerprint
+    for key in (existing_key, *(key for key, _ in pairs)):
+        expected = sequential_snapshot.get(key)
+        actual = bulk_snapshot.get(key)
+        assert expected is not None and actual is not None
+        np.testing.assert_array_equal(actual.matrix, expected.matrix)
+        assert actual.correlation == expected.correlation
+        assert actual.used_fallback == expected.used_fallback
+        assert actual.reason == expected.reason
+
+
+@pytest.mark.parametrize(
+    "invalid_tail",
+    [
+        pytest.param(lambda key: ("not-a-key", _result()), id="invalid-key"),
+        pytest.param(lambda key: (key, object()), id="invalid-result"),
+        pytest.param(lambda key: (key,), id="non-pair"),
+        pytest.param(lambda key: (key, _result()), id="duplicate-key"),
+    ],
+)
+def test_bulk_put_rejects_invalid_later_item_before_mutation(
+    tmp_path,
+    invalid_tail,
+):
+    cache = AlignmentCache(tmp_path / "cache")
+    cache.put(_key(), _result())
+    before = {
+        path.name: path.read_bytes()
+        for path in cache.root.iterdir()
+        if path.is_file()
+    }
+    new_key = AlignmentKey("site22", "sequence_b", 41, 43)
+    first = (new_key, _result(correlation=0.96))
+
+    with pytest.raises(ValueError, match="batch|key|result|pair|duplicate"):
+        cache.put_many((first, invalid_tail(new_key)))
+
+    assert {
+        path.name: path.read_bytes()
+        for path in cache.root.iterdir()
+        if path.is_file()
+    } == before
+    assert cache.get(new_key) is None
+
+
+@pytest.mark.parametrize("failure", ["artifact", "index"])
+def test_bulk_put_failure_preserves_old_visible_index_and_snapshot(
+    tmp_path,
+    monkeypatch,
+    failure,
+):
+    cache = AlignmentCache(tmp_path / "cache")
+    cache.put(_key(), _result())
+    original_index = cache.index_path.read_bytes()
+    original_snapshot = cache.snapshot()
+    original_replace = os.replace
+    artifact_replaces = 0
+
+    def fail_replace(source, target):
+        nonlocal artifact_replaces
+        destination = Path(target)
+        if destination.suffix == ".npz":
+            artifact_replaces += 1
+            if failure == "artifact" and artifact_replaces == 2:
+                raise OSError("injected artifact publication failure")
+        if failure == "index" and destination.name == "index.json":
+            raise OSError("injected index publication failure")
+        return original_replace(source, target)
+
+    monkeypatch.setattr("moving_det.vrud.alignment.os.replace", fail_replace)
+    pairs = (
+        (
+            AlignmentKey("site19", "sequence_a", 101, 95),
+            _result(correlation=0.91),
+        ),
+        (
+            AlignmentKey("site19", "sequence_a", 101, 99),
+            _result(correlation=0.92),
+        ),
+    )
+
+    with pytest.raises(OSError, match=f"injected {failure}"):
+        cache.put_many(pairs)
+
+    assert cache.index_path.read_bytes() == original_index
+    restored = cache.snapshot()
+    assert restored.fingerprint == original_snapshot.fingerprint
+    np.testing.assert_array_equal(
+        restored.get(_key()).matrix,
+        original_snapshot.get(_key()).matrix,
+    )
+    assert not list(cache.root.glob(".*.tmp"))
+
+
+def test_bulk_put_does_not_delegate_reads_once_and_publishes_index_once(
+    tmp_path,
+    monkeypatch,
+):
+    cache = AlignmentCache(tmp_path / "cache")
+    real_read_index = cache._read_index
+    read_count = 0
+    index_publications = 0
+    original_replace = os.replace
+
+    def fail_if_delegated(*args, **kwargs):
+        raise AssertionError("bulk put delegated to single-item put")
+
+    def observe_read_index():
+        nonlocal read_count
+        read_count += 1
+        return real_read_index()
+
+    def observe_replace(source, target):
+        nonlocal index_publications
+        if Path(target).name == "index.json":
+            index_publications += 1
+        return original_replace(source, target)
+
+    monkeypatch.setattr(cache, "put", fail_if_delegated)
+    monkeypatch.setattr(cache, "_read_index", observe_read_index)
+    monkeypatch.setattr("moving_det.vrud.alignment.os.replace", observe_replace)
+
+    cache.put_many(
+        (
+            (
+                AlignmentKey("site19", "sequence_a", 31, 29),
+                _result(correlation=0.91),
+            ),
+            (
+                AlignmentKey("site19", "sequence_a", 31, 33),
+                _result(correlation=0.92),
+            ),
+        )
+    )
+
+    assert read_count == 1
+    assert index_publications == 1
+
+
+def test_bulk_put_empty_batch_is_a_no_op(tmp_path):
+    missing = AlignmentCache(tmp_path / "missing")
+    missing.put_many(())
+    assert not missing.root.exists()
+
+    existing = AlignmentCache(tmp_path / "existing")
+    existing.put(_key(), _result())
+    before = {
+        path.name: path.read_bytes()
+        for path in existing.root.iterdir()
+        if path.is_file()
+    }
+    existing.put_many(iter(()))
+    assert {
+        path.name: path.read_bytes()
+        for path in existing.root.iterdir()
+        if path.is_file()
+    } == before
+
+
 def test_textureless_ecc_fallback_and_reason_are_cached(tmp_path):
     blank = np.zeros((128, 128), dtype=np.uint8)
     fallback = estimate_euclidean_ecc(blank, blank, _Limits())

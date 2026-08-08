@@ -11,6 +11,7 @@ import importlib.metadata
 import io
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import platform
@@ -187,6 +188,15 @@ class VisualizationRequest:
     alignment_cache: Path | None = None
     alignment_snapshot: object | None = None
     alignment_cache_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class _AlignmentCenterGroup:
+    site: str
+    sequence: str
+    center_frame: int
+    reference_path: Path
+    supports: tuple[tuple[int, Path], ...]
 
 
 @dataclass(frozen=True)
@@ -1179,6 +1189,84 @@ def _load_alignment_frame(path: Path) -> Any:
         raise WorkflowError(f"failed to read alignment frame: {path}") from exc
 
 
+def _build_alignment_center_groups(
+    frame_rows: Sequence[Mapping[str, object]],
+    image_root: Path,
+    offsets: Sequence[int],
+) -> tuple[_AlignmentCenterGroup, ...]:
+    groups = []
+    for row in frame_rows:
+        site = str(row["site"])
+        sequence = str(row["sequence"])
+        center = int(row["center_frame"])
+        center_path = (
+            Path(image_root)
+            / f"{site}_sequence"
+            / sequence
+            / f"{center:06d}.jpg"
+        )
+        if not center_path.is_file():
+            raise WorkflowError(f"alignment center frame is missing: {center_path}")
+        supports = []
+        for offset in sorted(offsets):
+            support = center + offset
+            if support <= 0:
+                continue
+            support_path = center_path.with_name(f"{support:06d}.jpg")
+            if support_path.is_file():
+                supports.append((support, support_path))
+        groups.append(
+            _AlignmentCenterGroup(
+                site=site,
+                sequence=sequence,
+                center_frame=center,
+                reference_path=center_path,
+                supports=tuple(supports),
+            )
+        )
+    return tuple(
+        sorted(
+            groups,
+            key=lambda group: (
+                group.site,
+                group.sequence,
+                group.center_frame,
+            ),
+        )
+    )
+
+
+def _run_alignment_center_group(
+    task: tuple[_AlignmentCenterGroup, object],
+) -> tuple[tuple[Any, Any], ...]:
+    import cv2
+
+    from moving_det.motion.alignment import estimate_euclidean_ecc
+    from moving_det.vrud.alignment import AlignmentKey
+
+    group, cfg = task
+    cv2.setNumThreads(1)
+    if not group.supports:
+        return ()
+    reference = _load_alignment_frame(group.reference_path)
+    pairs = []
+    for support_frame, support_path in group.supports:
+        moving = _load_alignment_frame(support_path)
+        result = estimate_euclidean_ecc(reference, moving, cfg)
+        pairs.append(
+            (
+                AlignmentKey(
+                    group.site,
+                    group.sequence,
+                    group.center_frame,
+                    support_frame,
+                ),
+                result,
+            )
+        )
+    return tuple(pairs)
+
+
 def run_cache_alignments(
     args: argparse.Namespace,
     *,
@@ -1209,51 +1297,40 @@ def run_cache_alignments(
     )
     frame_rows = _alignment_records(manifest)
 
-    from moving_det.motion.alignment import estimate_euclidean_ecc
-    from moving_det.vrud.alignment import AlignmentCache, AlignmentKey
+    from moving_det.vrud.alignment import AlignmentCache
 
     def writer(stage: Path) -> Path:
         cache = AlignmentCache(stage)
         reasons: Counter[str] = Counter()
-        jobs = []
-        for row in frame_rows:
-            site = str(row["site"])
-            sequence = str(row["sequence"])
-            center = int(row["center_frame"])
-            center_path = (
-                Path(getattr(cfg, "image_root"))
-                / f"{site}_sequence"
-                / sequence
-                / f"{center:06d}.jpg"
-            )
-            if not center_path.is_file():
-                raise WorkflowError(f"alignment center frame is missing: {center_path}")
-            for offset in offsets:
-                support = center + offset
-                if support <= 0:
-                    continue
-                support_path = center_path.with_name(f"{support:06d}.jpg")
-                if support_path.is_file():
-                    jobs.append(
-                        (
-                            AlignmentKey(site, sequence, center, support),
-                            center_path,
-                            support_path,
-                        )
-                    )
-        jobs.sort(
-            key=lambda item: (
-                item[0].site,
-                item[0].sequence,
-                item[0].center_frame,
-                item[0].support_frame,
-            )
+        groups = _build_alignment_center_groups(
+            frame_rows,
+            Path(getattr(cfg, "image_root")),
+            offsets,
         )
-        for key, center_path, support_path in jobs:
-            reference = _load_alignment_frame(center_path)
-            moving = _load_alignment_frame(support_path)
-            result = estimate_euclidean_ecc(reference, moving, cfg)
-            cache.put(key, result)
+        center_count = len(groups)
+        if center_count == 0:
+            worker_count = 0
+            grouped_pairs: Sequence[Sequence[tuple[Any, Any]]] = ()
+        elif center_count == 1:
+            worker_count = 1
+            grouped_pairs = (
+                _run_alignment_center_group((groups[0], cfg)),
+            )
+        else:
+            worker_count = min(16, center_count)
+            context = multiprocessing.get_context("spawn")
+            with context.Pool(processes=worker_count) as pool:
+                grouped_pairs = pool.map(
+                    _run_alignment_center_group,
+                    tuple((group, cfg) for group in groups),
+                )
+        pairs = tuple(
+            pair
+            for group_pairs in grouped_pairs
+            for pair in group_pairs
+        )
+        cache.put_many(pairs)
+        for _, result in pairs:
             if result.used_fallback:
                 reasons[result.reason or "unknown"] += 1
         if not (stage / "index.json").exists():
@@ -1266,13 +1343,18 @@ def run_cache_alignments(
             "manifest_sha256": manifest_sha256,
             "alignment_cache_sha256": cache.snapshot().fingerprint,
             "seed": getattr(cfg, "seed"),
-            "job_count": len(jobs),
+            "job_count": len(pairs),
             "fallback_count": sum(reasons.values()),
             "fallback_fraction": (
-                sum(reasons.values()) / len(jobs) if jobs else 0.0
+                sum(reasons.values()) / len(pairs) if pairs else 0.0
             ),
             "fallback_reasons": dict(sorted(reasons.items())),
             "offsets": offsets,
+            "center_count": center_count,
+            "worker_count": worker_count,
+            "opencv_threads_per_worker": 1,
+            "center_decode_reuse": True,
+            "cache_write_mode": "single_bulk_index_publication",
         }
         _write_bytes(stage / "summary.json", _json_bytes(summary))
         return Path("summary.json")

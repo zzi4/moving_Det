@@ -1919,6 +1919,7 @@ def test_overfit_manifest_is_exact_deterministic_and_preserves_source(
 def test_cache_alignments_runs_real_ecc_and_writes_strict_atomic_cache(
     tmp_path,
     capsys,
+    monkeypatch,
 ):
     image_root = tmp_path / "images"
     sequence = image_root / "site19_sequence" / "sequence_a"
@@ -1967,6 +1968,15 @@ def test_cache_alignments_runs_real_ecc_and_writes_strict_atomic_cache(
         ]
     )
 
+    def reject_process_pool(*args, **kwargs):
+        raise AssertionError("single center must not create a process pool")
+
+    monkeypatch.setattr(
+        vru_cli_module.multiprocessing,
+        "get_context",
+        reject_process_pool,
+    )
+
     result = run_cache_alignments(args, config_loader=lambda path: cfg)
 
     output = cfg.output_root / "alignment-cache"
@@ -1978,6 +1988,11 @@ def test_cache_alignments_runs_real_ecc_and_writes_strict_atomic_cache(
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert summary["schema_version"] == 1
     assert summary["job_count"] == 8
+    assert summary["center_count"] == 1
+    assert summary["worker_count"] == 1
+    assert summary["opencv_threads_per_worker"] == 1
+    assert summary["center_decode_reuse"] is True
+    assert summary["cache_write_mode"] == "single_bulk_index_publication"
     from moving_det.vrud.alignment import AlignmentCache
 
     assert summary["alignment_cache_sha256"] == (
@@ -2085,6 +2100,311 @@ def test_cache_alignment_ecc_and_artifact_keep_full_resolution_pixel_scale(
         cached.matrix,
         full_resolution_matrix,
     )
+
+
+def test_alignment_center_group_loads_reference_once_and_preserves_order(
+    tmp_path,
+    monkeypatch,
+):
+    from moving_det.motion.alignment import AlignmentResult
+
+    image_root = tmp_path / "images"
+    sequence = image_root / "site19_sequence" / "sequence_a"
+    sequence.mkdir(parents=True)
+    for frame in (27, 29, 31, 33):
+        (sequence / f"{frame:06d}.jpg").write_bytes(b"test frame")
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=image_root,
+        metadata_root=tmp_path / "metadata",
+        output_root=tmp_path / "runs",
+    )
+    groups = vru_cli_module._build_alignment_center_groups(
+        (
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+            },
+        ),
+        image_root,
+        (2, -4, -2),
+    )
+    loaded = []
+    references = []
+    opencv_threads = []
+
+    def load_frame(path):
+        frame = int(Path(path).stem)
+        image = np.full((8, 12, 3), frame, dtype=np.uint8)
+        loaded.append((frame, image))
+        return image
+
+    def estimator(reference, moving, received_cfg):
+        assert received_cfg is cfg
+        references.append(reference)
+        support = int(moving[0, 0, 0])
+        return AlignmentResult(
+            matrix=np.float32([[1, 0, support], [0, 1, -support]]),
+            correlation=0.99,
+            used_fallback=False,
+            reason=None,
+        )
+
+    monkeypatch.setattr(vru_cli_module, "_load_alignment_frame", load_frame)
+    monkeypatch.setattr(
+        "moving_det.motion.alignment.estimate_euclidean_ecc",
+        estimator,
+    )
+    monkeypatch.setattr(
+        "cv2.setNumThreads",
+        lambda count: opencv_threads.append(count),
+    )
+
+    pairs = vru_cli_module._run_alignment_center_group((groups[0], cfg))
+
+    assert [frame for frame, _ in loaded] == [31, 27, 29, 33]
+    assert len({id(reference) for reference in references}) == 1
+    assert [key.support_frame for key, _ in pairs] == [27, 29, 33]
+    assert [int(result.matrix[0, 2]) for _, result in pairs] == [27, 29, 33]
+    assert opencv_threads == [1]
+
+
+def _write_multi_center_alignment_fixture(tmp_path):
+    image_root = tmp_path / "images"
+    centers = (
+        ("site22", "sequence_b", 41),
+        ("site19", "sequence_a", 31),
+    )
+    yy, xx = np.indices((48, 64))
+    base = np.stack(
+        (
+            (3 * xx + 5 * yy) % 255,
+            (7 * xx + 2 * yy) % 255,
+            (5 * xx + 3 * yy) % 255,
+        ),
+        axis=2,
+    ).astype(np.uint8)
+    for group_index, (site, sequence_name, center) in enumerate(centers):
+        sequence = image_root / f"{site}_sequence" / sequence_name
+        sequence.mkdir(parents=True)
+        for offset in (-1, 0, 1):
+            frame = center + offset
+            path = sequence / f"{frame:06d}.jpg"
+            shifted = np.roll(base, group_index + offset, axis=1)
+            Image.fromarray(shifted).save(path)
+    manifest = tmp_path / "manifest"
+    _manifest_children(
+        manifest,
+        [
+            {
+                "split": "train",
+                "site": site,
+                "sequence": sequence,
+                "center_frame": center,
+                "tile_xywh": [0, 0, 64, 48],
+                "track_keys": [],
+                "source": "positive",
+            }
+            for site, sequence, center in centers
+        ],
+    )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=image_root,
+        metadata_root=tmp_path / "metadata",
+        output_root=tmp_path / "runs",
+        mg_offsets=(-1, 0, 1),
+        lstfe_offsets=(-1, 0, 1),
+    )
+    args = build_parser().parse_args(
+        [
+            "cache-alignments",
+            "--config",
+            "cfg.yaml",
+            "--manifest",
+            str(manifest),
+        ]
+    )
+    return cfg, args
+
+
+def test_cache_alignments_uses_deterministic_bounded_multi_center_pool(tmp_path):
+    from moving_det.vrud.alignment import AlignmentCache, AlignmentKey
+
+    cfg, args = _write_multi_center_alignment_fixture(tmp_path)
+
+    run_cache_alignments(args, config_loader=lambda path: cfg)
+
+    output = cfg.output_root / "alignment-cache"
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert summary["center_count"] == 2
+    assert summary["worker_count"] == 2
+    assert summary["opencv_threads_per_worker"] == 1
+    assert summary["job_count"] == 4
+    snapshot = AlignmentCache(output).snapshot()
+    expected_keys = (
+        AlignmentKey("site19", "sequence_a", 31, 30),
+        AlignmentKey("site19", "sequence_a", 31, 32),
+        AlignmentKey("site22", "sequence_b", 41, 40),
+        AlignmentKey("site22", "sequence_b", 41, 42),
+    )
+    assert all(snapshot.get(key) is not None for key in expected_keys)
+
+
+def test_cache_alignments_caps_pool_at_sixteen_and_maps_sorted_groups(
+    tmp_path,
+    monkeypatch,
+):
+    from moving_det.motion.alignment import AlignmentResult
+    from moving_det.vrud.alignment import AlignmentKey
+
+    image_root = tmp_path / "images"
+    rows = []
+    for index in reversed(range(17)):
+        site = f"site{index:02d}"
+        sequence_name = f"sequence_{index:02d}"
+        center = 100 + index * 10
+        sequence = image_root / f"{site}_sequence" / sequence_name
+        sequence.mkdir(parents=True)
+        for frame in (center, center + 1):
+            (sequence / f"{frame:06d}.jpg").write_bytes(b"not decoded")
+        rows.append(
+            {
+                "split": "train",
+                "site": site,
+                "sequence": sequence_name,
+                "center_frame": center,
+                "tile_xywh": [0, 0, 64, 48],
+                "track_keys": [],
+                "source": "positive",
+            }
+        )
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, rows)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=image_root,
+        metadata_root=tmp_path / "metadata",
+        output_root=tmp_path / "runs",
+        mg_offsets=(0, 1),
+        lstfe_offsets=(0, 1),
+    )
+    observed = {}
+
+    class RecordingPool:
+        def __init__(self, *, processes):
+            observed["processes"] = processes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def map(self, function, tasks):
+            materialized = tuple(tasks)
+            observed["centers"] = tuple(
+                (group.site, group.sequence, group.center_frame)
+                for group, _ in materialized
+            )
+            return tuple(
+                (
+                    (
+                        AlignmentKey(
+                            group.site,
+                            group.sequence,
+                            group.center_frame,
+                            group.supports[0][0],
+                        ),
+                        AlignmentResult(
+                            matrix=np.eye(2, 3, dtype=np.float32),
+                            correlation=0.99,
+                            used_fallback=False,
+                            reason=None,
+                        ),
+                    ),
+                )
+                for group, _ in materialized
+            )
+
+    class RecordingContext:
+        Pool = RecordingPool
+
+    def get_context(method):
+        observed["method"] = method
+        return RecordingContext()
+
+    monkeypatch.setattr(
+        vru_cli_module.multiprocessing,
+        "get_context",
+        get_context,
+    )
+    args = build_parser().parse_args(
+        [
+            "cache-alignments",
+            "--config",
+            "cfg.yaml",
+            "--manifest",
+            str(manifest),
+        ]
+    )
+
+    run_cache_alignments(args, config_loader=lambda path: cfg)
+
+    assert observed["method"] == "spawn"
+    assert observed["processes"] == 16
+    assert observed["centers"] == tuple(sorted(observed["centers"]))
+    summary = json.loads(
+        (cfg.output_root / "alignment-cache" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["center_count"] == 17
+    assert summary["worker_count"] == 16
+    assert summary["job_count"] == 17
+
+
+def test_cache_alignment_pool_failure_preserves_output_and_cleans_staging(
+    tmp_path,
+    monkeypatch,
+):
+    cfg, args = _write_multi_center_alignment_fixture(tmp_path)
+    output = cfg.output_root / "alignment-cache"
+    output.mkdir(parents=True)
+    sentinel = output / "published.txt"
+    sentinel.write_bytes(b"existing published output")
+
+    class FailingPool:
+        def __init__(self, *, processes):
+            assert processes == 2
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def map(self, function, tasks):
+            assert len(tuple(tasks)) == 2
+            raise RuntimeError("injected process pool failure")
+
+    class FailingContext:
+        Pool = FailingPool
+
+    monkeypatch.setattr(
+        vru_cli_module.multiprocessing,
+        "get_context",
+        lambda method: FailingContext(),
+    )
+
+    with pytest.raises(RuntimeError, match="injected process pool failure"):
+        run_cache_alignments(args, config_loader=lambda path: cfg)
+
+    assert sentinel.read_bytes() == b"existing published output"
+    assert {path.name for path in output.iterdir()} == {"published.txt"}
+    assert not list(output.parent.glob(".alignment-cache.staging.*"))
+    assert not list(output.parent.glob(".alignment-cache.backup.*"))
 
 
 def _evaluation_bundle(

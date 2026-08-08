@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 import errno
 import fcntl
 import hashlib
@@ -451,6 +451,127 @@ class AlignmentCache:
             with self._exclusive_process_lock():
                 return self._snapshot_from_index(self._read_index())
 
+    def _write_artifact(
+        self,
+        key_digest: str,
+        result: AlignmentResult,
+    ) -> tuple[str, str]:
+        artifact_temp: Path | None = None
+        try:
+            artifact_fd, artifact_name = tempfile.mkstemp(
+                prefix=f".{key_digest}-",
+                suffix=".npz.tmp",
+                dir=self.root,
+            )
+            artifact_temp = Path(artifact_name)
+            with os.fdopen(artifact_fd, "wb") as stream:
+                np.savez_compressed(
+                    stream,
+                    matrix=result.matrix,
+                    correlation=np.asarray(
+                        result.correlation,
+                        dtype=np.float64,
+                    ),
+                    used_fallback=np.asarray(
+                        result.used_fallback,
+                        dtype=np.bool_,
+                    ),
+                    reason_present=np.asarray(
+                        result.reason is not None,
+                        dtype=np.bool_,
+                    ),
+                    reason=np.asarray(
+                        result.reason or "",
+                        dtype=np.str_,
+                    ),
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            payload = artifact_temp.read_bytes()
+            checksum = hashlib.sha256(payload).hexdigest()
+            artifact = f"{key_digest}-{checksum}.npz"
+            os.replace(artifact_temp, self.root / artifact)
+            artifact_temp = None
+            return artifact, checksum
+        finally:
+            if artifact_temp is not None:
+                artifact_temp.unlink(missing_ok=True)
+
+    def _publish_index(self, index: dict[str, object]) -> None:
+        index_temp: Path | None = None
+        try:
+            index_fd, index_name = tempfile.mkstemp(
+                prefix=".index-",
+                suffix=".json.tmp",
+                dir=self.root,
+            )
+            index_temp = Path(index_name)
+            with os.fdopen(index_fd, "wb") as stream:
+                stream.write(_canonical_json(index))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(index_temp, self.index_path)
+            index_temp = None
+            _fsync_directory(self.root)
+        finally:
+            if index_temp is not None:
+                index_temp.unlink(missing_ok=True)
+
+    def put_many(
+        self,
+        pairs: Iterable[tuple[AlignmentKey, AlignmentResult]],
+    ) -> None:
+        if isinstance(pairs, (str, bytes)) or not isinstance(pairs, Iterable):
+            raise ValueError("cache batch must be a finite iterable of pairs")
+        materialized = tuple(pairs)
+        validated: list[tuple[AlignmentKey, AlignmentResult, str]] = []
+        key_digests: set[str] = set()
+        for item in materialized:
+            if isinstance(item, (str, bytes)):
+                raise ValueError("cache batch items must be key/result pairs")
+            try:
+                key, result = item
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "cache batch items must be key/result pairs"
+                ) from exc
+            if not isinstance(key, AlignmentKey):
+                raise ValueError("cache batch key must be an AlignmentKey")
+            _validate_result(result)
+            key_digest = _key_digest(key)
+            if key_digest in key_digests:
+                raise ValueError("cache batch contains a duplicate key")
+            key_digests.add(key_digest)
+            validated.append((key, result, key_digest))
+        if not validated:
+            return
+
+        self.root.mkdir(parents=True, exist_ok=True)
+        if not self.root.is_dir():
+            raise ValueError("alignment cache root is not a directory")
+
+        with _root_thread_lock(self.root):
+            with self._exclusive_process_lock():
+                index = self._read_index()
+                entries = dict(index["entries"])
+                for key, result, key_digest in validated:
+                    artifact, checksum = self._write_artifact(
+                        key_digest,
+                        result,
+                    )
+                    entries[key_digest] = {
+                        "key": _key_payload(key),
+                        "artifact": artifact,
+                        "sha256": checksum,
+                    }
+                _fsync_directory(self.root)
+                self._publish_index(
+                    {
+                        "schema_version": _CACHE_SCHEMA_VERSION,
+                        "entries": entries,
+                    }
+                )
+
     def put(self, key: AlignmentKey, result: AlignmentResult) -> None:
         if not isinstance(key, AlignmentKey):
             raise ValueError("cache key must be an AlignmentKey")
@@ -463,70 +584,17 @@ class AlignmentCache:
             with self._exclusive_process_lock():
                 index = self._read_index()
                 key_digest = _key_digest(key)
-                artifact_temp: Path | None = None
-                index_temp: Path | None = None
-                try:
-                    artifact_fd, artifact_name = tempfile.mkstemp(
-                        prefix=f".{key_digest}-",
-                        suffix=".npz.tmp",
-                        dir=self.root,
-                    )
-                    artifact_temp = Path(artifact_name)
-                    with os.fdopen(artifact_fd, "wb") as stream:
-                        np.savez_compressed(
-                            stream,
-                            matrix=result.matrix,
-                            correlation=np.asarray(
-                                result.correlation,
-                                dtype=np.float64,
-                            ),
-                            used_fallback=np.asarray(
-                                result.used_fallback,
-                                dtype=np.bool_,
-                            ),
-                            reason_present=np.asarray(
-                                result.reason is not None,
-                                dtype=np.bool_,
-                            ),
-                            reason=np.asarray(
-                                result.reason or "",
-                                dtype=np.str_,
-                            ),
-                        )
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    payload = artifact_temp.read_bytes()
-                    checksum = hashlib.sha256(payload).hexdigest()
-                    artifact = f"{key_digest}-{checksum}.npz"
-                    os.replace(artifact_temp, self.root / artifact)
-                    artifact_temp = None
-                    _fsync_directory(self.root)
-
-                    entries = dict(index["entries"])
-                    entries[key_digest] = {
-                        "key": _key_payload(key),
-                        "artifact": artifact,
-                        "sha256": checksum,
-                    }
-                    updated = {
+                artifact, checksum = self._write_artifact(key_digest, result)
+                _fsync_directory(self.root)
+                entries = dict(index["entries"])
+                entries[key_digest] = {
+                    "key": _key_payload(key),
+                    "artifact": artifact,
+                    "sha256": checksum,
+                }
+                self._publish_index(
+                    {
                         "schema_version": _CACHE_SCHEMA_VERSION,
                         "entries": entries,
                     }
-                    index_fd, index_name = tempfile.mkstemp(
-                        prefix=".index-",
-                        suffix=".json.tmp",
-                        dir=self.root,
-                    )
-                    index_temp = Path(index_name)
-                    with os.fdopen(index_fd, "wb") as stream:
-                        stream.write(_canonical_json(updated))
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(index_temp, self.index_path)
-                    index_temp = None
-                    _fsync_directory(self.root)
-                finally:
-                    if artifact_temp is not None:
-                        artifact_temp.unlink(missing_ok=True)
-                    if index_temp is not None:
-                        index_temp.unlink(missing_ok=True)
+                )
