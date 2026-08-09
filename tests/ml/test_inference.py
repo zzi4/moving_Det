@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -269,8 +270,17 @@ def test_rotated_nms_never_suppresses_across_site_or_sequence_identity():
 
 
 def test_rotated_nms_does_not_scan_winners_from_other_frame_groups(monkeypatch):
+    identity_reads = 0
+
+    class CountingDetection(Detection):
+        def __getattribute__(self, name):
+            nonlocal identity_reads
+            if name in {"site", "sequence", "frame", "class_id"}:
+                identity_reads += 1
+            return super().__getattribute__(name)
+
     rows = tuple(
-        Detection(
+        CountingDetection(
             frame=frame,
             obb=OBB(10.0, 10.0, 8.0, 4.0, 0.0),
             class_id=0,
@@ -281,6 +291,7 @@ def test_rotated_nms_does_not_scan_winners_from_other_frame_groups(monkeypatch):
         )
         for frame in range(1, 33)
     )
+    identity_reads = 0
     original_equal = inference_module.FrameKey.__eq__
     comparisons = 0
 
@@ -297,11 +308,12 @@ def test_rotated_nms_does_not_scan_winners_from_other_frame_groups(monkeypatch):
 
     assert merge_tile_detections(rows, 0.5) == rows
     assert comparisons <= len(rows)
+    assert identity_reads <= 12 * len(rows)
 
 
 @pytest.mark.parametrize(
     ("overlap", "expected_count"),
-    ((0.5, 2), (0.500001, 1)),
+    ((0.499999, 2), (0.5, 2), (0.500001, 1)),
 )
 def test_rotated_nms_keeps_exact_threshold_and_suppresses_strictly_above(
     monkeypatch,
@@ -342,6 +354,69 @@ def test_rotated_nms_groups_by_complete_frame_and_class_identity():
 
     assert merge_tile_detections(expected, 0.5) == ordered
     assert merge_tile_detections(tuple(reversed(expected)), 0.5) == ordered
+
+
+@pytest.mark.parametrize(
+    ("field", "lower_changes", "higher_changes"),
+    (
+        ("site", {"site": "site19"}, {"site": "site22"}),
+        (
+            "sequence",
+            {"sequence": "sequence_a"},
+            {"sequence": "sequence_b"},
+        ),
+        ("class_id", {"class_id": 0}, {"class_id": 1}),
+        ("frame", {"frame": 1}, {"frame": 2}),
+        (
+            "obb.cx",
+            {"obb": OBB(9.0, 10.0, 8.0, 4.0, 0.0)},
+            {"obb": OBB(11.0, 10.0, 8.0, 4.0, 0.0)},
+        ),
+        (
+            "obb.cy",
+            {"obb": OBB(10.0, 9.0, 8.0, 4.0, 0.0)},
+            {"obb": OBB(10.0, 11.0, 8.0, 4.0, 0.0)},
+        ),
+        (
+            "obb.width",
+            {"obb": OBB(10.0, 10.0, 7.0, 4.0, 0.0)},
+            {"obb": OBB(10.0, 10.0, 9.0, 4.0, 0.0)},
+        ),
+        (
+            "obb.height",
+            {"obb": OBB(10.0, 10.0, 8.0, 3.0, 0.0)},
+            {"obb": OBB(10.0, 10.0, 8.0, 5.0, 0.0)},
+        ),
+        (
+            "normalized obb.theta",
+            {"obb": OBB(10.0, 10.0, 8.0, 4.0, math.pi)},
+            {"obb": OBB(10.0, 10.0, 8.0, 4.0, 0.25)},
+        ),
+        ("tile.y", {"tile": Tile(0, 0, 32, 32)}, {"tile": Tile(0, 1, 32, 32)}),
+        ("tile.x", {"tile": Tile(0, 0, 32, 32)}, {"tile": Tile(1, 0, 32, 32)}),
+    ),
+)
+def test_rotated_nms_equal_confidence_order_uses_each_full_sort_key_field(
+    field,
+    lower_changes,
+    higher_changes,
+):
+    base = Detection(
+        frame=1,
+        obb=OBB(10.0, 10.0, 8.0, 4.0, 0.0),
+        class_id=0,
+        confidence=0.8,
+        tile=Tile(0, 0, 32, 32),
+        site="site19",
+        sequence="sequence_a",
+    )
+    lower_key_detection = replace(base, **lower_changes)
+    higher_key_detection = replace(base, **higher_changes)
+
+    assert merge_tile_detections(
+        (higher_key_detection, lower_key_detection),
+        1.0,
+    ) == (lower_key_detection, higher_key_detection), field
 
 
 def test_inference_empty_predictions_and_model_state_are_preserved():
