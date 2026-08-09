@@ -143,14 +143,16 @@ def merge_tile_detections(
         raise ValueError("detections must contain only Detection records")
 
     kept: list[Detection] = []
+    winners_by_group: dict[tuple[FrameKey, int], list[Detection]] = {}
     for candidate in sorted(validated, key=_detection_sort_key):
+        group_key = (candidate.frame_key, candidate.class_id)
+        group_winners = winners_by_group.setdefault(group_key, [])
         if any(
-            winner.frame_key == candidate.frame_key
-            and winner.class_id == candidate.class_id
-            and rotated_iou(winner.obb, candidate.obb) > threshold
-            for winner in kept
+            rotated_iou(winner.obb, candidate.obb) > threshold
+            for winner in group_winners
         ):
             continue
+        group_winners.append(candidate)
         kept.append(candidate)
     return tuple(sorted(kept, key=_detection_sort_key))
 

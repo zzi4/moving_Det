@@ -551,6 +551,92 @@ def test_task11_training_validator_consumes_passed_loader_and_restores_identity(
 
 
 @REQUIRES_TORCH
+def test_task11_training_validator_invokes_global_cross_tile_merge():
+    import torch
+
+    from moving_det.ml.inference import Detection
+    from moving_det.models import OBB
+    from moving_det.vrud.tiling import Tile
+
+    def batch(tile_x):
+        return {
+            "frames": torch.zeros((1, 1, 3, 8, 8)),
+            "valid": torch.ones((1, 1), dtype=torch.bool),
+            "transforms": torch.eye(2, 3).reshape(1, 1, 2, 3),
+            "cls": torch.empty((0, 1)),
+            "bboxes": torch.empty((0, 5)),
+            "batch_idx": torch.empty((0,)),
+            "metadata": [
+                {
+                    "site": "site19",
+                    "sequence": "sequence_a",
+                    "center_frame": 31,
+                    "tile_xywh": (tile_x, 0, 8, 8),
+                    "track_keys": (),
+                    "source": "evaluation",
+                    "offsets": (0,),
+                }
+            ],
+        }
+
+    class TwoTileLoader:
+        def __iter__(self):
+            yield batch(0)
+            yield batch(8)
+
+    model = torch.nn.Identity()
+    merge_calls = []
+    evaluated = []
+
+    def inferencer(received_model, clip, cfg):
+        assert received_model is model
+        return (
+            Detection(
+                frame=31,
+                obb=OBB(4.0, 4.0, 4.0, 2.0, 0.0),
+                class_id=0,
+                confidence=0.8,
+                tile=Tile(0, 0, 8, 8),
+                site="site19",
+                sequence="sequence_a",
+            ),
+        )
+
+    def merger(predictions, threshold):
+        rows = tuple(predictions)
+        merge_calls.append((rows, threshold))
+        return rows[:1]
+
+    def evaluator(predictions, ground_truth, cfg):
+        evaluated.append(tuple(predictions))
+        assert tuple(ground_truth) == ()
+        return {"map50": 0.0, "recall_riou_025": 0.0}
+
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        tile_size=8,
+        tile_overlap=0,
+    )
+    metrics = _loader_task11_metrics(
+        model,
+        TwoTileLoader(),
+        torch.device("cpu"),
+        cfg,
+        inferencer=inferencer,
+        evaluator=evaluator,
+        merger=merger,
+    )
+
+    assert metrics == {"map50": 0.0, "recall_at_riou_025": 0.0}
+    assert len(merge_calls) == 1
+    received, threshold = merge_calls[0]
+    assert len(received) == 2
+    assert {item.tile.x for item in received} == {0, 8}
+    assert threshold == cfg.nms_iou
+    assert evaluated == [received[:1]]
+
+
+@REQUIRES_TORCH
 def test_lstfe_diagnostic_uses_eval_without_bn_drift_and_restores_all_states(
     tmp_path,
 ):

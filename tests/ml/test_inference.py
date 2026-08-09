@@ -268,6 +268,82 @@ def test_rotated_nms_never_suppresses_across_site_or_sequence_identity():
     }
 
 
+def test_rotated_nms_does_not_scan_winners_from_other_frame_groups(monkeypatch):
+    rows = tuple(
+        Detection(
+            frame=frame,
+            obb=OBB(10.0, 10.0, 8.0, 4.0, 0.0),
+            class_id=0,
+            confidence=0.9,
+            tile=Tile(0, 0, 32, 32),
+            site="site19",
+            sequence="sequence_a",
+        )
+        for frame in range(1, 33)
+    )
+    original_equal = inference_module.FrameKey.__eq__
+    comparisons = 0
+
+    def counting_equal(self, other):
+        nonlocal comparisons
+        comparisons += 1
+        return original_equal(self, other)
+
+    monkeypatch.setattr(
+        inference_module.FrameKey,
+        "__eq__",
+        counting_equal,
+    )
+
+    assert merge_tile_detections(rows, 0.5) == rows
+    assert comparisons <= len(rows)
+
+
+@pytest.mark.parametrize(
+    ("overlap", "expected_count"),
+    ((0.5, 2), (0.500001, 1)),
+)
+def test_rotated_nms_keeps_exact_threshold_and_suppresses_strictly_above(
+    monkeypatch,
+    overlap,
+    expected_count,
+):
+    winner = _detection(confidence=0.9)
+    candidate = _detection(confidence=0.8, tile_x=768)
+    monkeypatch.setattr(
+        inference_module,
+        "rotated_iou",
+        lambda first, second: overlap,
+    )
+
+    assert len(merge_tile_detections((candidate, winner), 0.5)) == expected_count
+
+
+def test_rotated_nms_groups_by_complete_frame_and_class_identity():
+    winner = Detection(
+        frame=1,
+        obb=OBB(10.0, 10.0, 8.0, 4.0, 0.0),
+        class_id=0,
+        confidence=0.9,
+        tile=Tile(0, 0, 32, 32),
+        site="site19",
+        sequence="sequence_a",
+    )
+    expected = (
+        winner,
+        replace(winner, frame=2, confidence=0.8),
+        replace(winner, class_id=1, confidence=0.7),
+        replace(winner, site="site22", confidence=0.6),
+        replace(winner, sequence="sequence_b", confidence=0.5),
+    )
+    ordered = tuple(
+        sorted(expected, key=inference_module._detection_sort_key)
+    )
+
+    assert merge_tile_detections(expected, 0.5) == ordered
+    assert merge_tile_detections(tuple(reversed(expected)), 0.5) == ordered
+
+
 def test_inference_empty_predictions_and_model_state_are_preserved():
     model = RecordingModel(
         1,
