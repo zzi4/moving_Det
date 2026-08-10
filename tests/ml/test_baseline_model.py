@@ -79,6 +79,26 @@ def test_baseline_loss_is_finite_scalar_with_named_reused_criterion():
     assert set(second_components) == set(components)
 
 
+def test_loss_from_predictions_matches_loss():
+    model = BaselineOBB(weights=None).train()
+    batch = _synthetic_temporal_batch()
+
+    direct_total, direct_components = model.loss(batch)
+    predictions = model(batch)
+    split_total, split_components = model.loss_from_predictions(
+        predictions,
+        batch,
+    )
+
+    torch.testing.assert_close(split_total, direct_total)
+    assert split_components.keys() == direct_components.keys()
+    for name in direct_components:
+        torch.testing.assert_close(
+            split_components[name],
+            direct_components[name],
+        )
+
+
 def test_explicit_none_criterion_is_initialized_before_loss():
     model = BaselineOBB(weights=None).train()
     model.detector.criterion = None

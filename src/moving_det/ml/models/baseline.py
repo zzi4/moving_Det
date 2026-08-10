@@ -75,6 +75,13 @@ class BaselineOBB(nn.Module):
         batch: Mapping[str, Any],
     ) -> tuple[Tensor, dict[str, Tensor]]:
         predictions = self.forward(batch)
+        return self.loss_from_predictions(predictions, batch)
+
+    def loss_from_predictions(
+        self,
+        predictions: Any,
+        batch: Mapping[str, Any],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
         if getattr(self.detector, "criterion", None) is None:
             self.detector.criterion = self.detector.init_criterion()
         loss_values, components = self.detector.criterion(predictions, batch)
