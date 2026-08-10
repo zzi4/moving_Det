@@ -249,8 +249,9 @@ conda run -n moving-det-vru pytest -q tests/ml/test_training.py \
 For default loaders, use `DistributedSampler` with `num_replicas=2`, the
 context rank, `shuffle=True` only for training, and `seed=cfg.seed`.  Keep local
 batch size 1.  Gate and validation samplers are disjoint and unshuffled.
-Reject custom loader hooks in distributed mode so tests cannot accidentally
-bypass global batch accounting.
+Keep custom loader hooks as the existing explicit synthetic/no-cache test seam;
+their caller must provide disjoint rank-local samples and a custom gate loader.
+Production dual-GPU launch never supplies this seam.
 
 - [ ] **Step 4: Add DDP forward and global accumulation**
 
