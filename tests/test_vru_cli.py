@@ -576,6 +576,45 @@ def test_distributed_worker_passes_context_to_trainer_and_validator(tmp_path):
     assert destroyed == [True]
 
 
+@REQUIRES_TORCH
+def test_distributed_worker_disables_hanging_nccl_p2p_transport(monkeypatch):
+    import moving_det.distributed_train as distributed_train
+
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.delenv("NCCL_P2P_DISABLE", raising=False)
+    monkeypatch.setattr(
+        distributed_train.torch.cuda,
+        "is_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        distributed_train.torch.cuda,
+        "device_count",
+        lambda: 2,
+    )
+    selected_devices = []
+    initializations = []
+    monkeypatch.setattr(
+        distributed_train.torch.cuda,
+        "set_device",
+        selected_devices.append,
+    )
+    monkeypatch.setattr(
+        distributed_train.dist,
+        "init_process_group",
+        lambda **kwargs: initializations.append(kwargs),
+    )
+
+    context = distributed_train.initialize_distributed_context()
+
+    assert context.backend == "nccl"
+    assert selected_devices == [0]
+    assert initializations == [{"backend": "nccl", "init_method": "env://"}]
+    assert distributed_train.os.environ["NCCL_P2P_DISABLE"] == "1"
+
+
 def test_temporal_resume_rejects_output_parent_of_alignment_cache(tmp_path):
     import types
 

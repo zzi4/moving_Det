@@ -66,6 +66,7 @@ def initialize_distributed_context() -> DistributedContext:
     )
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise RuntimeError("distributed worker requires two CUDA devices")
+    os.environ.setdefault("NCCL_P2P_DISABLE", "1")
     torch.cuda.set_device(context.local_rank)
     try:
         dist.init_process_group(backend=context.backend, init_method="env://")
