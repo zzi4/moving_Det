@@ -17,6 +17,7 @@ from pathlib import Path
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from types import MappingProxyType
@@ -259,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--alignment-cache", type=_path_argument)
     train.add_argument("--overfit-samples", type=_positive_integer)
     train.add_argument("--max-steps", type=_positive_integer)
+    train.add_argument("--devices", type=int, choices=(1, 2), default=1)
 
     evaluate = subparsers.add_parser(
         "evaluate",
@@ -1094,11 +1096,123 @@ def _loader_task11_metrics(
             module.training = state
 
 
+def _distributed_training_command(
+    args: argparse.Namespace,
+    *,
+    manifest: Path,
+    checkpoint_output: Path,
+    alignment_cache: Path | None,
+    init_checkpoint: Path | None,
+    resume_checkpoint: Path | None,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=2",
+        "-m",
+        "moving_det.distributed_train",
+        "--model",
+        str(args.model),
+        "--config",
+        str(Path(args.config).resolve()),
+        "--manifest",
+        str(Path(manifest).resolve()),
+        "--output",
+        str(Path(checkpoint_output).resolve()),
+    ]
+    optional_paths = (
+        ("--weights", args.weights),
+        ("--alignment-cache", alignment_cache),
+        ("--init-checkpoint", init_checkpoint),
+        ("--resume-checkpoint", resume_checkpoint),
+    )
+    for option, value in optional_paths:
+        if value is not None:
+            command.extend((option, str(Path(value).resolve())))
+    if args.max_steps is not None:
+        command.extend(("--max-steps", str(args.max_steps)))
+    return command
+
+
+def _atomic_json_artifact(path: Path, payload: Mapping[str, object]) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(_json_bytes(dict(payload)))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _existing_json_mapping(path: Path) -> dict[str, object]:
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        return {}
+    try:
+        payload = _read_json(source)
+    except (OSError, RuntimeError, ValueError):
+        return {}
+    return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def _finalize_distributed_training_failure(
+    checkpoint_output: Path,
+    *,
+    exit_status: int,
+    overfit: bool,
+) -> None:
+    error = f"distributed training exited with status {exit_status}"
+    output = Path(checkpoint_output)
+    run_path = output / "run.json"
+    run = _existing_json_mapping(run_path)
+    run.update(
+        {
+            "status": "failed",
+            "error": error,
+            "distributed_exit_status": exit_status,
+            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    _atomic_json_artifact(run_path, run)
+    if overfit:
+        existing_gate = _existing_json_mapping(output / "gate.json")
+        gate = {
+            "initial_loss": existing_gate.get("initial_loss"),
+            "final_loss": existing_gate.get("final_loss"),
+            "loss_reduction": None,
+            "recall_at_riou_025": None,
+            "finite_gradients": False,
+            "amp_overflow_skips": existing_gate.get(
+                "amp_overflow_skips",
+                0,
+            ),
+            "optimizer_steps": existing_gate.get("optimizer_steps", 0),
+            "error": error,
+            "passed": False,
+        }
+        _atomic_json_artifact(output / "gate.json", gate)
+
+
 def run_train(
     args: argparse.Namespace,
     *,
     config_loader: Callable[[Path], object] | None = None,
     trainer: Callable[..., object] | None = None,
+    process_runner: Callable[..., object] | None = None,
+    cuda_device_count: Callable[[], int] | None = None,
 ) -> int:
     using_default_trainer = trainer is None
     cfg = _load_config(args.config, config_loader)
@@ -1182,6 +1296,66 @@ def run_train(
             if path is not None and (path.is_symlink() or not path.is_file()):
                 raise WorkflowError(f"{label} is missing or unsafe: {path}")
 
+    checkpoint_output = output / "checkpoints"
+    if args.devices == 2:
+        if not using_default_trainer:
+            raise WorkflowError(
+                "custom trainer injection is unavailable with --devices 2"
+            )
+        if cuda_device_count is None:
+            import torch
+
+            cuda_device_count = torch.cuda.device_count
+        visible_devices = cuda_device_count()
+        if (
+            isinstance(visible_devices, bool)
+            or not isinstance(visible_devices, int)
+            or visible_devices < 2
+        ):
+            raise WorkflowError(
+                "--devices 2 requires two visible CUDA devices"
+            )
+        command = _distributed_training_command(
+            args,
+            manifest=manifest_for_training,
+            checkpoint_output=checkpoint_output,
+            alignment_cache=alignment_cache,
+            init_checkpoint=init_checkpoint,
+            resume_checkpoint=resume_checkpoint,
+        )
+        selected_runner = process_runner or subprocess.run
+        try:
+            completed = selected_runner(command, check=False)
+            exit_status = getattr(completed, "returncode")
+            if (
+                isinstance(exit_status, bool)
+                or not isinstance(exit_status, int)
+            ):
+                raise WorkflowError(
+                    "distributed launcher returned an invalid exit status"
+                )
+        except OSError as exc:
+            _finalize_distributed_training_failure(
+                checkpoint_output,
+                exit_status=-1,
+                overfit=args.max_steps is not None,
+            )
+            raise WorkflowError(
+                f"failed to launch distributed training: {exc}"
+            ) from exc
+        if exit_status != 0:
+            _finalize_distributed_training_failure(
+                checkpoint_output,
+                exit_status=exit_status,
+                overfit=args.max_steps is not None,
+            )
+            raise WorkflowError(
+                f"distributed training exited with status {exit_status}"
+            )
+        best = checkpoint_output / "best.pt"
+        print(best.resolve())
+        return 0
+
     training_hooks = None
     if trainer is None:
         from moving_det.ml.training import TrainingHooks, train_model
@@ -1206,7 +1380,7 @@ def run_train(
         args.model,
         cfg,
         manifest_for_training,
-        output / "checkpoints",
+        checkpoint_output,
         **training_arguments,
     )
     best = Path(getattr(result, "best_checkpoint"))

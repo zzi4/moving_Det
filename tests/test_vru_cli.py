@@ -167,8 +167,18 @@ def test_parser_rejects_unknown_models_invalid_counts_and_malformed_paths():
         parser.parse_args(
             ["build-manifest", "--output", "bad\0path"]
         )
+    with pytest.raises(SystemExit) as devices:
+        parser.parse_args(
+            "train --model baseline --manifest manifest --output run "
+            "--devices 3".split()
+        )
 
-    assert (unknown.value.code, count.value.code, step.value.code) == (2, 2, 2)
+    assert (
+        unknown.value.code,
+        count.value.code,
+        step.value.code,
+        devices.value.code,
+    ) == (2, 2, 2, 2)
     assert malformed.value.code == 2
 
 
@@ -328,6 +338,242 @@ def test_train_maps_public_weights_baseline_init_and_resume_without_aliasing(
     assert capsys.readouterr().out.strip() == str(
         Result.best_checkpoint.resolve()
     )
+
+
+def test_train_devices_two_launches_normalized_torchrun_command(
+    tmp_path,
+    capsys,
+):
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    output = tmp_path / "distributed-run"
+    commands = []
+
+    def process_runner(command, *, check):
+        commands.append((command, check))
+        return subprocess.CompletedProcess(command, 0)
+
+    args = build_parser().parse_args(
+        [
+            "train",
+            "--model",
+            "baseline",
+            "--config",
+            "configs/vrud-temporal-obb.yaml",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--devices",
+            "2",
+        ]
+    )
+
+    result = run_train(
+        args,
+        config_loader=lambda _path: cfg,
+        process_runner=process_runner,
+        cuda_device_count=lambda: 2,
+    )
+
+    assert result == 0
+    assert len(commands) == 1
+    command, check = commands[0]
+    assert check is False
+    assert command[:8] == [
+        vru_cli_module.sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc-per-node=2",
+        "-m",
+        "moving_det.distributed_train",
+        "--model",
+    ]
+    assert command[8] == "baseline"
+    assert command[command.index("--config") + 1] == str(
+        Path("configs/vrud-temporal-obb.yaml").resolve()
+    )
+    assert command[command.index("--manifest") + 1] == str(
+        manifest.resolve()
+    )
+    assert command[command.index("--output") + 1] == str(
+        (output / "checkpoints").resolve()
+    )
+    assert capsys.readouterr().out.strip() == str(
+        (output / "checkpoints" / "best.pt").resolve()
+    )
+
+
+def test_train_devices_two_requires_two_visible_cuda_devices(tmp_path):
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    args = build_parser().parse_args(
+        [
+            "train",
+            "--model",
+            "baseline",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(tmp_path / "run"),
+            "--devices",
+            "2",
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="two visible CUDA devices"):
+        run_train(
+            args,
+            config_loader=lambda _path: cfg,
+            process_runner=lambda *_args, **_kwargs: pytest.fail(
+                "torchrun must not launch"
+            ),
+            cuda_device_count=lambda: 1,
+        )
+
+
+def test_distributed_launch_failure_finalizes_run_and_gate(tmp_path):
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    manifest = tmp_path / "manifest"
+    _manifest_children(
+        manifest,
+        [
+            {"source": "positive", "sample": index}
+            for index in range(64)
+        ],
+    )
+    output = tmp_path / "failed-run"
+
+    def process_runner(command, *, check):
+        assert check is False
+        checkpoints = output / "checkpoints"
+        checkpoints.mkdir(parents=True)
+        (checkpoints / "run.json").write_text(
+            json.dumps({"status": "running", "seed": 20260806}) + "\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 17)
+
+    args = build_parser().parse_args(
+        [
+            "train",
+            "--model",
+            "baseline",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--overfit-samples",
+            "64",
+            "--max-steps",
+            "300",
+            "--devices",
+            "2",
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="status 17"):
+        run_train(
+            args,
+            config_loader=lambda _path: cfg,
+            process_runner=process_runner,
+            cuda_device_count=lambda: 2,
+        )
+
+    run = json.loads(
+        (output / "checkpoints" / "run.json").read_text(encoding="utf-8")
+    )
+    gate = json.loads(
+        (output / "checkpoints" / "gate.json").read_text(encoding="utf-8")
+    )
+    assert run["status"] == "failed"
+    assert run["distributed_exit_status"] == 17
+    assert "finished_at_utc" in run
+    assert gate["passed"] is False
+    assert gate["finite_gradients"] is False
+    assert gate["error"] == "distributed training exited with status 17"
+
+
+@REQUIRES_TORCH
+def test_distributed_worker_passes_context_to_trainer_and_validator(tmp_path):
+    from moving_det.distributed_train import (
+        build_parser as build_worker_parser,
+        run_worker,
+    )
+    from moving_det.ml.distributed import DistributedContext
+
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        backend="nccl",
+    )
+    alignment_cache = tmp_path / "cache-root" / "alignment-cache"
+    captured = {}
+    destroyed = []
+
+    def validator(model, loader, device, config, *, distributed_context):
+        captured["validator_context"] = distributed_context
+        captured["validator_config"] = config
+        return {"map50": 0.25, "recall_at_riou_025": 0.5}
+
+    def trainer(model_name, config, manifest, output, **kwargs):
+        captured.update(
+            model_name=model_name,
+            config=config,
+            manifest=manifest,
+            output=output,
+            trainer_context=kwargs["distributed_context"],
+            init_checkpoint=kwargs["init_checkpoint"],
+        )
+        assert kwargs["hooks"].validator("model", "loader", "device") == {
+            "map50": 0.25,
+            "recall_at_riou_025": 0.5,
+        }
+        return object()
+
+    args = build_worker_parser().parse_args(
+        [
+            "--model",
+            "mg_vtod",
+            "--config",
+            "configs/vrud-temporal-obb.yaml",
+            "--manifest",
+            str(tmp_path / "manifest"),
+            "--output",
+            str(tmp_path / "checkpoints"),
+            "--alignment-cache",
+            str(alignment_cache),
+            "--init-checkpoint",
+            str(tmp_path / "baseline.pt"),
+            "--max-steps",
+            "36",
+        ]
+    )
+
+    result = run_worker(
+        args,
+        config_loader=lambda _path: cfg,
+        trainer=trainer,
+        context_initializer=lambda: context,
+        process_group_destroyer=lambda: destroyed.append(True),
+        validator=validator,
+    )
+
+    assert result == 0
+    assert captured["model_name"] == "mg_vtod"
+    assert captured["config"].output_root == alignment_cache.parent
+    assert captured["manifest"] == tmp_path / "manifest"
+    assert captured["output"] == tmp_path / "checkpoints"
+    assert captured["trainer_context"] is context
+    assert captured["validator_context"] is context
+    assert captured["validator_config"].output_root == alignment_cache.parent
+    assert captured["init_checkpoint"] == tmp_path / "baseline.pt"
+    assert destroyed == [True]
 
 
 def test_temporal_resume_rejects_output_parent_of_alignment_cache(tmp_path):
