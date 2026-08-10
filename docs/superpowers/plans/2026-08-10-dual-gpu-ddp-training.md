@@ -25,7 +25,7 @@
 
 **Files:**
 - Modify: `src/moving_det/ml/models/baseline.py`
-- Test: `tests/ml/test_baseline.py`
+- Test: `tests/ml/test_baseline_model.py`
 
 **Interfaces:**
 - Consumes: detector predictions from `BaselineOBB.forward(batch)`.
@@ -53,7 +53,7 @@ Run:
 
 ```bash
 conda run -n moving-det-vru pytest -q \
-  tests/ml/test_baseline.py::test_loss_from_predictions_matches_loss
+  tests/ml/test_baseline_model.py::test_loss_from_predictions_matches_loss
 ```
 
 Expected: fail because `loss_from_predictions` does not exist.
@@ -82,13 +82,13 @@ Keep `loss(batch)` as `return self.loss_from_predictions(self.forward(batch), ba
 
 ```bash
 conda run -n moving-det-vru pytest -q \
-  tests/ml/test_baseline.py tests/ml/test_mg_vtod.py tests/ml/test_lstfe.py
+  tests/ml/test_baseline_model.py tests/ml/test_mg_vtod.py tests/ml/test_lstfe.py
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/moving_det/ml/models/baseline.py tests/ml/test_baseline.py
+git add src/moving_det/ml/models/baseline.py tests/ml/test_baseline_model.py
 git commit -m "refactor: separate OBB forward and loss"
 ```
 
