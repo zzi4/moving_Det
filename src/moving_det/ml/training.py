@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import nullcontext
 import copy
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
@@ -19,10 +20,13 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from moving_det.ml.dataset import (
     ClipSpec,
@@ -30,6 +34,12 @@ from moving_det.ml.dataset import (
     collate_temporal_obb,
 )
 from moving_det.ml.factory import create_model
+from moving_det.ml.distributed import (
+    DistributedContext,
+    distributed_mean,
+    distributed_sum_count,
+    gather_rank_objects,
+)
 from moving_det.temporal_config import TemporalOBBConfig
 
 
@@ -430,6 +440,8 @@ def _default_loader_factory(
     model_name: str,
     cfg: TemporalOBBConfig,
     manifest_dir: Path,
+    *,
+    distributed_context: DistributedContext | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     spec = _clip_spec(model_name, cfg)
     training = TemporalClipDataset(
@@ -445,11 +457,36 @@ def _default_loader_factory(
         training=False,
     )
     generator = torch.Generator().manual_seed(cfg.seed)
+    training_sampler = (
+        None
+        if distributed_context is None
+        else DistributedSampler(
+            training,
+            num_replicas=distributed_context.world_size,
+            rank=distributed_context.rank,
+            shuffle=True,
+            seed=cfg.seed,
+            drop_last=False,
+        )
+    )
+    validation_sampler = (
+        None
+        if distributed_context is None
+        else DistributedSampler(
+            validation,
+            num_replicas=distributed_context.world_size,
+            rank=distributed_context.rank,
+            shuffle=False,
+            seed=cfg.seed,
+            drop_last=False,
+        )
+    )
     return (
         DataLoader(
             training,
             batch_size=1,
-            shuffle=True,
+            shuffle=training_sampler is None,
+            sampler=training_sampler,
             num_workers=0,
             collate_fn=collate_temporal_obb,
             generator=generator,
@@ -458,6 +495,7 @@ def _default_loader_factory(
             validation,
             batch_size=1,
             shuffle=False,
+            sampler=validation_sampler,
             num_workers=0,
             collate_fn=collate_temporal_obb,
         ),
@@ -468,6 +506,8 @@ def _default_gate_loader_factory(
     model_name: str,
     cfg: TemporalOBBConfig,
     manifest_dir: Path,
+    *,
+    distributed_context: DistributedContext | None = None,
 ) -> DataLoader:
     evidence = TemporalClipDataset(
         manifest_dir / "train.jsonl",
@@ -475,10 +515,23 @@ def _default_gate_loader_factory(
         _clip_spec(model_name, cfg),
         training=False,
     )
+    sampler = (
+        None
+        if distributed_context is None
+        else DistributedSampler(
+            evidence,
+            num_replicas=distributed_context.world_size,
+            rank=distributed_context.rank,
+            shuffle=False,
+            seed=cfg.seed,
+            drop_last=False,
+        )
+    )
     return DataLoader(
         evidence,
         batch_size=1,
         shuffle=False,
+        sampler=sampler,
         num_workers=0,
         collate_fn=collate_temporal_obb,
     )
@@ -1100,6 +1153,7 @@ def _validate_resume_checkpoint_payload(
     train_loader: Any,
     manifest_dir: Path,
     alignment_cache_sha256: str | None,
+    distributed_context: DistributedContext | None,
 ) -> list[dict[str, Any]]:
     _verify_manifest_sha256(
         payload["manifest_sha256"],
@@ -1170,11 +1224,64 @@ def _validate_resume_checkpoint_payload(
         payload.get("scaler"),
         enabled=scaler.is_enabled(),
     )
-    _validate_reproducibility_state(
-        payload.get("reproducibility_state"),
-        train_loader,
+    reproducibility_state = _resume_reproducibility_state(
+        payload,
+        distributed_context,
+        label=label,
     )
+    if reproducibility_state is not None:
+        _validate_reproducibility_state(
+            reproducibility_state,
+            train_loader,
+        )
     return history
+
+
+def _resume_reproducibility_state(
+    payload: Mapping[str, Any],
+    distributed_context: DistributedContext | None,
+    *,
+    label: str,
+) -> Mapping[str, Any] | None:
+    raw_world_size = payload.get("distributed_world_size")
+    rank_states = payload.get("distributed_reproducibility_states")
+    if distributed_context is None:
+        if raw_world_size is not None or rank_states is not None:
+            raise ValueError(
+                f"resume {label} checkpoint distributed topology is "
+                "incompatible with single-process training"
+            )
+        return payload.get("reproducibility_state")
+
+    if raw_world_size is None:
+        if rank_states is not None:
+            raise ValueError(
+                f"resume {label} checkpoint has distributed RNG states "
+                "without distributed topology"
+            )
+        return None
+    if (
+        isinstance(raw_world_size, bool)
+        or not isinstance(raw_world_size, int)
+        or raw_world_size != distributed_context.world_size
+    ):
+        raise ValueError(
+            f"resume {label} checkpoint distributed world size is "
+            "incompatible"
+        )
+    if (
+        not isinstance(rank_states, (list, tuple))
+        or len(rank_states) != distributed_context.world_size
+    ):
+        raise ValueError(
+            f"resume {label} checkpoint distributed RNG states are invalid"
+        )
+    selected = rank_states[distributed_context.rank]
+    if not isinstance(selected, Mapping):
+        raise ValueError(
+            f"resume {label} checkpoint rank RNG state is invalid"
+        )
+    return selected
 
 
 def _derive_strict_best(
@@ -1206,6 +1313,7 @@ def _validate_resume_pair(
     train_loader: Any,
     manifest_dir: Path,
     alignment_cache_sha256: str | None,
+    distributed_context: DistributedContext | None,
 ) -> list[dict[str, Any]]:
     last_history = _validate_resume_checkpoint_payload(
         last_payload,
@@ -1218,6 +1326,7 @@ def _validate_resume_pair(
         train_loader=train_loader,
         manifest_dir=manifest_dir,
         alignment_cache_sha256=alignment_cache_sha256,
+        distributed_context=distributed_context,
     )
     best_history = _validate_resume_checkpoint_payload(
         best_payload,
@@ -1230,6 +1339,7 @@ def _validate_resume_pair(
         train_loader=train_loader,
         manifest_dir=manifest_dir,
         alignment_cache_sha256=alignment_cache_sha256,
+        distributed_context=distributed_context,
     )
     if (
         last_payload["manifest_sha256"]
@@ -1345,6 +1455,7 @@ def _evaluate_full_loss(
     device: torch.device,
     *,
     use_amp: bool,
+    distributed_context: DistributedContext | None = None,
 ) -> float:
     was_training = model.training
     buffers = {
@@ -1380,6 +1491,12 @@ def _evaluate_full_loss(
             for name, value in buffers.items():
                 named_buffers[name].copy_(value)
         model.train(was_training)
+    if distributed_context is not None:
+        weighted_loss, sample_count = distributed_sum_count(
+            weighted_loss,
+            sample_count,
+            distributed_context,
+        )
     if sample_count != 64:
         raise ValueError(
             f"gate evidence loader must contain exactly 64 samples, got "
@@ -1419,6 +1536,7 @@ def train_model(
     init_checkpoint: Path | None = None,
     resume_checkpoint: Path | None = None,
     hooks: TrainingHooks | None = None,
+    distributed_context: DistributedContext | None = None,
 ) -> TrainResult:
     """Train a model with deterministic provenance and internal checkpoints."""
     incoming_resume_rng = (
@@ -1427,6 +1545,16 @@ def train_model(
         else None
     )
     resume_validation_committed = resume_checkpoint is None
+    if (
+        distributed_context is not None
+        and not isinstance(distributed_context, DistributedContext)
+    ):
+        raise ValueError(
+            "distributed_context must be a DistributedContext or None"
+        )
+    is_primary = (
+        distributed_context is None or distributed_context.is_primary
+    )
     output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc)
@@ -1461,6 +1589,19 @@ def train_model(
         "load_provenance": load_provenance,
         "amp_enabled": False,
         "amp_overflow_skips": 0,
+        "distributed": {
+            "enabled": distributed_context is not None,
+            "backend": (
+                None
+                if distributed_context is None
+                else distributed_context.backend
+            ),
+            "world_size": (
+                1
+                if distributed_context is None
+                else distributed_context.world_size
+            ),
+        },
         "status": "setup",
     }
 
@@ -1485,7 +1626,11 @@ def train_model(
         device = torch.device(
             selected_hooks.device
             if selected_hooks.device is not None
-            else ("cuda" if torch.cuda.is_available() else "cpu")
+            else (
+                f"cuda:{distributed_context.local_rank}"
+                if distributed_context is not None
+                else ("cuda" if torch.cuda.is_available() else "cpu")
+            )
         )
         use_amp = device.type == "cuda"
         run["git_commit"] = _git_value(["rev-parse", "HEAD"])
@@ -1527,6 +1672,22 @@ def train_model(
             )
         if device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA device requested but CUDA is unavailable")
+        if distributed_context is not None:
+            if (
+                not dist.is_initialized()
+                or dist.get_rank() != distributed_context.rank
+                or dist.get_world_size() != distributed_context.world_size
+            ):
+                raise ValueError(
+                    "distributed process group does not match context"
+                )
+            if (
+                device.type == "cuda"
+                and device.index != distributed_context.local_rank
+            ):
+                raise ValueError(
+                    "distributed CUDA device does not match local rank"
+                )
 
         manifest_sha256 = manifest_fingerprint(manifest_root)
         run["manifest_sha256"] = manifest_sha256
@@ -1547,13 +1708,6 @@ def train_model(
                 "gate_loader_factory in overfit mode"
             )
 
-        loader_factory = (
-            selected_hooks.loader_factory or _default_loader_factory
-        )
-        gate_loader_factory = (
-            selected_hooks.gate_loader_factory
-            or _default_gate_loader_factory
-        )
         scaler_factory = (
             selected_hooks.scaler_factory or _default_scaler_factory
         )
@@ -1575,18 +1729,38 @@ def train_model(
             nonlocal validation_loader
             nonlocal gate_loader
             nonlocal alignment_cache_sha256
-            train_loader, validation_loader = loader_factory(
-                model_name,
-                cfg,
-                manifest_root,
-            )
+            if selected_hooks.loader_factory is None:
+                train_loader, validation_loader = _default_loader_factory(
+                    model_name,
+                    cfg,
+                    manifest_root,
+                    distributed_context=distributed_context,
+                )
+            else:
+                train_loader, validation_loader = (
+                    selected_hooks.loader_factory(
+                        model_name,
+                        cfg,
+                        manifest_root,
+                    )
+                )
             if not hasattr(train_loader, "__len__") or len(train_loader) == 0:
                 raise ValueError("training loader must be non-empty and sized")
-            gate_loader = (
-                gate_loader_factory(model_name, cfg, manifest_root)
-                if max_steps is not None
-                else None
-            )
+            if max_steps is None:
+                gate_loader = None
+            elif selected_hooks.gate_loader_factory is None:
+                gate_loader = _default_gate_loader_factory(
+                    model_name,
+                    cfg,
+                    manifest_root,
+                    distributed_context=distributed_context,
+                )
+            else:
+                gate_loader = selected_hooks.gate_loader_factory(
+                    model_name,
+                    cfg,
+                    manifest_root,
+                )
             alignment_cache_sha256 = (
                 _alignment_cache_sha256_for_default_loaders(
                     model_name,
@@ -1717,6 +1891,7 @@ def train_model(
                     train_loader=train_loader,
                     manifest_dir=manifest_root,
                     alignment_cache_sha256=alignment_cache_sha256,
+                    distributed_context=distributed_context,
                 )
                 resume_validation_committed = True
                 checkpoint_epoch = resume_payload["epoch"]
@@ -1745,27 +1920,55 @@ def train_model(
                     scaler,
                     resume_payload["scaler"],
                 )
-                _restore_reproducibility_state(
-                    resume_payload["reproducibility_state"],
-                    train_loader,
+                reproducibility_state = _resume_reproducibility_state(
+                    resume_payload,
+                    distributed_context,
+                    label="last",
                 )
+                if reproducibility_state is None:
+                    assert distributed_context is not None
+                    migration_seed = cfg.seed + distributed_context.rank
+                    random.seed(migration_seed)
+                    np.random.seed(migration_seed)
+                    torch.manual_seed(migration_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(migration_seed)
+                else:
+                    _restore_reproducibility_state(
+                        reproducibility_state,
+                        train_loader,
+                    )
             except (KeyError, RuntimeError, TypeError, ValueError) as exc:
                 raise ValueError(
                     "resume checkpoint validation or restoration failed: "
                     f"{exc}"
                 ) from exc
 
-            resumed_best = {
-                **source_best,
-                "load_provenance": load_provenance,
-            }
-            _atomic_torch_save(resumed_best, best_checkpoint)
-            _atomic_json_write(history_path, history)
+            if is_primary:
+                resumed_best = {
+                    **source_best,
+                    "load_provenance": load_provenance,
+                }
+                _atomic_torch_save(resumed_best, best_checkpoint)
+                _atomic_json_write(history_path, history)
+
+        training_model: nn.Module = model
+        if distributed_context is not None:
+            training_model = DistributedDataParallel(
+                model,
+                device_ids=(
+                    [distributed_context.local_rank]
+                    if device.type == "cuda"
+                    else None
+                ),
+                find_unused_parameters=False,
+            )
 
         run["status"] = "running"
-        _atomic_json_write(output_root / "run.json", run)
+        if is_primary:
+            _atomic_json_write(output_root / "run.json", run)
 
-        model.train()
+        training_model.train()
         optimizer.zero_grad(set_to_none=True)
         if use_amp:
             torch.cuda.reset_peak_memory_stats(device)
@@ -1776,6 +1979,7 @@ def train_model(
                 gate_loader,
                 device,
                 use_amp=use_amp,
+                distributed_context=distributed_context,
             )
 
         epoch = start_epoch
@@ -1787,6 +1991,13 @@ def train_model(
             set_epoch = getattr(dataset, "set_epoch", None)
             if callable(set_epoch):
                 set_epoch(epoch)
+            sampler_set_epoch = getattr(
+                getattr(train_loader, "sampler", None),
+                "set_epoch",
+                None,
+            )
+            if callable(sampler_set_epoch):
+                sampler_set_epoch(epoch)
 
             steps_at_epoch_start = optimizer_steps
             epoch_loss_start = len(optimizer_losses)
@@ -1797,13 +2008,25 @@ def train_model(
                 current_batch_size = _batch_size(batch)
                 if physical_batch_size is None:
                     physical_batch_size = current_batch_size
-                    if cfg.effective_batch_size % physical_batch_size:
+                    world_size = (
+                        1
+                        if distributed_context is None
+                        else distributed_context.world_size
+                    )
+                    global_physical_batch_size = (
+                        physical_batch_size * world_size
+                    )
+                    if (
+                        cfg.effective_batch_size
+                        % global_physical_batch_size
+                    ):
                         raise ValueError(
                             "effective batch size must be divisible by the "
-                            "physical training batch size"
+                            "global physical training batch size"
                         )
                     accumulation_steps = (
-                        cfg.effective_batch_size // physical_batch_size
+                        cfg.effective_batch_size
+                        // global_physical_batch_size
                     )
                 elif current_batch_size != physical_batch_size:
                     raise ValueError(
@@ -1811,18 +2034,44 @@ def train_model(
                     )
                 assert accumulation_steps is not None
 
-                with torch.amp.autocast(
-                    device_type=device.type,
-                    enabled=use_amp,
-                ):
-                    loss, _components = model.loss(batch)
-                if not isinstance(loss, Tensor) or loss.ndim != 0:
-                    raise ValueError("model loss must be a scalar tensor")
-                if not bool(torch.isfinite(loss).item()):
-                    raise FloatingPointError("non-finite training loss detected")
-                raw_loss = float(loss.detach().cpu())
-                group_losses.append(raw_loss)
-                scaler.scale(loss / accumulation_steps).backward()
+                synchronize_gradients = (
+                    micro_batches + 1 == accumulation_steps
+                )
+                synchronization_context = (
+                    training_model.no_sync()
+                    if (
+                        distributed_context is not None
+                        and not synchronize_gradients
+                    )
+                    else nullcontext()
+                )
+                with synchronization_context:
+                    with torch.amp.autocast(
+                        device_type=device.type,
+                        enabled=use_amp,
+                    ):
+                        if distributed_context is None:
+                            loss, _components = model.loss(batch)
+                        else:
+                            predictions = training_model(batch)
+                            loss, _components = model.loss_from_predictions(
+                                predictions,
+                                batch,
+                            )
+                    if not isinstance(loss, Tensor) or loss.ndim != 0:
+                        raise ValueError("model loss must be a scalar tensor")
+                    if not bool(torch.isfinite(loss).item()):
+                        raise FloatingPointError(
+                            "non-finite training loss detected"
+                        )
+                    raw_loss = float(loss.detach().cpu())
+                    if distributed_context is not None:
+                        raw_loss = distributed_mean(
+                            raw_loss,
+                            distributed_context,
+                        )
+                    group_losses.append(raw_loss)
+                    scaler.scale(loss / accumulation_steps).backward()
                 micro_batches += 1
 
                 if micro_batches < accumulation_steps:
@@ -1834,12 +2083,24 @@ def train_model(
                     for parameter in model.parameters()
                     if parameter.grad is not None
                 ]
-                if not gradients:
+                ranks_with_gradients = 1.0 if gradients else 0.0
+                if distributed_context is not None:
+                    ranks_with_gradients = distributed_mean(
+                        ranks_with_gradients,
+                        distributed_context,
+                    )
+                if ranks_with_gradients != 1.0:
                     raise FloatingPointError("training produced no gradients")
                 gradients_finite = all(
                     bool(torch.isfinite(gradient).all().item())
                     for gradient in gradients
                 )
+                if distributed_context is not None:
+                    finite_rank_fraction = distributed_mean(
+                        1.0 if gradients_finite else 0.0,
+                        distributed_context,
+                    )
+                    gradients_finite = finite_rank_fraction == 1.0
                 if not gradients_finite and not use_amp:
                     raise FloatingPointError("non-finite gradient detected")
 
@@ -1854,8 +2115,17 @@ def train_model(
                     )
                 scaler.step(optimizer)
                 scaler.update()
+                scale_after = float(scaler.get_scale())
+                if distributed_context is not None:
+                    mean_scale_after = distributed_mean(
+                        scale_after,
+                        distributed_context,
+                    )
+                    if scale_after != mean_scale_after:
+                        raise RuntimeError(
+                            "distributed AMP gradient scales diverged"
+                        )
                 if not gradients_finite:
-                    scale_after = float(scaler.get_scale())
                     if scale_after >= scale_before:
                         raise FloatingPointError(
                             "AMP overflow did not reduce the gradient scale"
@@ -1921,9 +2191,19 @@ def train_model(
                     "learning_rate": epoch_learning_rate,
                 }
             )
-            _atomic_json_write(history_path, history)
+            if is_primary:
+                _atomic_json_write(history_path, history)
 
             scheduler.step()
+            reproducibility_state = _capture_reproducibility_state(
+                train_loader
+            )
+            distributed_reproducibility_states = None
+            if distributed_context is not None:
+                distributed_reproducibility_states = gather_rank_objects(
+                    reproducibility_state,
+                    distributed_context,
+                )
             checkpoint_state = {
                 "model_name": model_name,
                 "optimizer": optimizer.state_dict(),
@@ -1935,26 +2215,34 @@ def train_model(
                 "config": asdict(cfg),
                 "history": history,
                 "scaler": scaler.state_dict(),
-                "reproducibility_state": (
-                    _capture_reproducibility_state(train_loader)
-                ),
+                "reproducibility_state": reproducibility_state,
                 "load_provenance": load_provenance,
             }
-            save_checkpoint(
-                model,
-                manifest_root,
-                last_checkpoint,
-                alignment_cache_sha256=alignment_cache_sha256,
-                **checkpoint_state,
-            )
-            if improved:
+            if distributed_context is not None:
+                checkpoint_state["distributed_world_size"] = (
+                    distributed_context.world_size
+                )
+                checkpoint_state[
+                    "distributed_reproducibility_states"
+                ] = distributed_reproducibility_states
+            if is_primary:
                 save_checkpoint(
                     model,
                     manifest_root,
-                    best_checkpoint,
+                    last_checkpoint,
                     alignment_cache_sha256=alignment_cache_sha256,
                     **checkpoint_state,
                 )
+                if improved:
+                    save_checkpoint(
+                        model,
+                        manifest_root,
+                        best_checkpoint,
+                        alignment_cache_sha256=alignment_cache_sha256,
+                        **checkpoint_state,
+                    )
+            if distributed_context is not None:
+                dist.barrier()
 
             completed_epochs = epoch + 1
             if max_steps is not None and optimizer_steps >= max_steps:
@@ -1977,6 +2265,7 @@ def train_model(
                 gate_loader,
                 device,
                 use_amp=use_amp,
+                distributed_context=distributed_context,
             )
             assert initial_evidence_loss is not None
             loss_reduction = (
@@ -1987,19 +2276,20 @@ def train_model(
                 loss_reduction >= 0.50
                 and last_recall >= 0.80
             )
-            _atomic_json_write(
-                output_root / "gate.json",
-                {
-                    "initial_loss": initial_evidence_loss,
-                    "final_loss": final_evidence_loss,
-                    "loss_reduction": loss_reduction,
-                    "recall_at_riou_025": last_recall,
-                    "finite_gradients": True,
-                    "amp_overflow_skips": amp_overflow_skips,
-                    "optimizer_steps": optimizer_steps,
-                    "passed": gate_passed,
-                },
-            )
+            if is_primary:
+                _atomic_json_write(
+                    output_root / "gate.json",
+                    {
+                        "initial_loss": initial_evidence_loss,
+                        "final_loss": final_evidence_loss,
+                        "loss_reduction": loss_reduction,
+                        "recall_at_riou_025": last_recall,
+                        "finite_gradients": True,
+                        "amp_overflow_skips": amp_overflow_skips,
+                        "optimizer_steps": optimizer_steps,
+                        "passed": gate_passed,
+                    },
+                )
 
         run["status"] = "completed"
         run["gate_passed"] = gate_passed
@@ -2017,7 +2307,7 @@ def train_model(
     except BaseException as exc:
         run["status"] = "failed"
         run["error"] = f"{type(exc).__name__}: {exc}"
-        if max_steps is not None:
+        if max_steps is not None and is_primary:
             _atomic_json_write(
                 output_root / "gate.json",
                 _failed_gate_payload(
@@ -2037,7 +2327,8 @@ def train_model(
                 run["peak_allocated_memory_bytes"] = int(
                     torch.cuda.max_memory_allocated(device)
                 )
-            _atomic_json_write(output_root / "run.json", run)
+            if is_primary:
+                _atomic_json_write(output_root / "run.json", run)
         finally:
             if (
                 incoming_resume_rng is not None

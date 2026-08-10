@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import Tensor, nn
 
 import moving_det.ml.training as training_module
@@ -215,11 +217,114 @@ class SelectiveInfGradientOBB(TinyOBB):
         return loss, {"tiny_loss": loss.detach()}
 
 
+class DistributedTinyOBB(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.detector = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            self.detector.weight.fill_(0.01)
+        self.sample_ids: list[int] = []
+
+    def forward(self, batch: dict[str, Any]) -> Tensor:
+        sample_ids = batch.get("sample_id")
+        if isinstance(sample_ids, Tensor):
+            self.sample_ids.extend(int(value) for value in sample_ids.tolist())
+        return self.detector(batch["x"])
+
+    def loss_from_predictions(
+        self,
+        predictions: Tensor,
+        batch: dict[str, Any],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        loss = torch.square(predictions - batch["target"]).mean()
+        return loss, {"tiny_loss": loss.detach()}
+
+    def loss(
+        self,
+        batch: dict[str, Any],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        return self.loss_from_predictions(self.forward(batch), batch)
+
+
 def _batch(batch_size: int = 4) -> dict[str, Tensor]:
     return {
         "x": torch.ones(batch_size, 1),
         "target": torch.zeros(batch_size, 1),
     }
+
+
+def _distributed_training_worker(
+    rank: int,
+    init_file: str,
+    cfg: Any,
+    manifest: str,
+    output: str,
+    result_dir: str,
+    resume_checkpoint: str | None,
+    max_steps: int,
+) -> None:
+    from moving_det.ml.distributed import DistributedContext
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+    )
+    try:
+        context = DistributedContext(
+            rank=rank,
+            local_rank=rank,
+            world_size=2,
+            backend="gloo",
+        )
+        model = DistributedTinyOBB()
+        train_loader = [
+            {
+                "x": torch.tensor([[float(sample_id + 1)]]),
+                "target": torch.zeros(1, 1),
+                "sample_id": torch.tensor([sample_id]),
+            }
+            for sample_id in range(rank, 8, 2)
+        ]
+        gate_loader = [_batch(batch_size=16) for _ in range(2)]
+        result = train_model(
+            "baseline",
+            cfg,
+            Path(manifest),
+            Path(output),
+            max_steps=max_steps,
+            resume_checkpoint=(
+                None
+                if resume_checkpoint is None
+                else Path(resume_checkpoint)
+            ),
+            hooks=TrainingHooks(
+                model_factory=lambda _name, _weights, _cfg: model,
+                loader_factory=lambda _name, _cfg, _root: (
+                    train_loader,
+                    [_batch(batch_size=1)],
+                ),
+                gate_loader_factory=lambda _name, _cfg, _root: gate_loader,
+                validator=lambda _model, _loader, _device: {
+                    "map50": 0.5,
+                    "recall_at_riou_025": 0.9,
+                },
+                device="cpu",
+            ),
+            distributed_context=context,
+        )
+        torch.save(
+            {
+                "optimizer_steps": result.optimizer_steps,
+                "weight": model.detector.weight.detach().cpu(),
+                "sample_ids": tuple(model.sample_ids),
+            },
+            Path(result_dir) / f"rank-{rank}.pt",
+        )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _tiny_hooks(
@@ -443,6 +548,165 @@ def test_training_accumulates_to_effective_batch_and_uses_warmup_cosine(
     )
     assert observed_lrs[3] == pytest.approx(2e-4)
     assert observed_lrs[4] < observed_lrs[3]
+
+
+def test_distributed_training_uses_disjoint_global_batch_and_one_writer(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(
+        tmp_path / "manifest",
+        training_records=64,
+    )
+    output = tmp_path / "distributed-run"
+    cfg = replace(
+        temporal_config,
+        pilot_epochs=1,
+        effective_batch_size=8,
+    )
+    mp.spawn(
+        _distributed_training_worker,
+        args=(
+            str(tmp_path / "gloo-init"),
+            cfg,
+            str(manifest),
+            str(output),
+            str(tmp_path),
+            None,
+            1,
+        ),
+        nprocs=2,
+        join=True,
+    )
+
+    rank_zero = torch.load(
+        tmp_path / "rank-0.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    rank_one = torch.load(
+        tmp_path / "rank-1.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    rank_zero_samples = set(rank_zero["sample_ids"])
+    rank_one_samples = set(rank_one["sample_ids"])
+    assert rank_zero_samples.isdisjoint(rank_one_samples)
+    assert rank_zero_samples | rank_one_samples == set(range(8))
+    assert rank_zero["optimizer_steps"] == 1
+    assert rank_one["optimizer_steps"] == 1
+    torch.testing.assert_close(rank_zero["weight"], rank_one["weight"])
+    assert bool(torch.isfinite(rank_zero["weight"]).all())
+
+    run = json.loads((output / "run.json").read_text())
+    checkpoint = torch.load(
+        output / "last.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert run["distributed"] == {
+        "enabled": True,
+        "backend": "gloo",
+        "world_size": 2,
+    }
+    assert checkpoint["distributed_world_size"] == 2
+    assert checkpoint["optimizer_steps"] == 1
+
+
+def test_single_to_distributed_resume_migrates_at_epoch_boundary(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(
+        tmp_path / "manifest",
+        training_records=64,
+    )
+    source_model = DistributedTinyOBB()
+    source = train_model(
+        "baseline",
+        replace(
+            temporal_config,
+            pilot_epochs=1,
+            effective_batch_size=8,
+        ),
+        manifest,
+        tmp_path / "single-source",
+        max_steps=1,
+        hooks=TrainingHooks(
+            model_factory=lambda _name, _weights, _cfg: source_model,
+            loader_factory=lambda _name, _cfg, _root: (
+                [
+                    {
+                        "x": torch.tensor([[float(sample_id + 1)]]),
+                        "target": torch.zeros(1, 1),
+                        "sample_id": torch.tensor([sample_id]),
+                    }
+                    for sample_id in range(8)
+                ],
+                [_batch(batch_size=1)],
+            ),
+            gate_loader_factory=lambda _name, _cfg, _root: [
+                _batch(batch_size=16) for _ in range(4)
+            ],
+            validator=lambda _model, _loader, _device: {
+                "map50": 0.5,
+                "recall_at_riou_025": 0.9,
+            },
+            device="cpu",
+        ),
+    )
+    source_payload = torch.load(
+        source.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert "distributed_world_size" not in source_payload
+
+    output = tmp_path / "distributed-resume"
+    mp.spawn(
+        _distributed_training_worker,
+        args=(
+            str(tmp_path / "gloo-resume-init"),
+            replace(
+                temporal_config,
+                pilot_epochs=2,
+                effective_batch_size=8,
+            ),
+            str(manifest),
+            str(output),
+            str(tmp_path),
+            str(source.last_checkpoint),
+            2,
+        ),
+        nprocs=2,
+        join=True,
+    )
+
+    checkpoint = torch.load(
+        output / "last.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert checkpoint["epoch"] == 1
+    assert checkpoint["optimizer_steps"] == 2
+    assert checkpoint["distributed_world_size"] == 2
+    rank_states = checkpoint["distributed_reproducibility_states"]
+    assert isinstance(rank_states, tuple)
+    assert len(rank_states) == 2
+
+    with pytest.raises(ValueError, match="distributed topology"):
+        train_model(
+            "baseline",
+            replace(
+                temporal_config,
+                pilot_epochs=3,
+                effective_batch_size=8,
+            ),
+            manifest,
+            tmp_path / "invalid-single-resume",
+            resume_checkpoint=output / "last.pt",
+            hooks=_tiny_hooks(DistributedTinyOBB()),
+        )
 
 
 def test_best_map50_checkpoint_patience_and_run_provenance(
