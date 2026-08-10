@@ -706,6 +706,21 @@ def _stage_overfit_manifest(
     return destination_root
 
 
+def gather_rank_objects(value: object, context: object) -> object:
+    from moving_det.ml.distributed import gather_rank_objects as gather
+
+    return gather(value, context)
+
+
+def broadcast_metric_pair(
+    metrics: tuple[float, float] | None,
+    context: object,
+) -> tuple[float, float]:
+    from moving_det.ml.distributed import broadcast_metric_pair as broadcast
+
+    return broadcast(metrics, context)
+
+
 def _loader_task11_metrics(
     model: object,
     loader: object,
@@ -715,6 +730,7 @@ def _loader_task11_metrics(
     inferencer: Callable[..., Sequence[object]] | None = None,
     evaluator: Callable[..., Mapping[str, object]] | None = None,
     merger: Callable[..., Sequence[object]] | None = None,
+    distributed_context: object | None = None,
 ) -> dict[str, float]:
     """Evaluate exactly the supplied tile loader through the Task-11 APIs."""
     import math
@@ -722,6 +738,7 @@ def _loader_task11_metrics(
     import torch
 
     from moving_det.ml.evaluation import GroundTruth, evaluate_temporal_obb
+    from moving_det.ml.distributed import DistributedContext
     from moving_det.ml.inference import (
         Detection,
         FrameKey,
@@ -738,6 +755,13 @@ def _loader_task11_metrics(
         raise WorkflowError("training validator requires the supplied loader")
     if not isinstance(device, torch.device):
         raise WorkflowError("training validator device must be a torch device")
+    if (
+        distributed_context is not None
+        and not isinstance(distributed_context, DistributedContext)
+    ):
+        raise WorkflowError(
+            "training validator distributed context is malformed"
+        )
     selected_inferencer = infer_full_frame if inferencer is None else inferencer
     selected_evaluator = evaluate_temporal_obb if evaluator is None else evaluator
     selected_merger = merge_tile_detections if merger is None else merger
@@ -981,40 +1005,84 @@ def _loader_task11_metrics(
                 frame_keys.add(FrameKey(site, sequence, frame))
         if observed_batches == 0:
             raise WorkflowError("validation loader is empty")
-        merged = tuple(
-            selected_merger(
-                tuple(predictions),
-                float(getattr(cfg, "nms_iou")),
-            )
-        )
-        evaluated_frames = tuple(
-            {
-                "site": key.site,
-                "sequence": key.sequence,
-                "frame": key.frame,
-            }
-            for key in sorted(frame_keys)
-        )
-        raw_metrics = selected_evaluator(
-            merged,
-            tuple(ground_truth),
-            {
-                "evaluation_split": "validation",
-                "detection_frame_keys": evaluated_frames,
-                "continuity_frame_keys": (),
-                "max_false_detections_per_frame": float(
-                    getattr(cfg, "max_false_detections_per_frame")
+        if distributed_context is not None:
+            gathered = gather_rank_objects(
+                (
+                    tuple(predictions),
+                    tuple(ground_truth),
+                    frame_keys,
                 ),
-                "seed": int(getattr(cfg, "seed")),
-            },
-        )
-        try:
-            map50 = float(raw_metrics["map50"])
-            recall = float(raw_metrics["recall_riou_025"])
-        except (KeyError, TypeError, ValueError, OverflowError) as exc:
-            raise WorkflowError(
-                "Task-11 validator metrics are malformed"
-            ) from exc
+                distributed_context,
+            )
+            if distributed_context.is_primary:
+                if gathered is None:
+                    raise WorkflowError(
+                        "primary distributed validator received no shards"
+                    )
+                predictions = [
+                    item
+                    for shard_predictions, _, _ in gathered
+                    for item in shard_predictions
+                ]
+                ground_truth = [
+                    item
+                    for _, shard_ground_truth, _ in gathered
+                    for item in shard_ground_truth
+                ]
+                frame_keys = {
+                    key
+                    for _, _, shard_frame_keys in gathered
+                    for key in shard_frame_keys
+                }
+
+        metric_pair: tuple[float, float] | None = None
+        if (
+            distributed_context is None
+            or distributed_context.is_primary
+        ):
+            merged = tuple(
+                selected_merger(
+                    tuple(predictions),
+                    float(getattr(cfg, "nms_iou")),
+                )
+            )
+            evaluated_frames = tuple(
+                {
+                    "site": key.site,
+                    "sequence": key.sequence,
+                    "frame": key.frame,
+                }
+                for key in sorted(frame_keys)
+            )
+            raw_metrics = selected_evaluator(
+                merged,
+                tuple(ground_truth),
+                {
+                    "evaluation_split": "validation",
+                    "detection_frame_keys": evaluated_frames,
+                    "continuity_frame_keys": (),
+                    "max_false_detections_per_frame": float(
+                        getattr(cfg, "max_false_detections_per_frame")
+                    ),
+                    "seed": int(getattr(cfg, "seed")),
+                },
+            )
+            try:
+                metric_pair = (
+                    float(raw_metrics["map50"]),
+                    float(raw_metrics["recall_riou_025"]),
+                )
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise WorkflowError(
+                    "Task-11 validator metrics are malformed"
+                ) from exc
+        if distributed_context is not None:
+            metric_pair = broadcast_metric_pair(
+                metric_pair,
+                distributed_context,
+            )
+        assert metric_pair is not None
+        map50, recall = metric_pair
         if not math.isfinite(map50) or not math.isfinite(recall):
             raise WorkflowError("Task-11 validator metrics must be finite")
         return {

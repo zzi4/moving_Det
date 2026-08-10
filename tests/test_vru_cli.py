@@ -637,6 +637,142 @@ def test_task11_training_validator_invokes_global_cross_tile_merge():
 
 
 @REQUIRES_TORCH
+def test_distributed_task11_metrics_match_unsplit_metrics(monkeypatch):
+    import torch
+
+    from moving_det.ml.distributed import DistributedContext
+    from moving_det.ml.inference import Detection, FrameKey
+    from moving_det.models import OBB
+    from moving_det.vrud.tiling import Tile
+
+    def batch(frame, tile_x):
+        return {
+            "frames": torch.zeros((1, 1, 3, 8, 8)),
+            "valid": torch.ones((1, 1), dtype=torch.bool),
+            "transforms": torch.eye(2, 3).reshape(1, 1, 2, 3),
+            "cls": torch.empty((0, 1)),
+            "bboxes": torch.empty((0, 5)),
+            "batch_idx": torch.empty((0,)),
+            "metadata": [
+                {
+                    "site": "site19",
+                    "sequence": "sequence_a",
+                    "center_frame": frame,
+                    "tile_xywh": (tile_x, 0, 8, 8),
+                    "track_keys": (),
+                    "source": "evaluation",
+                    "offsets": (0,),
+                }
+            ],
+        }
+
+    model = torch.nn.Identity()
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        tile_size=8,
+        tile_overlap=0,
+    )
+    merge_inputs = []
+
+    def inferencer(_model, clip, _cfg):
+        return (
+            Detection(
+                frame=clip["frame"],
+                obb=OBB(4.0, 4.0, 4.0, 2.0, 0.0),
+                class_id=0,
+                confidence=0.8,
+                tile=Tile(0, 0, 8, 8),
+                site="site19",
+                sequence="sequence_a",
+            ),
+        )
+
+    def merger(predictions, _threshold):
+        rows = tuple(predictions)
+        merge_inputs.append(rows)
+        return rows
+
+    def evaluator(predictions, _ground_truth, received_cfg):
+        return {
+            "map50": len(tuple(predictions)) / 2,
+            "recall_riou_025": len(
+                received_cfg["detection_frame_keys"]
+            )
+            / 2,
+        }
+
+    full_metrics = _loader_task11_metrics(
+        model,
+        [batch(101, 0), batch(102, 8)],
+        torch.device("cpu"),
+        cfg,
+        inferencer=inferencer,
+        evaluator=evaluator,
+        merger=merger,
+    )
+    remote_detection = Detection(
+        frame=102,
+        obb=OBB(12.0, 4.0, 4.0, 2.0, 0.0),
+        class_id=0,
+        confidence=0.8,
+        tile=Tile(8, 0, 8, 8),
+        site="site19",
+        sequence="sequence_a",
+    )
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        backend="gloo",
+    )
+
+    def gather_records(local_records, received_context):
+        assert received_context is context
+        return (
+            local_records,
+            (
+                (remote_detection,),
+                (),
+                {FrameKey("site19", "sequence_a", 102)},
+            ),
+        )
+
+    def broadcast_metrics(metrics, received_context):
+        assert received_context is context
+        assert metrics is not None
+        return metrics
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "gather_rank_objects",
+        gather_records,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "broadcast_metric_pair",
+        broadcast_metrics,
+        raising=False,
+    )
+    distributed_metrics = _loader_task11_metrics(
+        model,
+        [batch(101, 0)],
+        torch.device("cpu"),
+        cfg,
+        inferencer=inferencer,
+        evaluator=evaluator,
+        merger=merger,
+        distributed_context=context,
+    )
+
+    assert distributed_metrics == full_metrics == {
+        "map50": 1.0,
+        "recall_at_riou_025": 1.0,
+    }
+    assert {item.frame for item in merge_inputs[-1]} == {101, 102}
+
+
+@REQUIRES_TORCH
 def test_lstfe_diagnostic_uses_eval_without_bn_drift_and_restores_all_states(
     tmp_path,
 ):
