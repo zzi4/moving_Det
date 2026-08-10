@@ -1393,6 +1393,7 @@ def _failed_gate_payload(
     initial_loss: float | None,
     final_loss: float | None,
     optimizer_steps: int,
+    amp_overflow_skips: int,
     error: str | None = None,
 ) -> dict[str, Any]:
     return {
@@ -1401,6 +1402,7 @@ def _failed_gate_payload(
         "loss_reduction": None,
         "recall_at_riou_025": None,
         "finite_gradients": False,
+        "amp_overflow_skips": amp_overflow_skips,
         "optimizer_steps": optimizer_steps,
         "error": error,
         "passed": False,
@@ -1458,6 +1460,7 @@ def train_model(
         "pretrained_weights": getattr(cfg, "pretrained_weights", None),
         "load_provenance": load_provenance,
         "amp_enabled": False,
+        "amp_overflow_skips": 0,
         "status": "setup",
     }
 
@@ -1473,6 +1476,7 @@ def train_model(
     initial_evidence_loss: float | None = None
     final_evidence_loss: float | None = None
     use_amp = False
+    amp_overflow_skips = 0
     group_losses: list[float] = []
     optimizer_losses: list[float] = []
 
@@ -1830,19 +1834,38 @@ def train_model(
                     for parameter in model.parameters()
                     if parameter.grad is not None
                 ]
-                if not gradients or not all(
+                if not gradients:
+                    raise FloatingPointError("training produced no gradients")
+                gradients_finite = all(
                     bool(torch.isfinite(gradient).all().item())
                     for gradient in gradients
-                ):
+                )
+                if not gradients_finite and not use_amp:
                     raise FloatingPointError("non-finite gradient detected")
 
-                if selected_hooks.on_optimizer_step is not None:
+                scale_before = float(scaler.get_scale())
+                if (
+                    gradients_finite
+                    and selected_hooks.on_optimizer_step is not None
+                ):
                     selected_hooks.on_optimizer_step(
                         optimizer,
                         optimizer_steps,
                     )
                 scaler.step(optimizer)
                 scaler.update()
+                if not gradients_finite:
+                    scale_after = float(scaler.get_scale())
+                    if scale_after >= scale_before:
+                        raise FloatingPointError(
+                            "AMP overflow did not reduce the gradient scale"
+                        )
+                    amp_overflow_skips += 1
+                    run["amp_overflow_skips"] = amp_overflow_skips
+                    optimizer.zero_grad(set_to_none=True)
+                    micro_batches = 0
+                    continue
+
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_steps += 1
                 optimizer_losses.append(
@@ -1972,6 +1995,7 @@ def train_model(
                     "loss_reduction": loss_reduction,
                     "recall_at_riou_025": last_recall,
                     "finite_gradients": True,
+                    "amp_overflow_skips": amp_overflow_skips,
                     "optimizer_steps": optimizer_steps,
                     "passed": gate_passed,
                 },
@@ -2000,6 +2024,7 @@ def train_model(
                     initial_loss=initial_evidence_loss,
                     final_loss=final_evidence_loss,
                     optimizer_steps=optimizer_steps,
+                    amp_overflow_skips=amp_overflow_skips,
                     error=run["error"],
                 ),
             )

@@ -192,6 +192,29 @@ class NanGradientOBB(TinyOBB):
         return loss, {"tiny_loss": loss.detach()}
 
 
+class FiniteLossInfGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, value):
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return torch.full_like(gradient, float("inf"))
+
+
+class SelectiveInfGradientOBB(TinyOBB):
+    def loss(
+        self,
+        batch: dict[str, Any],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        self.loss_calls += 1
+        prediction = self.detector(batch["x"])
+        loss = torch.square(prediction - batch["target"]).mean()
+        if batch.get("overflow_gradient", False):
+            loss = FiniteLossInfGradient.apply(loss)
+        return loss, {"tiny_loss": loss.detach()}
+
+
 def _batch(batch_size: int = 4) -> dict[str, Tensor]:
     return {
         "x": torch.ones(batch_size, 1),
@@ -1009,6 +1032,75 @@ def test_nonfinite_gradient_fails_fast_and_writes_failed_gate(
     assert gate["finite_gradients"] is False
     assert gate["passed"] is False
     assert run["status"] == "failed"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_cuda_amp_overflow_backs_off_without_counting_skipped_step(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(
+        tmp_path / "manifest",
+        training_records=64,
+    )
+    output = tmp_path / "amp-overflow"
+    model = SelectiveInfGradientOBB()
+    train_loader = [
+        {
+            **_batch(),
+            "overflow_gradient": index == 0,
+        }
+        for index in range(8)
+    ]
+    gate_loader = [_batch(batch_size=16) for _ in range(4)]
+    observed_steps: list[int] = []
+    scalers: list[torch.amp.GradScaler] = []
+
+    def scaler_factory(_device):
+        scaler = torch.amp.GradScaler(
+            "cuda",
+            init_scale=32.0,
+            growth_interval=1000,
+        )
+        scalers.append(scaler)
+        return scaler
+
+    result = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        output,
+        max_steps=1,
+        hooks=TrainingHooks(
+            model_factory=lambda _name, _weights, _cfg: model,
+            loader_factory=lambda _name, _cfg, _root: (
+                train_loader,
+                [_batch()],
+            ),
+            gate_loader_factory=lambda _name, _cfg, _root: gate_loader,
+            validator=lambda _model, _loader, _device: {
+                "map50": 0.5,
+                "recall_at_riou_025": 0.9,
+            },
+            on_optimizer_step=lambda _optimizer, step: (
+                observed_steps.append(step)
+            ),
+            scaler_factory=scaler_factory,
+            device="cuda",
+        ),
+    )
+
+    run = json.loads((output / "run.json").read_text())
+    gate = json.loads((output / "gate.json").read_text())
+    assert result.optimizer_steps == 1
+    assert observed_steps == [0]
+    assert scalers[0].get_scale() == pytest.approx(16.0)
+    assert run["status"] == "completed"
+    assert run["amp_overflow_skips"] == 1
+    assert gate["optimizer_steps"] == 1
+    assert gate["amp_overflow_skips"] == 1
+    assert gate["finite_gradients"] is True
+    assert bool(torch.isfinite(model.detector.weight).all())
 
 
 def test_setup_failure_finalizes_run_and_failed_gate(
