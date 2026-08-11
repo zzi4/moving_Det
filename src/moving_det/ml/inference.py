@@ -440,6 +440,8 @@ def infer_full_frame(
                     sequence=validated.sequence,
                 )
             )
+    if len(tiles) == 1:
+        return tuple(sorted(decoded, key=_detection_sort_key))
     return merge_tile_detections(decoded, nms_iou)
 
 

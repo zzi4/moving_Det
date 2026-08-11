@@ -175,6 +175,62 @@ def test_default_inference_batches_one_tile_at_a_time_to_bound_memory():
     assert len(detections) == 2
 
 
+def test_single_tile_inference_skips_cross_tile_merger(monkeypatch):
+    model = RecordingModel(1)
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1024),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
+    }
+
+    def reject_redundant_merge(*_args, **_kwargs):
+        raise AssertionError("single tile must not use cross-tile merge")
+
+    monkeypatch.setattr(
+        inference_module,
+        "merge_tile_detections",
+        reject_redundant_merge,
+    )
+
+    detections = infer_full_frame(model, clip, _cfg())
+
+    assert len(detections) == 1
+    assert detections == tuple(
+        sorted(detections, key=inference_module._detection_sort_key)
+    )
+
+
+def test_multi_tile_inference_uses_cross_tile_merger(monkeypatch):
+    model = RecordingModel(1)
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1792),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
+    }
+
+    monkeypatch.setattr(
+        inference_module,
+        "merge_tile_detections",
+        lambda _detections, _threshold: (),
+    )
+
+    assert infer_full_frame(model, clip, _cfg()) == ()
+
+
 def test_full_frame_inference_localizes_affine_to_each_crop():
     model = RecordingModel(1)
     frames = torch.rand(1, 3, 1024, 1792)
