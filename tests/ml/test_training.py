@@ -50,6 +50,50 @@ def temporal_config():
     )
 
 
+def test_loader_runtime_uses_bounded_persistent_prefetch():
+    assert training_module._loader_runtime_kwargs(
+        loader_workers=None,
+        cuda_available=True,
+    ) == {
+        "num_workers": 4,
+        "pin_memory": True,
+        "persistent_workers": True,
+        "prefetch_factor": 2,
+    }
+
+
+def test_loader_runtime_supports_synchronous_test_override():
+    assert training_module._loader_runtime_kwargs(
+        loader_workers=0,
+        cuda_available=False,
+    ) == {
+        "num_workers": 0,
+        "pin_memory": False,
+    }
+
+
+def test_default_loader_factory_preserves_contract_with_synchronous_override(
+    temporal_fixture,
+):
+    manifest, _cache = _prepare_default_temporal_training(temporal_fixture)
+
+    training, validation = training_module._default_loader_factory(
+        "baseline",
+        temporal_fixture.config,
+        manifest,
+        loader_workers=0,
+    )
+
+    assert training.batch_size == 1
+    assert validation.batch_size == 1
+    assert training.num_workers == 0
+    assert validation.num_workers == 0
+    assert training.pin_memory is torch.cuda.is_available()
+    assert validation.pin_memory is torch.cuda.is_available()
+    assert training.collate_fn is training_module.collate_temporal_obb
+    assert validation.collate_fn is training_module.collate_temporal_obb
+
+
 def _write_manifest_set(
     directory: Path,
     payload: str = "a",

@@ -43,6 +43,8 @@ from moving_det.ml.distributed import (
 from moving_det.temporal_config import TemporalOBBConfig
 
 
+_DEFAULT_LOADER_WORKERS = 4
+_DEFAULT_PREFETCH_FACTOR = 2
 _MANIFEST_ARTIFACTS = (
     "train.jsonl",
     "validation.jsonl",
@@ -436,12 +438,43 @@ def _clip_spec(model_name: str, cfg: TemporalOBBConfig) -> ClipSpec:
     raise ValueError(f"unknown model name: {model_name!r}")
 
 
+def _loader_runtime_kwargs(
+    loader_workers: int | None = None,
+    cuda_available: bool | None = None,
+) -> dict[str, object]:
+    workers = (
+        _DEFAULT_LOADER_WORKERS
+        if loader_workers is None
+        else loader_workers
+    )
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, int)
+        or workers < 0
+    ):
+        raise ValueError("loader_workers must be a non-negative integer")
+    cuda = torch.cuda.is_available() if cuda_available is None else cuda_available
+    if not isinstance(cuda, bool):
+        raise ValueError("cuda_available must be a boolean")
+    options: dict[str, object] = {
+        "num_workers": workers,
+        "pin_memory": cuda,
+    }
+    if workers:
+        options.update(
+            persistent_workers=True,
+            prefetch_factor=_DEFAULT_PREFETCH_FACTOR,
+        )
+    return options
+
+
 def _default_loader_factory(
     model_name: str,
     cfg: TemporalOBBConfig,
     manifest_dir: Path,
     *,
     distributed_context: DistributedContext | None = None,
+    loader_workers: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     spec = _clip_spec(model_name, cfg)
     training = TemporalClipDataset(
@@ -481,23 +514,24 @@ def _default_loader_factory(
             drop_last=False,
         )
     )
+    loader_options = _loader_runtime_kwargs(loader_workers)
     return (
         DataLoader(
             training,
             batch_size=1,
             shuffle=training_sampler is None,
             sampler=training_sampler,
-            num_workers=0,
             collate_fn=collate_temporal_obb,
             generator=generator,
+            **loader_options,
         ),
         DataLoader(
             validation,
             batch_size=1,
             shuffle=False,
             sampler=validation_sampler,
-            num_workers=0,
             collate_fn=collate_temporal_obb,
+            **loader_options,
         ),
     )
 
@@ -508,6 +542,7 @@ def _default_gate_loader_factory(
     manifest_dir: Path,
     *,
     distributed_context: DistributedContext | None = None,
+    loader_workers: int | None = None,
 ) -> DataLoader:
     evidence = TemporalClipDataset(
         manifest_dir / "train.jsonl",
@@ -532,8 +567,8 @@ def _default_gate_loader_factory(
         batch_size=1,
         shuffle=False,
         sampler=sampler,
-        num_workers=0,
         collate_fn=collate_temporal_obb,
+        **_loader_runtime_kwargs(loader_workers),
     )
 
 
