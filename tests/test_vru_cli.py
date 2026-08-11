@@ -22,6 +22,7 @@ from moving_det.vru_cli import (
     _extract_model_diagnostic,
     _loader_task11_metrics,
     _manifest_fingerprint,
+    _move_validator_temporal_inputs,
     _predictions_for_artifact,
     _select_audit_rows,
     _select_data_smoke_records,
@@ -724,6 +725,34 @@ def test_default_train_installs_real_loader_based_task11_validator(
 
 
 @REQUIRES_TORCH
+def test_validator_temporal_inputs_use_one_nonblocking_device_transfer():
+    import torch
+
+    frames = torch.zeros((1, 1, 3, 8, 8))
+    valid = torch.ones((1, 1), dtype=torch.bool)
+    transforms = torch.eye(2, 3).reshape(1, 1, 2, 3)
+    device = torch.device("cpu")
+    calls = []
+
+    def mover(tensor, *, device, non_blocking):
+        calls.append((tensor, device, non_blocking))
+        return tensor
+
+    moved = _move_validator_temporal_inputs(
+        frames,
+        valid,
+        transforms,
+        device,
+        mover=mover,
+    )
+
+    assert moved == (frames, valid, transforms)
+    assert [call[0] for call in calls] == [frames, valid, transforms]
+    assert [call[1] for call in calls] == [device, device, device]
+    assert [call[2] for call in calls] == [True, True, True]
+
+
+@REQUIRES_TORCH
 def test_task11_training_validator_consumes_passed_loader_and_restores_identity():
     import torch
 
@@ -779,6 +808,9 @@ def test_task11_training_validator_consumes_passed_loader_and_restores_identity(
         assert received_model is model
         assert cfg["confidence_threshold"] == 0.0
         assert cfg["inference_batch_size"] == 1
+        assert clip["frames"].device == torch.device("cpu")
+        assert clip["valid"].device == torch.device("cpu")
+        assert clip["transforms"].device == torch.device("cpu")
         assert clip["frame"] == 31
         assert clip["metadata"]["site"] == "site19"
         assert clip["metadata"]["sequence"] == "sequence_a"

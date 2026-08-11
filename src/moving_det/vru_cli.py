@@ -723,6 +723,42 @@ def broadcast_metric_pair(
     return broadcast(metrics, context)
 
 
+def _move_validator_temporal_inputs(
+    frames: object,
+    valid: object,
+    transforms: object,
+    device: object,
+    *,
+    mover: Callable[..., object] | None = None,
+) -> tuple[object, object, object]:
+    """Move the three large temporal inputs once per validator batch."""
+    import torch
+
+    inputs = (frames, valid, transforms)
+    if any(not isinstance(tensor, torch.Tensor) for tensor in inputs):
+        raise WorkflowError("validation temporal inputs must be tensors")
+    if not isinstance(device, torch.device):
+        raise WorkflowError("validation temporal input device must be a torch device")
+    if mover is not None and not callable(mover):
+        raise WorkflowError("validation temporal input mover must be callable")
+
+    selected_mover = torch.Tensor.to if mover is None else mover
+    moved = tuple(
+        selected_mover(tensor, device=device, non_blocking=True)
+        for tensor in inputs
+    )
+    if any(not isinstance(tensor, torch.Tensor) for tensor in moved):
+        raise WorkflowError("validation temporal input mover returned a non-tensor")
+    for source, destination in zip(inputs, moved, strict=True):
+        if (
+            destination.device != device
+            or destination.shape != source.shape
+            or destination.dtype != source.dtype
+        ):
+            raise WorkflowError("validation temporal input transfer changed its contract")
+    return moved
+
+
 def _loader_task11_metrics(
     model: object,
     loader: object,
@@ -817,6 +853,12 @@ def _loader_task11_metrics(
                 raise WorkflowError(
                     "validation loader batch violates the temporal OBB contract"
                 )
+            frames, valid, transforms = _move_validator_temporal_inputs(
+                frames,
+                valid,
+                transforms,
+                device,
+            )
             if not bool(torch.isfinite(frames).all()):
                 raise WorkflowError("validation frames must be finite")
             if not bool(torch.isfinite(transforms).all()):
