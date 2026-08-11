@@ -72,6 +72,54 @@ def test_loader_runtime_supports_synchronous_test_override():
     }
 
 
+def test_accumulated_logging_loss_matches_microbatch_mean():
+    result = training_module._accumulated_logging_loss(
+        [torch.tensor(2.0), torch.tensor(4.0)],
+        None,
+    )
+
+    assert result == pytest.approx(3.0)
+
+
+def test_accumulated_logging_loss_reduces_once(monkeypatch):
+    from moving_det.ml.distributed import DistributedContext
+
+    context = DistributedContext(
+        rank=0,
+        local_rank=0,
+        world_size=2,
+        backend="gloo",
+    )
+    calls = []
+
+    def record_mean(value, received_context):
+        assert received_context is context
+        calls.append(value)
+        return value
+
+    monkeypatch.setattr(training_module, "distributed_mean", record_mean)
+
+    result = training_module._accumulated_logging_loss(
+        [torch.tensor(2.0), torch.tensor(4.0)],
+        context,
+    )
+
+    assert result == pytest.approx(3.0)
+    assert calls == [pytest.approx(3.0)]
+
+
+def test_batched_gradient_finite_check_accepts_finite_tensors():
+    assert training_module._gradients_are_finite(
+        [torch.ones(2), torch.tensor([-2.0, 3.0])]
+    ) is True
+
+
+def test_batched_gradient_finite_check_rejects_one_nonfinite_tensor():
+    assert training_module._gradients_are_finite(
+        [torch.ones(2), torch.tensor([float("inf")])]
+    ) is False
+
+
 def test_default_loader_factory_preserves_contract_with_synchronous_override(
     temporal_fixture,
 ):

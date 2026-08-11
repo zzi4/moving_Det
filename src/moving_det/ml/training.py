@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 import copy
 from dataclasses import asdict, dataclass, is_dataclass
@@ -148,6 +148,33 @@ def _default_scaler_factory(
     device: torch.device,
 ) -> torch.amp.GradScaler:
     return torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+
+
+def _accumulated_logging_loss(
+    losses: Sequence[Tensor],
+    distributed_context: DistributedContext | None,
+) -> float:
+    """Reduce one accumulation group's detached logging loss once."""
+    if not losses:
+        raise ValueError("accumulated logging losses cannot be empty")
+    if any(not isinstance(loss, Tensor) or loss.ndim != 0 for loss in losses):
+        raise ValueError("accumulated logging losses must be scalar tensors")
+    mean_loss = float(torch.stack(tuple(losses)).mean().detach().cpu())
+    if distributed_context is not None:
+        mean_loss = distributed_mean(mean_loss, distributed_context)
+    if not math.isfinite(mean_loss):
+        raise FloatingPointError("non-finite training loss detected")
+    return mean_loss
+
+
+def _gradients_are_finite(gradients: Sequence[Tensor]) -> bool:
+    """Check every gradient with one device-to-host synchronization."""
+    if not gradients:
+        return False
+    flags = torch.stack(
+        tuple(torch.isfinite(gradient).all() for gradient in gradients)
+    )
+    return bool(flags.all().item())
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -1653,7 +1680,7 @@ def train_model(
     final_evidence_loss: float | None = None
     use_amp = False
     amp_overflow_skips = 0
-    group_losses: list[float] = []
+    pending_losses: list[Tensor] = []
     optimizer_losses: list[float] = []
 
     try:
@@ -2095,17 +2122,7 @@ def train_model(
                             )
                     if not isinstance(loss, Tensor) or loss.ndim != 0:
                         raise ValueError("model loss must be a scalar tensor")
-                    if not bool(torch.isfinite(loss).item()):
-                        raise FloatingPointError(
-                            "non-finite training loss detected"
-                        )
-                    raw_loss = float(loss.detach().cpu())
-                    if distributed_context is not None:
-                        raw_loss = distributed_mean(
-                            raw_loss,
-                            distributed_context,
-                        )
-                    group_losses.append(raw_loss)
+                    pending_losses.append(loss.detach())
                     scaler.scale(loss / accumulation_steps).backward()
                 micro_batches += 1
 
@@ -2113,6 +2130,10 @@ def train_model(
                     continue
 
                 scaler.unscale_(optimizer)
+                group_logging_loss = _accumulated_logging_loss(
+                    pending_losses,
+                    distributed_context,
+                )
                 gradients = [
                     parameter.grad
                     for parameter in model.parameters()
@@ -2126,10 +2147,7 @@ def train_model(
                     )
                 if ranks_with_gradients != 1.0:
                     raise FloatingPointError("training produced no gradients")
-                gradients_finite = all(
-                    bool(torch.isfinite(gradient).all().item())
-                    for gradient in gradients
-                )
+                gradients_finite = _gradients_are_finite(gradients)
                 if distributed_context is not None:
                     finite_rank_fraction = distributed_mean(
                         1.0 if gradients_finite else 0.0,
@@ -2168,21 +2186,21 @@ def train_model(
                     amp_overflow_skips += 1
                     run["amp_overflow_skips"] = amp_overflow_skips
                     optimizer.zero_grad(set_to_none=True)
+                    pending_losses.clear()
                     micro_batches = 0
                     continue
 
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_steps += 1
-                optimizer_losses.append(
-                    sum(group_losses[-accumulation_steps:])
-                    / accumulation_steps
-                )
+                optimizer_losses.append(group_logging_loss)
+                pending_losses.clear()
                 micro_batches = 0
                 if max_steps is not None and optimizer_steps >= max_steps:
                     break
 
             if micro_batches:
                 optimizer.zero_grad(set_to_none=True)
+                pending_losses.clear()
             if optimizer_steps == steps_at_epoch_start:
                 raise ValueError(
                     "one epoch does not contain enough samples for the "
