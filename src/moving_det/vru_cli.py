@@ -4518,11 +4518,16 @@ def _verify_alignment_cache_summary(
             f"temporal workflow requires alignment cache: {root}"
         )
     summary = _read_json(root / "summary.json")
+    manifest_fingerprints = {_manifest_fingerprint(source_manifest)}
+    manifest_metadata = _read_json(Path(source_manifest) / "manifest.json")
+    if isinstance(manifest_metadata, Mapping):
+        parent_fingerprint = manifest_metadata.get("source_manifest_sha256")
+        if _is_sha256(parent_fingerprint):
+            manifest_fingerprints.add(parent_fingerprint)
     if (
         not isinstance(summary, Mapping)
         or summary.get("schema_version") != 1
-        or summary.get("manifest_sha256")
-        != _manifest_fingerprint(source_manifest)
+        or summary.get("manifest_sha256") not in manifest_fingerprints
     ):
         raise WorkflowError(
             "alignment cache manifest provenance does not match"

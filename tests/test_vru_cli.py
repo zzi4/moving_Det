@@ -387,6 +387,55 @@ def test_diagnose_overfit_runner_failure_keeps_previous_output(
     assert sentinel.read_text(encoding="utf-8") == "preserved"
 
 
+def test_alignment_cache_accepts_explicit_overfit_parent_manifest_lineage(
+    tmp_path,
+):
+    source_manifest = tmp_path / "source-manifest"
+    overfit_manifest = tmp_path / "overfit-manifest"
+    _manifest_children(source_manifest, [{"record": index} for index in range(80)])
+    _manifest_children(overfit_manifest, [{"record": index} for index in range(64)])
+    source_fingerprint = _manifest_fingerprint(source_manifest)
+    overfit_metadata_path = overfit_manifest / "manifest.json"
+    overfit_metadata = json.loads(overfit_metadata_path.read_text(encoding="utf-8"))
+    overfit_metadata["source_manifest_sha256"] = source_fingerprint
+    overfit_metadata_path.write_text(
+        json.dumps(overfit_metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    cache = tmp_path / "alignment-cache"
+    cache.mkdir()
+    (cache / "summary.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "manifest_sha256": source_fingerprint,
+                "alignment_cache_sha256": "d" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (cache / "index.json").write_text(
+        json.dumps({"schema_version": 1, "entries": {}}),
+        encoding="utf-8",
+    )
+
+    vru_cli_module._verify_alignment_cache_summary(
+        cache,
+        source_manifest=overfit_manifest,
+    )
+
+    overfit_metadata["source_manifest_sha256"] = "e" * 64
+    overfit_metadata_path.write_text(
+        json.dumps(overfit_metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WorkflowError, match="provenance does not match"):
+        vru_cli_module._verify_alignment_cache_summary(
+            cache,
+            source_manifest=overfit_manifest,
+        )
+
+
 def _fake_diagnostic_request(tmp_path):
     cfg = replace(
         load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
