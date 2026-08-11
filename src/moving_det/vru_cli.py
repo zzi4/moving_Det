@@ -181,6 +181,25 @@ class EvaluationArtifacts:
 
 
 @dataclass(frozen=True)
+class OverfitDiagnosticRequest:
+    cfg: object
+    baseline_checkpoint: Path
+    mg_checkpoint: Path
+    manifest_dir: Path
+    alignment_cache: Path
+    alignment_snapshot: object
+    config_sha256: str
+    baseline_checkpoint_sha256: str
+    mg_checkpoint_sha256: str
+    manifest_sha256: str
+    alignment_cache_sha256: str
+    sample_count: int = 64
+    confidence_threshold: float = 0.25
+    nms_iou: float = 0.5
+    match_iou: float = 0.25
+
+
+@dataclass(frozen=True)
 class VisualizationRequest:
     cfg: object
     manifest_dir: Path
@@ -316,6 +335,21 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--count", type=_positive_integer, default=20)
     audit.add_argument("--seed", type=_positive_integer, default=20260806)
     audit.add_argument("--output", type=_path_argument, required=True)
+
+    diagnose = subparsers.add_parser(
+        "diagnose-overfit",
+        help="compare frozen baseline and MG-VTOD on the 64-sample overfit set",
+    )
+    diagnose.add_argument("--config", type=_path_argument, default=_DEFAULT_CONFIG)
+    diagnose.add_argument(
+        "--baseline-checkpoint",
+        type=_path_argument,
+        required=True,
+    )
+    diagnose.add_argument("--mg-checkpoint", type=_path_argument, required=True)
+    diagnose.add_argument("--manifest", type=_path_argument, required=True)
+    diagnose.add_argument("--alignment-cache", type=_path_argument, required=True)
+    diagnose.add_argument("--output", type=_path_argument, required=True)
     return parser
 
 
@@ -359,6 +393,7 @@ def main(
             "visualize": run_visualize,
             "compare": run_compare,
             "audit-sample": run_audit_sample,
+            "diagnose-overfit": run_diagnose_overfit,
         }
         if handlers is None
         else dict(handlers)
@@ -4406,6 +4441,72 @@ def run_visualize(
     return 0
 
 
+def run_diagnose_overfit(
+    args: argparse.Namespace,
+    *,
+    config_loader: Callable[[Path], object] | None = None,
+    diagnostic_runner: (
+        Callable[[OverfitDiagnosticRequest, Path], Path] | None
+    ) = None,
+) -> int:
+    cfg = _load_config(args.config, config_loader)
+    baseline_checkpoint = Path(args.baseline_checkpoint)
+    mg_checkpoint = Path(args.mg_checkpoint)
+    manifest = Path(args.manifest)
+    alignment_cache = Path(args.alignment_cache)
+    output = _validate_output(
+        Path(args.output),
+        inputs=(
+            baseline_checkpoint,
+            mg_checkpoint,
+            manifest,
+            alignment_cache,
+        ),
+        source_roots=(
+            Path(getattr(cfg, "image_root")),
+            Path(getattr(cfg, "metadata_root")),
+        ),
+    )
+    manifest_sha256 = _manifest_fingerprint(manifest)
+    records = _read_jsonl(manifest / "train.jsonl")
+    if len(records) != 64:
+        raise WorkflowError(
+            "overfit diagnostic requires exactly 64 train records"
+        )
+    alignment_snapshot = _verified_alignment_snapshot(
+        alignment_cache,
+        source_manifest=manifest,
+    )
+    alignment_fingerprint = getattr(alignment_snapshot, "fingerprint", None)
+    if not _is_sha256(alignment_fingerprint):
+        raise WorkflowError("alignment cache fingerprint is invalid")
+    request = OverfitDiagnosticRequest(
+        cfg=cfg,
+        baseline_checkpoint=baseline_checkpoint,
+        mg_checkpoint=mg_checkpoint,
+        manifest_dir=manifest,
+        alignment_cache=alignment_cache,
+        alignment_snapshot=alignment_snapshot,
+        config_sha256=_config_fingerprint(cfg),
+        baseline_checkpoint_sha256=_sha256_file(baseline_checkpoint),
+        mg_checkpoint_sha256=_sha256_file(mg_checkpoint),
+        manifest_sha256=manifest_sha256,
+        alignment_cache_sha256=alignment_fingerprint,
+    )
+    selected_runner = (
+        _diagnose_overfit_real
+        if diagnostic_runner is None
+        else diagnostic_runner
+    )
+
+    def writer(stage: Path) -> Path:
+        return Path(selected_runner(request, stage))
+
+    primary = _replace_directory(output, writer)
+    print(primary.resolve())
+    return 0
+
+
 def _verify_alignment_cache_summary(
     cache_root: Path,
     *,
@@ -5729,6 +5830,412 @@ def _visualize_saved_runs(
         stage,
         _load_compatible_run_records(request.run_dirs),
     )
+
+
+def _default_overfit_diagnostic_dataset(
+    model_name: str,
+    request: OverfitDiagnosticRequest,
+) -> object:
+    from moving_det.ml.dataset import ClipSpec, TemporalClipDataset
+
+    offsets = _model_offsets(model_name, request.cfg)
+    return TemporalClipDataset(
+        request.manifest_dir / "train.jsonl",
+        request.cfg,
+        ClipSpec(model_name, offsets),
+        training=False,
+        alignment_snapshot=(
+            None
+            if model_name == "baseline"
+            else request.alignment_snapshot
+        ),
+    )
+
+
+def _diagnostic_gate_context(checkpoint: Path) -> dict[str, object]:
+    gate_path = Path(checkpoint).parent / "gate.json"
+    payload = _read_json(gate_path)
+    if not isinstance(payload, Mapping):
+        raise WorkflowError(f"overfit gate is malformed: {gate_path}")
+    result = {}
+    for field in ("initial_loss", "final_loss", "loss_reduction"):
+        value = payload.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+        ):
+            raise WorkflowError(f"overfit gate {field} is invalid: {gate_path}")
+        result[field] = float(value)
+    for field in (
+        "passed",
+        "optimizer_steps",
+        "recall_at_riou_025",
+        "finite_gradients",
+        "amp_overflow_skips",
+    ):
+        if field in payload:
+            result[field] = payload[field]
+    return result
+
+
+def _diagnostic_sample_records(
+    sample: Mapping[str, object],
+) -> tuple[object, tuple[object, ...], object]:
+    import numpy as np
+    import torch
+
+    from moving_det.ml.obb_adapter import normalized_xywhr_to_obb
+    from moving_det.ml.overfit_diagnostic import (
+        DiagnosticTruth,
+        SampleKey,
+    )
+    from moving_det.vrud.tiling import Tile
+
+    if not isinstance(sample, Mapping):
+        raise WorkflowError("diagnostic dataset sample must be a mapping")
+    metadata = sample.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise WorkflowError("diagnostic sample metadata is malformed")
+    tile_value = metadata.get("tile_xywh")
+    if (
+        not isinstance(tile_value, (tuple, list))
+        or len(tile_value) != 4
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in tile_value)
+    ):
+        raise WorkflowError("diagnostic sample tile identity is malformed")
+    tile_xywh = tuple(int(value) for value in tile_value)
+    try:
+        key = SampleKey(
+            str(metadata.get("site")),
+            str(metadata.get("sequence")),
+            int(metadata.get("center_frame")),
+            tile_xywh,
+        )
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError("diagnostic sample identity is malformed") from exc
+    local_tile = Tile(0, 0, tile_xywh[2], tile_xywh[3])
+    try:
+        classes = torch.as_tensor(sample.get("cls")).detach().cpu().reshape(-1)
+        boxes = torch.as_tensor(sample.get("bboxes")).detach().cpu()
+        frames = torch.as_tensor(sample.get("frames")).detach().cpu()
+        zero_index = int(sample.get("zero_index"))
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise WorkflowError("diagnostic sample tensors are malformed") from exc
+    if boxes.ndim != 2 or boxes.shape[1] != 5 or len(classes) != len(boxes):
+        raise WorkflowError("diagnostic sample targets are malformed")
+    track_keys = metadata.get("track_keys")
+    if (
+        isinstance(track_keys, (str, bytes))
+        or not isinstance(track_keys, Sequence)
+        or len(track_keys) != len(boxes)
+    ):
+        raise WorkflowError("diagnostic sample track identities are malformed")
+    truth = []
+    for class_value, box, track_key in zip(
+        classes.tolist(),
+        boxes.numpy(),
+        track_keys,
+        strict=True,
+    ):
+        class_id = int(class_value)
+        if float(class_id) != float(class_value):
+            raise WorkflowError("diagnostic target class is not integral")
+        if (
+            not isinstance(track_key, (tuple, list))
+            or len(track_key) != 3
+        ):
+            raise WorkflowError("diagnostic track identity is malformed")
+        identity = ":".join(str(value) for value in track_key)
+        try:
+            truth.append(
+                DiagnosticTruth(
+                    identity,
+                    normalized_xywhr_to_obb(box, local_tile),
+                    class_id,
+                )
+            )
+        except ValueError as exc:
+            raise WorkflowError("diagnostic ground truth is invalid") from exc
+    if (
+        frames.ndim != 4
+        or zero_index < 0
+        or zero_index >= frames.shape[0]
+        or tuple(frames.shape[1:])
+        != (3, tile_xywh[3], tile_xywh[2])
+        or not bool(torch.isfinite(frames).all())
+    ):
+        raise WorkflowError("diagnostic center RGB tensor is invalid")
+    center = frames[zero_index]
+    center_rgb = (
+        center.clamp(0.0, 1.0)
+        .mul(255.0)
+        .round()
+        .to(dtype=torch.uint8)
+        .permute(1, 2, 0)
+        .contiguous()
+        .numpy()
+    )
+    if center_rgb.dtype != np.uint8:
+        raise AssertionError("uint8 center conversion failed")
+    return key, tuple(truth), center_rgb
+
+
+def _diagnostic_clip(sample: Mapping[str, object]) -> dict[str, object]:
+    metadata = sample.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise WorkflowError("diagnostic sample metadata is malformed")
+    return {
+        "frames": sample.get("frames"),
+        "valid": sample.get("valid"),
+        "transforms": sample.get("transforms"),
+        "zero_index": sample.get("zero_index"),
+        "frame": metadata.get("center_frame"),
+        "metadata": {
+            "site": metadata.get("site"),
+            "sequence": metadata.get("sequence"),
+            "offsets": metadata.get("offsets"),
+        },
+    }
+
+
+def _diagnostic_predictions(detections: Sequence[object]) -> tuple[object, ...]:
+    from moving_det.geometry.obb import obb_to_points, points_to_obb
+    from moving_det.ml.overfit_diagnostic import DiagnosticPrediction
+
+    result = []
+    for detection in detections:
+        try:
+            result.append(
+                DiagnosticPrediction(
+                    points_to_obb(obb_to_points(detection.obb)),
+                    int(detection.class_id),
+                    float(detection.confidence),
+                )
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise WorkflowError("diagnostic prediction is malformed") from exc
+    return tuple(result)
+
+
+def _diagnose_overfit_real(
+    request: OverfitDiagnosticRequest,
+    stage: Path,
+    *,
+    dataset_factory: (
+        Callable[[str, OverfitDiagnosticRequest], object] | None
+    ) = None,
+    model_factory: Callable[[str, object], object] | None = None,
+    checkpoint_loader: Callable[[object, Path, Path], Mapping[str, object]] | None = None,
+    inferencer: Callable[[object, Mapping[str, object], object], Sequence[object]] | None = None,
+    panel_renderer: Callable[[object, Path], Path] | None = None,
+    report_writer: Callable[..., Path] | None = None,
+    device: object | None = None,
+) -> Path:
+    import gc
+    import numpy as np
+    import torch
+
+    from moving_det.ml.factory import create_model
+    from moving_det.ml.inference import infer_full_frame
+    from moving_det.ml.overfit_diagnostic import (
+        analyze_paired_sample,
+        aggregate_paired_evidence,
+        select_diagnostic_samples,
+    )
+    from moving_det.ml.overfit_report import (
+        DiagnosticPanelInput,
+        render_diagnostic_panel,
+        write_overfit_report,
+    )
+    from moving_det.ml.training import load_experiment_checkpoint
+
+    if not isinstance(request, OverfitDiagnosticRequest):
+        raise WorkflowError("overfit diagnostic request is invalid")
+    if request.sample_count != 64:
+        raise WorkflowError("overfit diagnostic sample count must remain 64")
+    if _model_offsets("mg_vtod", request.cfg) != (-4, -2, 0, 2, 4):
+        raise WorkflowError("MG-VTOD diagnostic offsets are not the approved five-frame clip")
+    selected_dataset_factory = (
+        _default_overfit_diagnostic_dataset
+        if dataset_factory is None
+        else dataset_factory
+    )
+    selected_model_factory = (
+        (lambda name, cfg: create_model(name, None, cfg))
+        if model_factory is None
+        else model_factory
+    )
+    selected_checkpoint_loader = (
+        load_experiment_checkpoint
+        if checkpoint_loader is None
+        else checkpoint_loader
+    )
+    selected_inferencer = infer_full_frame if inferencer is None else inferencer
+    selected_panel_renderer = (
+        render_diagnostic_panel if panel_renderer is None else panel_renderer
+    )
+    selected_report_writer = (
+        write_overfit_report if report_writer is None else report_writer
+    )
+    selected_device = (
+        torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None
+        else device
+    )
+    inference_cfg = {
+        "tile_size": getattr(request.cfg, "tile_size"),
+        "tile_overlap": getattr(request.cfg, "tile_overlap"),
+        "confidence_threshold": request.confidence_threshold,
+        "nms_iou": request.nms_iou,
+        "inference_batch_size": 1,
+    }
+    started_at = datetime.now(timezone.utc)
+    started_monotonic = time.monotonic()
+    baseline_dataset = selected_dataset_factory("baseline", request)
+    mg_dataset = selected_dataset_factory("mg_vtod", request)
+    if len(baseline_dataset) != 64 or len(mg_dataset) != 64:
+        raise WorkflowError("diagnostic datasets must each contain exactly 64 samples")
+
+    baseline_model = selected_model_factory("baseline", request.cfg)
+    baseline_payload = selected_checkpoint_loader(
+        baseline_model,
+        request.baseline_checkpoint,
+        request.manifest_dir,
+    )
+    if baseline_payload.get("model_name") != "baseline":
+        raise WorkflowError("baseline checkpoint model identity is invalid")
+    _verify_checkpoint_alignment_provenance(
+        baseline_payload,
+        model_name="baseline",
+        alignment_cache_sha256=None,
+    )
+    baseline_model = baseline_model.to(selected_device)
+    baseline_model.eval()
+    baseline_rows = []
+    centers = {}
+    for index in range(64):
+        sample = baseline_dataset[index]
+        key, truth, center_rgb = _diagnostic_sample_records(sample)
+        if key in centers:
+            raise WorkflowError("diagnostic sample identity is duplicated")
+        detections = selected_inferencer(
+            baseline_model,
+            _diagnostic_clip(sample),
+            inference_cfg,
+        )
+        baseline_rows.append((key, truth, _diagnostic_predictions(detections)))
+        centers[key] = center_rgb
+        if (index + 1) % 8 == 0:
+            print(f"[diagnose-overfit] baseline {index + 1}/64", flush=True)
+    baseline_model.to(torch.device("cpu"))
+    del baseline_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    mg_model = selected_model_factory("mg_vtod", request.cfg)
+    mg_payload = selected_checkpoint_loader(
+        mg_model,
+        request.mg_checkpoint,
+        request.manifest_dir,
+    )
+    if mg_payload.get("model_name") != "mg_vtod":
+        raise WorkflowError("MG-VTOD checkpoint model identity is invalid")
+    _verify_checkpoint_alignment_provenance(
+        mg_payload,
+        model_name="mg_vtod",
+        alignment_cache_sha256=request.alignment_cache_sha256,
+    )
+    mg_model = mg_model.to(selected_device)
+    mg_model.eval()
+    evidence = []
+    for index in range(64):
+        sample = mg_dataset[index]
+        key, truth, center_rgb = _diagnostic_sample_records(sample)
+        baseline_key, baseline_truth, baseline_predictions = baseline_rows[index]
+        if key != baseline_key or truth != baseline_truth:
+            raise WorkflowError(
+                f"baseline/MG diagnostic sample identity mismatch at index {index}"
+            )
+        if not np.array_equal(center_rgb, centers[key]):
+            raise WorkflowError(
+                f"baseline/MG center RGB mismatch at index {index}"
+            )
+        detections = selected_inferencer(
+            mg_model,
+            _diagnostic_clip(sample),
+            inference_cfg,
+        )
+        evidence.append(
+            analyze_paired_sample(
+                key,
+                truth,
+                baseline_predictions,
+                _diagnostic_predictions(detections),
+                match_iou=request.match_iou,
+            )
+        )
+        if (index + 1) % 8 == 0:
+            print(f"[diagnose-overfit] MG-VTOD {index + 1}/64", flush=True)
+    mg_model.to(torch.device("cpu"))
+    del mg_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    aggregate = aggregate_paired_evidence(evidence)
+    selected = select_diagnostic_samples(evidence, count=6)
+    panel_paths = []
+    for index, row in enumerate(selected, start=1):
+        relative = Path("panels") / f"{index:02d}_{row.role}_{row.evidence.key.site}_{row.evidence.key.center_frame}.jpg"
+        selected_panel_renderer(
+            DiagnosticPanelInput(row, centers[row.evidence.key]),
+            Path(stage) / relative,
+        )
+        panel_paths.append(relative)
+
+    git_commit, git_dirty = _git_provenance()
+    finished_at = datetime.now(timezone.utc)
+    provenance = {
+        "config_sha256": request.config_sha256,
+        "manifest_sha256": request.manifest_sha256,
+        "baseline_checkpoint_sha256": request.baseline_checkpoint_sha256,
+        "mg_checkpoint_sha256": request.mg_checkpoint_sha256,
+        "alignment_cache_sha256": request.alignment_cache_sha256,
+        "baseline_checkpoint_epoch": baseline_payload.get("epoch"),
+        "baseline_checkpoint_step": baseline_payload.get("optimizer_steps"),
+        "mg_checkpoint_epoch": mg_payload.get("epoch"),
+        "mg_checkpoint_step": mg_payload.get("optimizer_steps"),
+        "git_commit": git_commit,
+        "git_dirty": git_dirty,
+        "started_at_utc": _utc_timestamp(started_at),
+        "finished_at_utc": _utc_timestamp(finished_at),
+        "duration_seconds": time.monotonic() - started_monotonic,
+        "environment": _environment_provenance(),
+    }
+    gate_context = {
+        "baseline": _diagnostic_gate_context(request.baseline_checkpoint),
+        "mg_vtod": _diagnostic_gate_context(request.mg_checkpoint),
+    }
+    primary = selected_report_writer(
+        Path(stage),
+        aggregate=aggregate,
+        selected=selected,
+        panel_paths=panel_paths,
+        provenance=provenance,
+        gate_context=gate_context,
+        thresholds={
+            "confidence": request.confidence_threshold,
+            "nms_iou": request.nms_iou,
+            "match_riou": request.match_iou,
+        },
+    )
+    primary_path = Path(primary)
+    try:
+        return primary_path.relative_to(stage)
+    except ValueError as exc:
+        raise WorkflowError("diagnostic report returned a path outside staging") from exc
 
 
 def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:

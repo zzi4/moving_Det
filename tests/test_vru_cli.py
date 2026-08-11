@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
@@ -51,6 +52,7 @@ EXPECTED_COMMANDS = {
     "visualize",
     "compare",
     "audit-sample",
+    "diagnose-overfit",
 }
 REQUIRES_TORCH = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None,
@@ -141,12 +143,477 @@ def test_vru_cli_exposes_exact_workflow_commands():
             "audit-sample --manifest runs/vrud-pilot/manifest --count 20 "
             "--output runs/vrud-pilot/manual-audit"
         ),
+        (
+            "diagnose-overfit --config configs/vrud-temporal-obb.yaml "
+            "--baseline-checkpoint runs/vrud-pilot/baseline-overfit/checkpoints/best.pt "
+            "--mg-checkpoint runs/vrud-pilot/mg_vtod-overfit/checkpoints/best.pt "
+            "--manifest runs/vrud-pilot/mg_vtod-overfit/overfit-manifest "
+            "--alignment-cache runs/vrud-pilot/alignment-cache "
+            "--output runs/vrud-pilot/mg_vtod-overfit-diagnostic"
+        ),
     ],
 )
 def test_task12_and_task13_command_forms_parse_without_ambiguity(arguments):
     args = build_parser().parse_args(arguments.split())
 
     assert args.command in EXPECTED_COMMANDS
+
+
+def test_diagnose_overfit_parser_preserves_all_frozen_inputs():
+    args = build_parser().parse_args(
+        "diagnose-overfit --config config.yaml "
+        "--baseline-checkpoint baseline.pt --mg-checkpoint mg.pt "
+        "--manifest manifest --alignment-cache cache --output diagnostic".split()
+    )
+
+    assert args.command == "diagnose-overfit"
+    assert args.config == Path("config.yaml")
+    assert args.baseline_checkpoint == Path("baseline.pt")
+    assert args.mg_checkpoint == Path("mg.pt")
+    assert args.manifest == Path("manifest")
+    assert args.alignment_cache == Path("cache")
+    assert args.output == Path("diagnostic")
+
+
+def test_diagnose_overfit_routes_through_main():
+    captured = {}
+
+    def handler(args):
+        captured["args"] = args
+        return 17
+
+    result = main(
+        "diagnose-overfit --baseline-checkpoint baseline.pt "
+        "--mg-checkpoint mg.pt --manifest manifest --alignment-cache cache "
+        "--output diagnostic".split(),
+        handlers={"diagnose-overfit": handler},
+    )
+
+    assert result == 17
+    assert captured["args"].command == "diagnose-overfit"
+
+
+def test_diagnose_overfit_runner_freezes_provenance_and_publishes_atomically(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(
+        manifest,
+        [{"record": index} for index in range(64)],
+    )
+    baseline = tmp_path / "baseline.pt"
+    mg = tmp_path / "mg.pt"
+    baseline.write_bytes(b"baseline checkpoint")
+    mg.write_bytes(b"MG checkpoint")
+    cache = tmp_path / "alignment-cache"
+    cache.mkdir()
+    output = tmp_path / "diagnostic"
+    output.mkdir()
+    (output / "old.txt").write_text("old", encoding="utf-8")
+    fingerprint = "d" * 64
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_verified_alignment_snapshot",
+        lambda root, *, source_manifest: SimpleNamespace(
+            fingerprint=fingerprint
+        ),
+    )
+    captured = {}
+
+    def runner(request, stage):
+        captured["request"] = request
+        assert stage.parent == output.parent
+        (stage / "index.html").write_text("diagnostic", encoding="utf-8")
+        return Path("index.html")
+
+    args = build_parser().parse_args(
+        [
+            "diagnose-overfit",
+            "--baseline-checkpoint",
+            str(baseline),
+            "--mg-checkpoint",
+            str(mg),
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(cache),
+            "--output",
+            str(output),
+        ]
+    )
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+
+    result = vru_cli_module.run_diagnose_overfit(
+        args,
+        config_loader=lambda _path: cfg,
+        diagnostic_runner=runner,
+    )
+
+    request = captured["request"]
+    assert result == 0
+    assert request.sample_count == 64
+    assert request.confidence_threshold == pytest.approx(0.25)
+    assert request.nms_iou == pytest.approx(0.5)
+    assert request.match_iou == pytest.approx(0.25)
+    assert request.manifest_sha256 == _manifest_fingerprint(manifest)
+    assert request.baseline_checkpoint_sha256 == hashlib.sha256(
+        baseline.read_bytes()
+    ).hexdigest()
+    assert request.mg_checkpoint_sha256 == hashlib.sha256(
+        mg.read_bytes()
+    ).hexdigest()
+    assert request.alignment_cache_sha256 == fingerprint
+    assert not (output / "old.txt").exists()
+    assert (output / "index.html").read_text(encoding="utf-8") == "diagnostic"
+    assert capsys.readouterr().out.strip() == str(
+        (output / "index.html").resolve()
+    )
+
+
+def test_diagnose_overfit_rejects_non_64_manifest_and_overlapping_output(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [{"record": index} for index in range(63)])
+    baseline = tmp_path / "baseline.pt"
+    mg = tmp_path / "mg.pt"
+    baseline.write_bytes(b"baseline")
+    mg.write_bytes(b"mg")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_verified_alignment_snapshot",
+        lambda *args, **kwargs: SimpleNamespace(fingerprint="d" * 64),
+    )
+
+    args = build_parser().parse_args(
+        [
+            "diagnose-overfit",
+            "--baseline-checkpoint",
+            str(baseline),
+            "--mg-checkpoint",
+            str(mg),
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(cache),
+            "--output",
+            str(tmp_path / "output"),
+        ]
+    )
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    with pytest.raises(WorkflowError, match="exactly 64"):
+        vru_cli_module.run_diagnose_overfit(
+            args,
+            config_loader=lambda _path: cfg,
+            diagnostic_runner=lambda *_args: Path("index.html"),
+        )
+
+    _manifest_children(tmp_path / "manifest-64", [{"record": i} for i in range(64)])
+    overlapping = build_parser().parse_args(
+        [
+            "diagnose-overfit",
+            "--baseline-checkpoint",
+            str(baseline),
+            "--mg-checkpoint",
+            str(mg),
+            "--manifest",
+            str(tmp_path / "manifest-64"),
+            "--alignment-cache",
+            str(cache),
+            "--output",
+            str(cache),
+        ]
+    )
+    with pytest.raises(WorkflowError, match="overlaps"):
+        vru_cli_module.run_diagnose_overfit(
+            overlapping,
+            config_loader=lambda _path: cfg,
+            diagnostic_runner=lambda *_args: Path("index.html"),
+        )
+
+
+def test_diagnose_overfit_runner_failure_keeps_previous_output(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [{"record": index} for index in range(64)])
+    baseline = tmp_path / "baseline.pt"
+    mg = tmp_path / "mg.pt"
+    baseline.write_bytes(b"baseline")
+    mg.write_bytes(b"mg")
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    sentinel = output / "sentinel.txt"
+    sentinel.write_text("preserved", encoding="utf-8")
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_verified_alignment_snapshot",
+        lambda *args, **kwargs: SimpleNamespace(fingerprint="d" * 64),
+    )
+    args = build_parser().parse_args(
+        [
+            "diagnose-overfit",
+            "--baseline-checkpoint",
+            str(baseline),
+            "--mg-checkpoint",
+            str(mg),
+            "--manifest",
+            str(manifest),
+            "--alignment-cache",
+            str(cache),
+            "--output",
+            str(output),
+        ]
+    )
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        vru_cli_module.run_diagnose_overfit(
+            args,
+            config_loader=lambda _path: cfg,
+            diagnostic_runner=lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("synthetic failure")
+            ),
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "preserved"
+
+
+def _fake_diagnostic_request(tmp_path):
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        tile_size=64,
+        tile_overlap=0,
+    )
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [{"record": index} for index in range(64)])
+    checkpoints = {}
+    for model_name in ("baseline", "mg_vtod"):
+        checkpoint_dir = tmp_path / model_name / "checkpoints"
+        checkpoint_dir.mkdir(parents=True)
+        checkpoint = checkpoint_dir / "best.pt"
+        checkpoint.write_bytes(model_name.encode("ascii"))
+        (checkpoint_dir / "gate.json").write_text(
+            json.dumps(
+                {
+                    "initial_loss": 10.0,
+                    "final_loss": 4.0 if model_name == "baseline" else 3.0,
+                    "loss_reduction": 0.6 if model_name == "baseline" else 0.7,
+                }
+            ),
+            encoding="utf-8",
+        )
+        checkpoints[model_name] = checkpoint
+    snapshot = SimpleNamespace(fingerprint="d" * 64)
+    return vru_cli_module.OverfitDiagnosticRequest(
+        cfg=cfg,
+        baseline_checkpoint=checkpoints["baseline"],
+        mg_checkpoint=checkpoints["mg_vtod"],
+        manifest_dir=manifest,
+        alignment_cache=tmp_path / "cache",
+        alignment_snapshot=snapshot,
+        config_sha256="a" * 64,
+        baseline_checkpoint_sha256="b" * 64,
+        mg_checkpoint_sha256="c" * 64,
+        manifest_sha256=_manifest_fingerprint(manifest),
+        alignment_cache_sha256=snapshot.fingerprint,
+    )
+
+
+@REQUIRES_TORCH
+def test_diagnose_overfit_real_pairs_identical_samples_and_renders_six(
+    tmp_path,
+):
+    import torch
+
+    from moving_det.ml.inference import Detection
+    from moving_det.models import OBB
+    from moving_det.vrud.tiling import Tile
+
+    request = _fake_diagnostic_request(tmp_path)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    events = []
+
+    class FakeModel:
+        def __init__(self, model_name):
+            self.model_name = model_name
+
+        def to(self, device):
+            events.append((self.model_name, "to", str(device)))
+            return self
+
+        def eval(self):
+            events.append((self.model_name, "eval"))
+            return self
+
+    def sample(index, model_name):
+        offsets = (0,) if model_name == "baseline" else request.cfg.mg_offsets
+        temporal = len(offsets)
+        return {
+            "frames": torch.zeros((temporal, 3, 64, 64), dtype=torch.float32),
+            "valid": torch.ones((temporal,), dtype=torch.bool),
+            "zero_index": offsets.index(0),
+            "transforms": torch.eye(2, 3).repeat(temporal, 1, 1),
+            "tile_xywh": (index, index, 64, 64),
+            "cls": torch.tensor([[0.0]], dtype=torch.float32),
+            "bboxes": torch.tensor(
+                [[0.5, 0.5, 0.5, 0.25, 0.0]], dtype=torch.float32
+            ),
+            "metadata": {
+                "site": "site19" if index % 2 == 0 else "site22",
+                "sequence": f"sequence_{index:02d}",
+                "center_frame": index + 1,
+                "tile_xywh": (index, index, 64, 64),
+                "track_keys": (("site", "sequence", index),),
+                "offsets": tuple(offsets),
+            },
+        }
+
+    def dataset_factory(model_name, _request):
+        events.append((model_name, "dataset"))
+        return tuple(sample(index, model_name) for index in range(64))
+
+    def checkpoint_loader(model, checkpoint, manifest):
+        events.append((model.model_name, "load", checkpoint.name))
+        return {
+            "model_name": model.model_name,
+            "alignment_cache_sha256": (
+                None
+                if model.model_name == "baseline"
+                else request.alignment_cache_sha256
+            ),
+            "epoch": 7,
+            "optimizer_steps": 300,
+        }
+
+    def inferencer(model, clip, inference_cfg):
+        assert inference_cfg["confidence_threshold"] == pytest.approx(0.25)
+        assert inference_cfg["nms_iou"] == pytest.approx(0.5)
+        if model.model_name == "baseline" and clip["frame"] % 2:
+            return ()
+        return (
+            Detection(
+                frame=clip["frame"],
+                obb=OBB(32, 32, 32, 16, 0),
+                class_id=0,
+                confidence=0.9,
+                tile=Tile(0, 0, 64, 64),
+                site=clip["metadata"]["site"],
+                sequence=clip["metadata"]["sequence"],
+            ),
+        )
+
+    rendered = []
+
+    def panel_renderer(panel, destination):
+        assert panel.center_rgb.shape == (64, 64, 3)
+        rendered.append(panel.selected.evidence.key)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (10, 10)).save(destination)
+        return destination
+
+    def report_writer(destination, **kwargs):
+        assert len(kwargs["selected"]) == 6
+        assert len(kwargs["panel_paths"]) == 6
+        (destination / "summary.json").write_text("{}", encoding="utf-8")
+        primary = destination / "index.html"
+        primary.write_text("report", encoding="utf-8")
+        return primary
+
+    primary = vru_cli_module._diagnose_overfit_real(
+        request,
+        stage,
+        dataset_factory=dataset_factory,
+        model_factory=lambda model_name, _cfg: FakeModel(model_name),
+        checkpoint_loader=checkpoint_loader,
+        inferencer=inferencer,
+        panel_renderer=panel_renderer,
+        report_writer=report_writer,
+        device=torch.device("cpu"),
+    )
+
+    assert primary == Path("index.html")
+    assert len(rendered) == 6
+    assert len(set(rendered)) == 6
+    assert events.index(("baseline", "to", "cpu")) < events.index(
+        ("mg_vtod", "to", "cpu")
+    )
+    assert ("baseline", "dataset") in events
+    assert ("mg_vtod", "dataset") in events
+
+
+@REQUIRES_TORCH
+def test_diagnose_overfit_real_rejects_unpaired_sample_identity(tmp_path):
+    import torch
+
+    request = _fake_diagnostic_request(tmp_path)
+    stage = tmp_path / "stage"
+    stage.mkdir()
+
+    def dataset_factory(model_name, _request):
+        rows = []
+        for index in range(64):
+            offsets = (0,) if model_name == "baseline" else request.cfg.mg_offsets
+            site = "site-mismatch" if model_name == "mg_vtod" and index == 0 else "site19"
+            rows.append(
+                {
+                    "frames": torch.zeros(
+                        (len(offsets), 3, 64, 64), dtype=torch.float32
+                    ),
+                    "valid": torch.ones((len(offsets),), dtype=torch.bool),
+                    "zero_index": tuple(offsets).index(0),
+                    "transforms": torch.eye(2, 3).repeat(len(offsets), 1, 1),
+                    "tile_xywh": (0, 0, 64, 64),
+                    "cls": torch.tensor([[0.0]]),
+                    "bboxes": torch.tensor([[0.5, 0.5, 0.5, 0.25, 0.0]]),
+                    "metadata": {
+                        "site": site,
+                        "sequence": f"sequence_{index}",
+                        "center_frame": index + 1,
+                        "tile_xywh": (0, 0, 64, 64),
+                        "track_keys": (("site", "sequence", index),),
+                        "offsets": tuple(offsets),
+                    },
+                }
+            )
+        return tuple(rows)
+
+    class FakeModel:
+        def __init__(self, name):
+            self.name = name
+
+        def to(self, _device):
+            return self
+
+        def eval(self):
+            return self
+
+    with pytest.raises(WorkflowError, match="sample identity"):
+        vru_cli_module._diagnose_overfit_real(
+            request,
+            stage,
+            dataset_factory=dataset_factory,
+            model_factory=lambda name, _cfg: FakeModel(name),
+            checkpoint_loader=lambda model, *_args: {
+                "model_name": model.name,
+                "alignment_cache_sha256": (
+                    None if model.name == "baseline" else "d" * 64
+                ),
+            },
+            inferencer=lambda *_args: (),
+            panel_renderer=lambda *_args: pytest.fail("must not render"),
+            report_writer=lambda *_args, **_kwargs: pytest.fail("must not report"),
+            device=torch.device("cpu"),
+        )
 
 
 def test_parser_rejects_unknown_models_invalid_counts_and_malformed_paths():
