@@ -665,6 +665,36 @@ def test_diagnose_overfit_real_rejects_unpaired_sample_identity(tmp_path):
         )
 
 
+def test_diagnostic_predictions_preserve_near_degenerate_false_positive():
+    from moving_det.models import OBB
+
+    prediction = SimpleNamespace(
+        obb=OBB(
+            cx=106.231201171875,
+            cy=821.768798828125,
+            width=570.6640625,
+            height=9.380422827387491e-11,
+            theta=-0.7853981852531433,
+        ),
+        class_id=3,
+        confidence=0.5420459508895874,
+    )
+    portrait = SimpleNamespace(
+        obb=OBB(20, 30, 10, 40, 1.4),
+        class_id=0,
+        confidence=0.8,
+    )
+
+    rows = vru_cli_module._diagnostic_predictions((prediction, portrait))
+
+    assert len(rows) == 2
+    assert rows[0].obb.height == pytest.approx(prediction.obb.height)
+    assert rows[0].obb.width == pytest.approx(prediction.obb.width)
+    assert rows[1].obb.width == pytest.approx(40)
+    assert rows[1].obb.height == pytest.approx(10)
+    assert -np.pi / 2 <= rows[1].obb.theta < np.pi / 2
+
+
 def test_parser_rejects_unknown_models_invalid_counts_and_malformed_paths():
     parser = build_parser()
     with pytest.raises(SystemExit) as unknown:

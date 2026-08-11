@@ -6005,15 +6005,29 @@ def _diagnostic_clip(sample: Mapping[str, object]) -> dict[str, object]:
 
 
 def _diagnostic_predictions(detections: Sequence[object]) -> tuple[object, ...]:
-    from moving_det.geometry.obb import obb_to_points, points_to_obb
+    from moving_det.geometry.obb import normalize_theta
     from moving_det.ml.overfit_diagnostic import DiagnosticPrediction
+    from moving_det.models import OBB
 
     result = []
     for detection in detections:
         try:
+            source = detection.obb
+            width = float(source.width)
+            height = float(source.height)
+            theta = float(source.theta)
+            if height > width:
+                width, height = height, width
+                theta += math.pi / 2
             result.append(
                 DiagnosticPrediction(
-                    points_to_obb(obb_to_points(detection.obb)),
+                    OBB(
+                        float(source.cx),
+                        float(source.cy),
+                        width,
+                        height,
+                        normalize_theta(theta),
+                    ),
                     int(detection.class_id),
                     float(detection.confidence),
                 )
