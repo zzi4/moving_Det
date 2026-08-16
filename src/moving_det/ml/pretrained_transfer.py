@@ -10,6 +10,7 @@ from pathlib import Path
 import pickletools
 import random
 import shutil
+import stat
 import struct
 import tempfile
 from types import MappingProxyType
@@ -80,6 +81,11 @@ _REPORT_FIELDS = frozenset(
 _RUN_FIELDS = frozenset({"artifact_kind", "schema_version", "artifacts"})
 _PICKLE_PROBE_LIMIT = 16 * 1024 * 1024
 _LEGACY_HEADER_LIMIT = 64 * 1024
+_CHECKPOINT_PROBE_FILE_LIMIT = 8 * 1024 * 1024 * 1024
+_ZIP_MEMBER_LIMIT = 4096
+_ZIP_CENTRAL_DIRECTORY_LIMIT = 4 * 1024 * 1024
+_ZIP_PICKLE_COMPRESSED_LIMIT = 16 * 1024 * 1024
+_ZIP_EOCD_SEARCH_LIMIT = 22 + 65535
 _LEGACY_TORCH_MAGIC = 0x1950A86A20F9469CFC6C
 _LEGACY_TORCH_PROTOCOL = 1001
 _PICKLE_MARK = object()
@@ -87,6 +93,7 @@ _PICKLE_OPAQUE = object()
 _PICKLE_SEQUENCE = object()
 _ARCHIVE_NOT_TORCH = object()
 _ARCHIVE_INDETERMINATE = object()
+_ZIP_CENTRAL_HEADER = struct.Struct("<4s6H3L5H2L")
 
 
 class _ProbeDict(dict[object, object]):
@@ -383,6 +390,9 @@ def _marked_items(stack: list[object]) -> tuple[int, list[object]] | None:
 
 
 def _probe_pickle_top_level_marker(content: bytes) -> bool | None:
+    stream_end = _pickle_stream_end(content, 0)
+    if stream_end is None:
+        return None
     stack: list[object] = []
     memo: dict[int, object] = {}
     unicode_ops = {
@@ -417,7 +427,7 @@ def _probe_pickle_top_level_marker(content: bytes) -> bool | None:
     memo_put_ops = {"PUT", "BINPUT", "LONG_BINPUT"}
     memo_get_ops = {"GET", "BINGET", "LONG_BINGET"}
     try:
-        operations = pickletools.genops(content)
+        operations = pickletools.genops(content[:stream_end])
         for opcode, argument, _position in operations:
             name = opcode.name
             if name in {"PROTO", "FRAME"}:
@@ -572,8 +582,11 @@ def _legacy_scalar_pickle(
     content: bytes,
     offset: int,
 ) -> tuple[int, int] | None:
+    stream_end = _pickle_stream_end(content, offset)
+    if stream_end is None:
+        return None
     try:
-        operations = iter(pickletools.genops(content[offset:]))
+        operations = iter(pickletools.genops(content[offset:stream_end]))
         first, first_argument, _first_position = next(operations)
         if first.name == "PROTO":
             value, value_argument, _value_position = next(operations)
@@ -603,11 +616,45 @@ def _legacy_scalar_pickle(
 
 
 def _pickle_stream_end(content: bytes, offset: int) -> int | None:
+    active_frame_end: int | None = None
     try:
         for opcode, _argument, position in pickletools.genops(content[offset:]):
-            if opcode.name == "STOP":
-                return offset + position + 1
-    except (ValueError, OverflowError):
+            absolute_position = offset + position
+            if active_frame_end is not None:
+                if absolute_position > active_frame_end:
+                    return None
+                if absolute_position == active_frame_end:
+                    active_frame_end = None
+            if opcode.name == "FRAME":
+                if active_frame_end is not None:
+                    return None
+                frame_header_end = absolute_position + 9
+                if frame_header_end > len(content):
+                    return None
+                frame_length = struct.unpack_from(
+                    "<Q",
+                    content,
+                    absolute_position + 1,
+                )[0]
+                if (
+                    type(_argument) is not int
+                    or _argument != frame_length
+                    or frame_length > _PICKLE_PROBE_LIMIT
+                ):
+                    return None
+                frame_end = frame_header_end + frame_length
+                if frame_end > len(content):
+                    return None
+                active_frame_end = frame_end
+            elif opcode.name == "STOP":
+                stream_end = absolute_position + 1
+                if (
+                    active_frame_end is not None
+                    and stream_end != active_frame_end
+                ):
+                    return None
+                return stream_end
+    except (ValueError, OverflowError, struct.error):
         return None
     return None
 
@@ -621,7 +668,11 @@ def _legacy_torch_pickle(path: Path) -> bytes | object:
     except OSError:
         return _ARCHIVE_INDETERMINATE
     magic = _legacy_scalar_pickle(content, 0)
-    if magic is None or magic[0] != _LEGACY_TORCH_MAGIC:
+    if magic is None:
+        if content.startswith(b"\x80"):
+            return _ARCHIVE_INDETERMINATE
+        return _ARCHIVE_NOT_TORCH
+    if magic[0] != _LEGACY_TORCH_MAGIC:
         return _ARCHIVE_NOT_TORCH
     protocol = _legacy_scalar_pickle(content, magic[1])
     if protocol is None:
@@ -639,30 +690,152 @@ def _legacy_torch_pickle(path: Path) -> bytes | object:
     return content[system_info_end:payload_end]
 
 
-def _torch_archive_pickle(path: Path) -> bytes | object:
-    if not path.is_file():
+def _bounded_probe_file_size(path: Path) -> int | object:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
         return _ARCHIVE_NOT_TORCH
+    except OSError:
+        return _ARCHIVE_INDETERMINATE
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size < 0
+        or metadata.st_size > _CHECKPOINT_PROBE_FILE_LIMIT
+    ):
+        return _ARCHIVE_INDETERMINATE
+    return metadata.st_size
+
+
+def _bounded_zip_directory(
+    path: Path,
+    file_size: int,
+) -> tuple[int, int] | None:
+    read_size = min(file_size, _ZIP_EOCD_SEARCH_LIMIT)
+    if read_size < 22:
+        return None
+    try:
+        with path.open("rb") as stream:
+            stream.seek(file_size - read_size)
+            tail = stream.read(read_size)
+    except OSError:
+        return None
+    if len(tail) != read_size:
+        return None
+    relative_offset = tail.rfind(b"PK\x05\x06")
+    if relative_offset < 0 or relative_offset + 22 > len(tail):
+        return None
+    try:
+        (
+            signature,
+            disk_number,
+            directory_disk,
+            disk_entries,
+            total_entries,
+            directory_size,
+            directory_offset,
+            comment_size,
+        ) = struct.unpack_from("<4s4H2LH", tail, relative_offset)
+    except struct.error:
+        return None
+    absolute_offset = file_size - read_size + relative_offset
+    if (
+        signature != b"PK\x05\x06"
+        or absolute_offset + 22 + comment_size != file_size
+        or disk_number != 0
+        or directory_disk != 0
+        or disk_entries != total_entries
+        or total_entries > _ZIP_MEMBER_LIMIT
+        or directory_size > _ZIP_CENTRAL_DIRECTORY_LIMIT
+        or directory_offset > absolute_offset
+        or directory_size > absolute_offset - directory_offset
+    ):
+        return None
+    entry_count = 0
+    consumed = 0
+    try:
+        with path.open("rb") as stream:
+            stream.seek(directory_offset)
+            while consumed < directory_size:
+                header = stream.read(_ZIP_CENTRAL_HEADER.size)
+                if len(header) != _ZIP_CENTRAL_HEADER.size:
+                    return None
+                fields = _ZIP_CENTRAL_HEADER.unpack(header)
+                if fields[0] != b"PK\x01\x02" or fields[13] != 0:
+                    return None
+                variable_size = fields[10] + fields[11] + fields[12]
+                entry_size = _ZIP_CENTRAL_HEADER.size + variable_size
+                if entry_size > directory_size - consumed:
+                    return None
+                stream.seek(variable_size, os.SEEK_CUR)
+                consumed += entry_size
+                entry_count += 1
+                if entry_count > _ZIP_MEMBER_LIMIT:
+                    return None
+    except (OSError, struct.error):
+        return None
+    if consumed != directory_size or entry_count != total_entries:
+        return None
+    return total_entries, directory_size
+
+
+def _torch_archive_pickle(path: Path) -> bytes | object:
+    file_size = _bounded_probe_file_size(path)
+    if file_size is _ARCHIVE_NOT_TORCH:
+        return _ARCHIVE_NOT_TORCH
+    if file_size is _ARCHIVE_INDETERMINATE:
+        return _ARCHIVE_INDETERMINATE
+    assert type(file_size) is int
+    try:
+        with path.open("rb") as stream:
+            signature = stream.read(4)
+    except OSError:
+        return _ARCHIVE_INDETERMINATE
+    if signature != b"PK\x03\x04":
+        if signature.startswith(b"PK"):
+            return _ARCHIVE_INDETERMINATE
+        return _legacy_torch_pickle(path)
+    directory = _bounded_zip_directory(path, file_size)
+    if directory is None:
+        return _ARCHIVE_INDETERMINATE
+    expected_members, _directory_size = directory
     try:
         with zipfile.ZipFile(path) as archive:
-            candidates = [
-                info
-                for info in archive.infolist()
-                if info.filename == "data.pkl"
-                or info.filename.endswith("/data.pkl")
-            ]
-            if len(candidates) != 1:
+            members = archive.infolist()
+            if (
+                len(members) != expected_members
+                or len(members) > _ZIP_MEMBER_LIMIT
+            ):
                 return _ARCHIVE_INDETERMINATE
-            info = candidates[0]
-            if info.file_size < 0 or info.file_size > _PICKLE_PROBE_LIMIT:
+            candidate = None
+            for info in members:
+                if info.filename == "data.pkl" or info.filename.endswith(
+                    "/data.pkl"
+                ):
+                    if candidate is not None:
+                        return _ARCHIVE_INDETERMINATE
+                    candidate = info
+            if candidate is None:
                 return _ARCHIVE_INDETERMINATE
-            with archive.open(info) as stream:
+            if (
+                type(candidate.file_size) is not int
+                or candidate.file_size < 0
+                or candidate.file_size > _PICKLE_PROBE_LIMIT
+                or type(candidate.compress_size) is not int
+                or candidate.compress_size < 0
+                or candidate.compress_size > _ZIP_PICKLE_COMPRESSED_LIMIT
+            ):
+                return _ARCHIVE_INDETERMINATE
+            with archive.open(candidate) as stream:
                 content = stream.read(_PICKLE_PROBE_LIMIT + 1)
-            if len(content) > _PICKLE_PROBE_LIMIT:
+            if (
+                len(content) > _PICKLE_PROBE_LIMIT
+                or len(content) != candidate.file_size
+            ):
                 return _ARCHIVE_INDETERMINATE
             return content
     except zipfile.BadZipFile:
-        return _legacy_torch_pickle(path)
-    except (OSError, ValueError):
+        return _ARCHIVE_INDETERMINATE
+    except (OSError, ValueError, EOFError, NotImplementedError, RuntimeError):
         return _ARCHIVE_INDETERMINATE
 
 
@@ -678,19 +851,8 @@ def _static_frozen_marker_evidence(path: Path) -> bool | None:
 
 
 def _is_frozen_p2_initialization(path: Path) -> bool:
-    try:
-        payload = torch.load(
-            io.BytesIO(Path(path).read_bytes()),
-            map_location="cpu",
-            weights_only=True,
-        )
-    except Exception:
-        marker_evidence = _static_frozen_marker_evidence(path)
-        return marker_evidence is not False
-    return (
-        isinstance(payload, Mapping)
-        and payload.get("artifact_kind") == _ARTIFACT_KIND
-    )
+    marker_evidence = _static_frozen_marker_evidence(path)
+    return marker_evidence is not False
 
 
 def _shape(value: Tensor) -> list[int]:

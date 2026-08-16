@@ -1,7 +1,9 @@
 from collections import OrderedDict
 import hashlib
 import json
+from pathlib import Path
 import pickle
+import struct
 import zipfile
 
 import pytest
@@ -477,6 +479,98 @@ def test_legacy_marker_with_unsupported_value_fails_before_models(
         create_p2_obb_detector(weights=artifact, nc=4)
 
 
+def test_truncated_tagged_torch_zip_fails_before_models(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+    )
+    content = artifact.read_bytes()
+    end_of_central_directory = content.rfind(b"PK\x05\x06")
+    assert end_of_central_directory > 0
+    artifact.write_bytes(content[:end_of_central_directory])
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("truncated tagged ZIP must fail before construction")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(ValueError, match="frozen initialization children"):
+        create_p2_obb_detector(weights=artifact, nc=4)
+
+
+def test_corrupt_zip_signature_fails_before_models(tmp_path, monkeypatch):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+    )
+    content = bytearray(artifact.read_bytes())
+    assert content[:4] == b"PK\x03\x04"
+    content[3] = 5
+    artifact.write_bytes(content)
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("corrupt ZIP must fail before model construction")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(ValueError, match="frozen initialization children"):
+        create_p2_obb_detector(weights=artifact, nc=4)
+
+
+@pytest.mark.parametrize("pickle_protocol", [4, 5])
+@pytest.mark.parametrize(
+    "frame_length",
+    [2**64 - 1, 1],
+    ids=["oversized", "split-opcode"],
+)
+def test_forged_pickle_frame_is_indeterminate(
+    tmp_path,
+    monkeypatch,
+    pickle_protocol,
+    frame_length,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+        _use_new_zipfile_serialization=False,
+        pickle_protocol=pickle_protocol,
+    )
+    content = bytearray(artifact.read_bytes())
+    assert content[:3] == bytes((0x80, pickle_protocol, 0x95))
+    struct.pack_into("<Q", content, 3, frame_length)
+    artifact.write_bytes(content)
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("forged FRAME must fail before model construction")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(ValueError, match="frozen initialization children"):
+        create_p2_obb_detector(weights=artifact, nc=4)
+
+
 @pytest.mark.parametrize("indeterminate", ["multiple-pickles", "probe-limit"])
 def test_indeterminate_tagged_torch_archive_fails_before_models(
     tmp_path,
@@ -516,6 +610,211 @@ def test_indeterminate_tagged_torch_archive_fails_before_models(
 
     with pytest.raises(ValueError, match="frozen initialization"):
         create_p2_obb_detector(weights=artifact, nc=4)
+
+
+def test_marker_detection_never_reads_the_entire_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    ordinary = tmp_path / "ordinary.pt"
+    torch.save({"model": torch.nn.Linear(2, 2)}, ordinary)
+    read_paths = []
+
+    def reject_read_bytes(path):
+        read_paths.append(path)
+        raise AssertionError("marker detection must not read the whole file")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_read_bytes)
+
+    assert transfer_module._is_frozen_p2_initialization(ordinary) is False
+    assert read_paths == []
+
+
+@pytest.mark.parametrize(
+    "bound",
+    ["file-size", "member-count", "central-directory-size"],
+)
+def test_archive_metadata_bounds_precede_zipfile_construction(
+    tmp_path,
+    monkeypatch,
+    bound,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+    )
+    if bound == "file-size":
+        monkeypatch.setattr(
+            transfer_module,
+            "_CHECKPOINT_PROBE_FILE_LIMIT",
+            artifact.stat().st_size - 1,
+            raising=False,
+        )
+    elif bound == "member-count":
+        monkeypatch.setattr(
+            transfer_module,
+            "_ZIP_MEMBER_LIMIT",
+            1,
+            raising=False,
+        )
+    else:
+        monkeypatch.setattr(
+            transfer_module,
+            "_ZIP_CENTRAL_DIRECTORY_LIMIT",
+            1,
+            raising=False,
+        )
+    original_zipfile = zipfile.ZipFile
+    zipfile_calls = []
+
+    def recording_zipfile(*args, **kwargs):
+        zipfile_calls.append(args[0])
+        return original_zipfile(*args, **kwargs)
+
+    monkeypatch.setattr(transfer_module.zipfile, "ZipFile", recording_zipfile)
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+    assert zipfile_calls == []
+
+
+def test_central_directory_member_count_is_verified_before_zipfile(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+    )
+    content = bytearray(artifact.read_bytes())
+    end_of_central_directory = content.rfind(b"PK\x05\x06")
+    assert end_of_central_directory > 0
+    struct.pack_into("<HH", content, end_of_central_directory + 8, 1, 1)
+    artifact.write_bytes(content)
+    monkeypatch.setattr(transfer_module, "_ZIP_MEMBER_LIMIT", 1)
+    original_zipfile = zipfile.ZipFile
+    zipfile_calls = []
+
+    def recording_zipfile(*args, **kwargs):
+        zipfile_calls.append(args[0])
+        return original_zipfile(*args, **kwargs)
+
+    monkeypatch.setattr(transfer_module.zipfile, "ZipFile", recording_zipfile)
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+    assert zipfile_calls == []
+
+
+def test_compressed_pickle_member_bound_is_fail_closed(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "_ZIP_PICKLE_COMPRESSED_LIMIT",
+        1,
+        raising=False,
+    )
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+
+
+def test_short_pickle_member_read_is_indeterminate(tmp_path):
+    artifact = tmp_path / "ordinary.pt"
+    pickle_content = pickle.dumps({"model": "ordinary"}, protocol=2)
+    with zipfile.ZipFile(
+        artifact,
+        mode="w",
+        compression=zipfile.ZIP_STORED,
+    ) as archive:
+        archive.writestr("checkpoint/data.pkl", pickle_content)
+    content = bytearray(artifact.read_bytes())
+    with zipfile.ZipFile(artifact) as archive:
+        info = archive.getinfo("checkpoint/data.pkl")
+    struct.pack_into(
+        "<L",
+        content,
+        info.header_offset + 22,
+        len(pickle_content) + 1,
+    )
+    central_header = content.find(b"PK\x01\x02")
+    assert central_header > info.header_offset
+    struct.pack_into(
+        "<L",
+        content,
+        central_header + 24,
+        len(pickle_content) + 1,
+    )
+    artifact.write_bytes(content)
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+
+
+def test_pickle_member_read_failure_is_indeterminate(tmp_path, monkeypatch):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+    )
+    real_zipfile = zipfile.ZipFile
+
+    class ReadFailureZipFile:
+        def __init__(self, *args, **kwargs):
+            self.archive = real_zipfile(*args, **kwargs)
+
+        def __enter__(self):
+            self.archive.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.archive.__exit__(*args)
+
+        def infolist(self):
+            return self.archive.infolist()
+
+        def open(self, *_args, **_kwargs):
+            raise RuntimeError("synthetic bounded member read failure")
+
+    monkeypatch.setattr(
+        transfer_module.zipfile,
+        "ZipFile",
+        ReadFailureZipFile,
+    )
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+
+
+def test_symlink_checkpoint_probe_is_fail_closed(tmp_path):
+    target = tmp_path / "target.pt"
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        target,
+    )
+    artifact.symlink_to(target)
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
 
 
 def test_complete_tagged_artifact_with_unsupported_value_fails_before_models(
