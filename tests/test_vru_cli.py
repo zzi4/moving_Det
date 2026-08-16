@@ -2800,6 +2800,253 @@ def test_human_full_frame_clip_rejects_symlink_selected_support(tmp_path):
 
 
 @REQUIRES_TORCH
+@pytest.mark.parametrize(
+    "replacement_scope",
+    ("parent", "ancestor"),
+)
+def test_human_full_frame_clip_binds_open_directory_to_original_path_chain(
+    tmp_path,
+    monkeypatch,
+    replacement_scope,
+):
+    root = tmp_path / "root"
+    original_parent = root / "nas" / "site19_sequence" / "sequence_a"
+    original_parent.mkdir(parents=True)
+    center_path = original_parent / "31.jpg"
+    Image.new("RGB", (8, 8), color=(50, 60, 70)).save(center_path)
+    Image.new("RGB", (8, 8), color=(0, 0, 0)).save(
+        original_parent / "33.jpg"
+    )
+    if replacement_scope == "parent":
+        replacement_root = original_parent.with_name("replacement_sequence")
+        replacement_parent = replacement_root
+        moved_original = original_parent.with_name("original_sequence")
+        component_name = original_parent.name
+        swap_source = original_parent
+        swap_replacement = replacement_root
+    else:
+        replacement_root = root / "replacement_nas"
+        replacement_parent = (
+            replacement_root / "site19_sequence" / "sequence_a"
+        )
+        moved_original = root / "original_nas"
+        component_name = "nas"
+        swap_source = root / "nas"
+        swap_replacement = replacement_root
+    replacement_parent.mkdir(parents=True)
+    (replacement_parent / "31.jpg").write_bytes(center_path.read_bytes())
+    Image.new("RGB", (8, 8), color=(255, 255, 255)).save(
+        replacement_parent / "33.jpg"
+    )
+    expected_sha256 = hashlib.sha256(center_path.read_bytes()).hexdigest()
+    real_reject = vru_cli_module._reject_symlink_components
+    real_stat = vru_cli_module.os.stat
+    swapped = False
+
+    def swap_chain():
+        nonlocal swapped
+        if swapped:
+            return
+        swap_source.rename(moved_original)
+        swap_replacement.rename(swap_source)
+        swapped = True
+
+    def reject_then_swap(path):
+        real_reject(path)
+        if Path(path) == original_parent:
+            swap_chain()
+
+    def stat_then_swap(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if (
+            kwargs.get("dir_fd") is not None
+            and path == component_name
+            and not swapped
+        ):
+            swap_chain()
+        return result
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_reject_symlink_components",
+        reject_then_swap,
+    )
+    monkeypatch.setattr(vru_cli_module.os, "stat", stat_then_swap)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+    rejected = False
+    clip = None
+    try:
+        try:
+            clip = vru_cli_module._load_full_frame_clip(
+                cfg,
+                {
+                    "site": "site19",
+                    "sequence": "sequence_a",
+                    "center_frame": 31,
+                    "image_path": center_path,
+                    "image_sha256": expected_sha256,
+                },
+                offsets=(0, 2),
+                cache=SimpleNamespace(
+                    get=lambda key: SimpleNamespace(
+                        matrix=np.eye(2, 3, dtype=np.float32)
+                    )
+                ),
+            )
+        except WorkflowError:
+            rejected = True
+    finally:
+        if swapped:
+            swap_source.rename(swap_replacement)
+            moved_original.rename(swap_source)
+
+    if not rejected:
+        assert clip is not None
+        assert float(clip["frames"][1].mean()) < 0.1
+
+
+@REQUIRES_TORCH
+def test_human_full_frame_clip_rejects_symlink_parent_component(tmp_path):
+    real_nas = tmp_path / "real-nas"
+    image_dir = real_nas / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    (tmp_path / "nas").symlink_to(real_nas, target_is_directory=True)
+    center_via_symlink = (
+        tmp_path / "nas" / "site19_sequence" / "sequence_a" / "31.jpg"
+    )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    with pytest.raises(
+        WorkflowError,
+        match="canonical|symlink|unsafe|not a directory",
+    ):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "image_path": center_via_symlink,
+                "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+            },
+            offsets=(0,),
+            cache=None,
+        )
+
+
+@REQUIRES_TORCH
+def test_human_full_frame_clip_rejects_ancestor_rename_and_restore(
+    tmp_path,
+    monkeypatch,
+):
+    nas = tmp_path / "nas"
+    image_dir = nas / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    support = image_dir / "33.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    Image.new("RGB", (8, 8), color=(40, 50, 60)).save(support)
+    real_listdir = vru_cli_module.os.listdir
+    renamed = tmp_path / "renamed-nas"
+    changed = False
+
+    def listdir_after_rename_restore(path):
+        nonlocal changed
+        if isinstance(path, int) and not changed:
+            nas.rename(renamed)
+            renamed.rename(nas)
+            changed = True
+        return real_listdir(path)
+
+    monkeypatch.setattr(vru_cli_module.os, "listdir", listdir_after_rename_restore)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    with pytest.raises(WorkflowError, match="component changed|chain changed"):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "image_path": center,
+                "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+            },
+            offsets=(0, 2),
+            cache=SimpleNamespace(
+                get=lambda key: SimpleNamespace(
+                    matrix=np.eye(2, 3, dtype=np.float32)
+                )
+            ),
+        )
+
+    assert changed is True
+
+
+@REQUIRES_TORCH
+def test_human_path_chain_failures_do_not_leak_file_descriptors(tmp_path):
+    proc_fds = Path("/proc/self/fd")
+    if not proc_fds.is_dir():
+        pytest.skip("requires /proc file-descriptor accounting")
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+    record = {
+        "site": "site19",
+        "sequence": "sequence_a",
+        "center_frame": 31,
+        "image_path": center,
+        "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+    }
+    missing_chain_record = {
+        **record,
+        "image_path": image_dir / "missing" / "sequence" / "31.jpg",
+    }
+
+    with pytest.raises(WorkflowError, match="support frame is missing"):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            record,
+            offsets=(0, 2),
+            cache=None,
+        )
+    before = len(tuple(proc_fds.iterdir()))
+    for _ in range(100):
+        with pytest.raises(WorkflowError, match="support frame is missing"):
+            vru_cli_module._load_full_frame_clip(
+                cfg,
+                record,
+                offsets=(0, 2),
+                cache=None,
+            )
+        with pytest.raises(WorkflowError, match="path component"):
+            vru_cli_module._load_full_frame_clip(
+                cfg,
+                missing_chain_record,
+                offsets=(0,),
+                cache=None,
+            )
+    after = len(tuple(proc_fds.iterdir()))
+
+    assert after == before
+
+
+@REQUIRES_TORCH
 @pytest.mark.parametrize("center", (2926, 3216), ids=("first", "last"))
 def test_human_full_frame_clip_requires_nas_neighbors_outside_annotation_interval(
     tmp_path,

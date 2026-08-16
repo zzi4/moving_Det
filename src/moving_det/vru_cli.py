@@ -5596,37 +5596,57 @@ def _load_stable_human_rgb(
         raise WorkflowError(f"{label} is undecodable: {source}") from exc
 
 
-def _open_stable_human_image_directory(
-    center_path: Path,
+def _human_directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+
+
+def _open_human_directory_component(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_stat: os.stat_result | None = None,
 ) -> tuple[int, os.stat_result]:
-    source = Path(center_path)
-    parent = source.parent
-    if not source.is_absolute() or source.resolve(strict=False) != source:
-        raise WorkflowError(
-            "human center frame must use a canonical absolute path"
+    try:
+        before = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
         )
+    except OSError as exc:
+        raise WorkflowError(
+            f"human path component is missing or unsafe: {name}"
+        ) from exc
+    if not stat.S_ISDIR(before.st_mode):
+        raise WorkflowError(
+            f"human path component is not a directory: {name}"
+        )
+    if (
+        expected_stat is not None
+        and _stable_file_signature(before)
+        != _stable_file_signature(expected_stat)
+    ):
+        raise WorkflowError(f"human path component changed: {name}")
     descriptor = -1
     try:
-        _reject_symlink_components(parent)
         descriptor = os.open(
-            parent,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_DIRECTORY", 0),
+            name,
+            _human_directory_open_flags(),
+            dir_fd=parent_fd,
         )
         opened = os.fstat(descriptor)
-        path_stat = os.stat(parent, follow_symlinks=False)
         if (
             not stat.S_ISDIR(opened.st_mode)
-            or not stat.S_ISDIR(path_stat.st_mode)
-            or (opened.st_dev, opened.st_ino)
-            != (path_stat.st_dev, path_stat.st_ino)
+            or _stable_file_signature(opened)
+            != _stable_file_signature(before)
         ):
-            raise WorkflowError(
-                f"human image directory is missing or unsafe: {parent}"
-            )
-        return descriptor, opened
+            raise WorkflowError(f"human path component changed: {name}")
+        return descriptor, before
     except WorkflowError:
         if descriptor >= 0:
             os.close(descriptor)
@@ -5635,33 +5655,119 @@ def _open_stable_human_image_directory(
         if descriptor >= 0:
             os.close(descriptor)
         raise WorkflowError(
-            f"human image directory is missing or unsafe: {parent}"
+            f"human path component is missing or unsafe: {name}"
         ) from exc
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
 
 
-def _assert_stable_human_image_directory(
+def _open_stable_human_path_chain(
     center_path: Path,
-    descriptor: int,
-    opened: os.stat_result,
-) -> None:
-    parent = Path(center_path).parent
-    try:
-        finished = os.fstat(descriptor)
-        path_stat = os.stat(parent, follow_symlinks=False)
-        _reject_symlink_components(parent)
-    except (OSError, WorkflowError) as exc:
-        raise WorkflowError(
-            f"human image directory changed while reading: {parent}"
-        ) from exc
+) -> tuple[
+    int,
+    int,
+    os.stat_result,
+    tuple[tuple[str, os.stat_result], ...],
+]:
+    source = Path(center_path)
+    parent = source.parent
     if (
-        _stable_file_signature(finished) != _stable_file_signature(opened)
-        or not stat.S_ISDIR(path_stat.st_mode)
-        or (path_stat.st_dev, path_stat.st_ino)
-        != (opened.st_dev, opened.st_ino)
+        not source.is_absolute()
+        or ".." in source.parts
+        or parent == Path(".")
     ):
         raise WorkflowError(
-            f"human image directory changed while reading: {parent}"
+            "human center frame must use a canonical absolute path"
         )
+    root_fd = -1
+    current_fd = -1
+    try:
+        root_fd = os.open(Path("/"), _human_directory_open_flags())
+        root_stat = os.fstat(root_fd)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise WorkflowError("human path root is not a directory")
+        current_fd = root_fd
+        snapshots = []
+        for component in parent.parts[1:]:
+            next_fd, component_stat = _open_human_directory_component(
+                current_fd,
+                component,
+            )
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+            snapshots.append((component, component_stat))
+        if current_fd == root_fd:
+            current_fd = os.dup(root_fd)
+        return root_fd, current_fd, root_stat, tuple(snapshots)
+    except WorkflowError:
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise
+    except OSError as exc:
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise WorkflowError(
+            f"human image path chain is missing or unsafe: {parent}"
+        ) from exc
+    except BaseException:
+        if current_fd >= 0 and current_fd != root_fd:
+            os.close(current_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        raise
+
+
+def _assert_stable_human_path_chain(
+    center_path: Path,
+    root_fd: int,
+    directory_fd: int,
+    root_stat: os.stat_result,
+    snapshots: Sequence[tuple[str, os.stat_result]],
+) -> None:
+    parent = Path(center_path).parent
+    current_fd = root_fd
+    try:
+        current_root_stat = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(current_root_stat.st_mode)
+            or (current_root_stat.st_dev, current_root_stat.st_ino)
+            != (root_stat.st_dev, root_stat.st_ino)
+        ):
+            raise WorkflowError("human path root changed while reading")
+        for component, expected_stat in snapshots:
+            next_fd, _ = _open_human_directory_component(
+                current_fd,
+                component,
+                expected_stat=expected_stat,
+            )
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        walked = os.fstat(current_fd)
+        opened = os.fstat(directory_fd)
+        if (
+            _stable_file_signature(walked)
+            != _stable_file_signature(opened)
+        ):
+            raise WorkflowError(
+                f"human image path chain changed while reading: {parent}"
+            )
+    except WorkflowError:
+        raise
+    except OSError as exc:
+        raise WorkflowError(
+            f"human image path chain changed while reading: {parent}"
+        ) from exc
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
 
 
 def _resolve_human_jpeg_entries(
@@ -5753,9 +5859,12 @@ def _load_human_clip_rgb(
     if not _is_sha256(center_sha256):
         raise WorkflowError("human frame image_sha256 is invalid")
     frame_numbers = tuple(center_frame + offset for offset in offsets)
-    directory_fd, directory_stat = _open_stable_human_image_directory(
-        center_path
-    )
+    (
+        root_fd,
+        directory_fd,
+        root_stat,
+        path_snapshots,
+    ) = _open_stable_human_path_chain(center_path)
     try:
         resolved = _resolve_human_jpeg_entries(
             center_path,
@@ -5780,14 +5889,19 @@ def _load_human_clip_rgb(
                 expected_stat=entry_stat,
             )
             paths[offset] = path
-        _assert_stable_human_image_directory(
+        _assert_stable_human_path_chain(
             center_path,
+            root_fd,
             directory_fd,
-            directory_stat,
+            root_stat,
+            path_snapshots,
         )
         return arrays, paths
     finally:
-        os.close(directory_fd)
+        try:
+            os.close(directory_fd)
+        finally:
+            os.close(root_fd)
 
 
 def _load_full_frame_clip(
