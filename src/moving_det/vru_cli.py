@@ -5508,6 +5508,16 @@ def _stable_file_signature(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _directory_identity_signature(value: os.stat_result) -> tuple[int, ...]:
+    # Child entry changes mutate directory metadata without replacing the
+    # directory object that this path component names.
+    return (
+        stat.S_IFMT(value.st_mode),
+        value.st_dev,
+        value.st_ino,
+    )
+
+
 class _HumanFileDescriptorRegistry:
     def __init__(self) -> None:
         self._owned: dict[int, None] = {}
@@ -5532,12 +5542,12 @@ class _HumanFileDescriptorRegistry:
             return exc
         return None
 
-    def close_all(self) -> tuple[BaseException, ...]:
+    def close_all(self) -> tuple[tuple[int, BaseException], ...]:
         errors = []
         for descriptor in reversed(tuple(self._owned)):
             error = self.close(descriptor)
             if error is not None:
-                errors.append(error)
+                errors.append((descriptor, error))
         return tuple(errors)
 
 
@@ -5557,19 +5567,31 @@ def _close_owned_human_fd(
 def _cleanup_owned_human_fds(
     owned_fds: _HumanFileDescriptorRegistry,
     primary_error: BaseException | None,
-) -> None:
+) -> tuple[tuple[int, BaseException], ...]:
     errors = owned_fds.close_all()
     if not errors:
-        return
-    if primary_error is not None:
-        primary_error.add_note(
-            f"{len(errors)} additional human file-descriptor cleanup "
-            "error(s) were suppressed"
+        return errors
+    notes = []
+    for descriptor, error in errors:
+        errno_value = getattr(error, "errno", None)
+        errno_detail = (
+            f", errno={errno_value}" if errno_value is not None else ""
         )
-        return
-    raise WorkflowError(
+        notes.append(
+            "human file-descriptor cleanup error: "
+            f"fd={descriptor}, exception={type(error).__name__}"
+            f"{errno_detail}, message={error}"
+        )
+    if primary_error is not None:
+        for note in notes:
+            primary_error.add_note(note)
+        return errors
+    aggregate = WorkflowError(
         f"failed to close {len(errors)} owned human path descriptor(s)"
-    ) from errors[0]
+    )
+    for note in notes:
+        aggregate.add_note(note)
+    raise aggregate
 
 
 def _load_stable_human_rgb(
@@ -5721,8 +5743,8 @@ def _open_human_directory_component(
         )
     if (
         expected_stat is not None
-        and _stable_file_signature(before)
-        != _stable_file_signature(expected_stat)
+        and _directory_identity_signature(before)
+        != _directory_identity_signature(expected_stat)
     ):
         raise WorkflowError(f"human path component changed: {name}")
     try:
@@ -5736,8 +5758,8 @@ def _open_human_directory_component(
         opened = os.fstat(descriptor)
         if (
             not stat.S_ISDIR(opened.st_mode)
-            or _stable_file_signature(opened)
-            != _stable_file_signature(before)
+            or _directory_identity_signature(opened)
+            != _directory_identity_signature(before)
         ):
             raise WorkflowError(f"human path component changed: {name}")
         return descriptor, before
@@ -5841,8 +5863,8 @@ def _assert_stable_human_path_chain(
         walked = os.fstat(current_fd)
         opened = os.fstat(directory_fd)
         if (
-            _stable_file_signature(walked)
-            != _stable_file_signature(opened)
+            _directory_identity_signature(walked)
+            != _directory_identity_signature(opened)
         ):
             raise WorkflowError(
                 f"human image path chain changed while reading: {parent}"
@@ -5989,6 +6011,25 @@ def _load_human_clip_rgb(
                 owned_fds=owned_fds,
             )
             paths[offset] = path
+        # Recheck only the requested numeric identities.  This preserves the
+        # alias-uniqueness contract without treating unrelated entries as a
+        # change to bytes already consumed from pinned image descriptors.
+        final_resolved = _resolve_human_jpeg_entries(
+            center_path,
+            center_frame=center_frame,
+            frame_numbers=frame_numbers,
+            directory_fd=directory_fd,
+        )
+        for frame, (path, entry_stat) in resolved.items():
+            final_path, final_entry_stat = final_resolved[frame]
+            if (
+                final_path.name != path.name
+                or _stable_file_signature(final_entry_stat)
+                != _stable_file_signature(entry_stat)
+            ):
+                raise WorkflowError(
+                    "human image directory entries changed while reading"
+                )
         _assert_stable_human_path_chain(
             center_path,
             root_fd,

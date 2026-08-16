@@ -2739,6 +2739,109 @@ def test_human_full_frame_clip_rejects_duplicate_numeric_support_alias(tmp_path)
         )
 
 
+@pytest.mark.parametrize(
+    "mutation_scope",
+    ("shared-ancestor", "image-directory"),
+)
+def test_human_clip_ignores_unrelated_directory_entry_changes(
+    tmp_path,
+    monkeypatch,
+    mutation_scope,
+):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    support = image_dir / "33.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    Image.new("RGB", (8, 8), color=(40, 50, 60)).save(support)
+    record = {
+        "image_path": center,
+        "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+    }
+    real_loader = vru_cli_module._load_stable_human_rgb
+    mutation_path = (
+        tmp_path.with_name(f"{tmp_path.name}-unrelated-sibling")
+        if mutation_scope == "shared-ancestor"
+        else image_dir / "999999.jpg"
+    )
+    mutated = False
+
+    def load_then_create_unrelated_entry(*args, **kwargs):
+        nonlocal mutated
+        result = real_loader(*args, **kwargs)
+        if not mutated:
+            if mutation_scope == "shared-ancestor":
+                mutation_path.mkdir()
+            else:
+                mutation_path.write_bytes(b"unrelated non-requested entry")
+            mutated = True
+        return result
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_stable_human_rgb",
+        load_then_create_unrelated_entry,
+    )
+    try:
+        arrays, paths = vru_cli_module._load_human_clip_rgb(
+            record,
+            center_frame=31,
+            offsets=(0, 2),
+        )
+    finally:
+        if mutation_path.exists():
+            if mutation_scope == "shared-ancestor":
+                mutation_path.rmdir()
+            else:
+                mutation_path.unlink()
+
+    assert mutated is True
+    assert tuple(arrays) == (0, 2)
+    assert paths == {0: center, 2: support}
+
+
+def test_human_clip_rejects_duplicate_numeric_alias_added_while_reading(
+    tmp_path,
+    monkeypatch,
+):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    support = image_dir / "33.jpg"
+    duplicate = image_dir / "000031.JPG"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    Image.new("RGB", (8, 8), color=(40, 50, 60)).save(support)
+    record = {
+        "image_path": center,
+        "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+    }
+    real_loader = vru_cli_module._load_stable_human_rgb
+    added = False
+
+    def load_then_add_duplicate(*args, **kwargs):
+        nonlocal added
+        result = real_loader(*args, **kwargs)
+        if not added:
+            duplicate.write_bytes(center.read_bytes())
+            added = True
+        return result
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_stable_human_rgb",
+        load_then_add_duplicate,
+    )
+
+    with pytest.raises(WorkflowError, match="multiple JPEG aliases"):
+        vru_cli_module._load_human_clip_rgb(
+            record,
+            center_frame=31,
+            offsets=(0, 2),
+        )
+
+    assert added is True
+
+
 @REQUIRES_TORCH
 @pytest.mark.parametrize("name", ("３１.jpg", "frame31.jpg", "31.png"))
 def test_human_full_frame_clip_rejects_invalid_center_jpeg_identity(
@@ -3123,8 +3226,15 @@ def test_human_cleanup_close_errors_do_not_mask_original_security_error(
     def close_then_raise(descriptor):
         real_close(descriptor)
         if inject_close_errors:
-            failed_closes.append(descriptor)
-            raise OSError(errno.EINTR, "injected cleanup close interruption")
+            if not failed_closes:
+                error = OSError(
+                    errno.EINTR,
+                    "injected cleanup close interruption",
+                )
+            else:
+                error = RuntimeError("injected second cleanup close failure")
+            failed_closes.append((descriptor, error))
+            raise error
 
     monkeypatch.setattr(vru_cli_module.os, "listdir", listdir_then_arm_close_fault)
     monkeypatch.setattr(vru_cli_module.os, "close", close_then_raise)
@@ -3143,10 +3253,86 @@ def test_human_cleanup_close_errors_do_not_mask_original_security_error(
     after = len(tuple(proc_fds.iterdir()))
     assert len(failed_closes) == 2
     assert after == before
-    assert any(
-        "additional human file-descriptor cleanup" in note
-        for note in getattr(raised.value, "__notes__", ())
-    )
+    notes = getattr(raised.value, "__notes__", ())
+    assert len(notes) == 2
+    for (descriptor, error), note in zip(failed_closes, notes, strict=True):
+        assert f"fd={descriptor}" in note
+        assert f"exception={type(error).__name__}" in note
+        assert f"message={error}" in note
+    assert f"errno={errno.EINTR}" in notes[0]
+    assert "errno=" not in notes[1]
+
+
+def test_human_cleanup_aggregates_every_close_error_without_reclose_or_leak(
+    tmp_path,
+    monkeypatch,
+):
+    proc_fds = Path("/proc/self/fd")
+    if not proc_fds.is_dir():
+        pytest.skip("requires /proc file-descriptor accounting")
+    real_open = vru_cli_module.os.open
+    real_close = vru_cli_module.os.close
+    baseline = len(tuple(proc_fds.iterdir()))
+    sources = []
+    probes = []
+    registry = vru_cli_module._HumanFileDescriptorRegistry()
+    for index in range(2):
+        source = tmp_path / f"owned-{index}"
+        probe = tmp_path / f"probe-{index}"
+        source.write_bytes(f"source-{index}".encode())
+        probe.write_bytes(f"probe-{index}".encode())
+        sources.append(registry.own(real_open(source, vru_cli_module.os.O_RDONLY)))
+        probes.append(probe)
+    failures = []
+    reused = []
+
+    def close_then_reuse_and_raise(descriptor):
+        real_close(descriptor)
+        probe_fd = real_open(
+            probes[len(failures)],
+            vru_cli_module.os.O_RDONLY | vru_cli_module.os.O_CLOEXEC,
+        )
+        reused.append((probe_fd, vru_cli_module.os.fstat(probe_fd).st_ino))
+        if not failures:
+            error = PermissionError(
+                errno.EACCES,
+                "injected aggregate permission failure",
+            )
+        else:
+            error = RuntimeError("injected aggregate runtime failure")
+        failures.append((descriptor, error))
+        raise error
+
+    monkeypatch.setattr(vru_cli_module.os, "close", close_then_reuse_and_raise)
+    try:
+        with pytest.raises(
+            WorkflowError,
+            match="failed to close 2 owned human path descriptor",
+        ) as raised:
+            vru_cli_module._cleanup_owned_human_fds(registry, None)
+
+        assert len(failures) == 2
+        assert registry.close_all() == ()
+        notes = getattr(raised.value, "__notes__", ())
+        assert len(notes) == 2
+        for (descriptor, error), note in zip(failures, notes, strict=True):
+            assert f"fd={descriptor}" in note
+            assert f"exception={type(error).__name__}" in note
+            assert f"message={error}" in note
+        assert f"errno={errno.EACCES}" in notes[0]
+        assert "errno=" not in notes[1]
+        for descriptor, expected_inode in reused:
+            assert vru_cli_module.os.fstat(descriptor).st_ino == expected_inode
+    finally:
+        monkeypatch.setattr(vru_cli_module.os, "close", real_close)
+        for descriptor in {*sources, *(fd for fd, _ in reused)}:
+            try:
+                real_close(descriptor)
+            except OSError as exc:
+                if exc.errno != errno.EBADF:
+                    raise
+
+    assert len(tuple(proc_fds.iterdir())) == baseline
 
 
 @REQUIRES_TORCH
@@ -3189,7 +3375,6 @@ def test_human_full_frame_clip_binds_open_directory_to_original_path_chain(
         replacement_parent / "33.jpg"
     )
     expected_sha256 = hashlib.sha256(center_path.read_bytes()).hexdigest()
-    real_reject = vru_cli_module._reject_symlink_components
     real_stat = vru_cli_module.os.stat
     swapped = False
 
@@ -3201,11 +3386,6 @@ def test_human_full_frame_clip_binds_open_directory_to_original_path_chain(
         swap_replacement.rename(swap_source)
         swapped = True
 
-    def reject_then_swap(path):
-        real_reject(path)
-        if Path(path) == original_parent:
-            swap_chain()
-
     def stat_then_swap(path, *args, **kwargs):
         result = real_stat(path, *args, **kwargs)
         if (
@@ -3216,21 +3396,14 @@ def test_human_full_frame_clip_binds_open_directory_to_original_path_chain(
             swap_chain()
         return result
 
-    monkeypatch.setattr(
-        vru_cli_module,
-        "_reject_symlink_components",
-        reject_then_swap,
-    )
     monkeypatch.setattr(vru_cli_module.os, "stat", stat_then_swap)
     cfg = replace(
         load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
         image_root=tmp_path / "legacy-images",
     )
-    rejected = False
-    clip = None
     try:
-        try:
-            clip = vru_cli_module._load_full_frame_clip(
+        with pytest.raises(WorkflowError, match="component changed"):
+            vru_cli_module._load_full_frame_clip(
                 cfg,
                 {
                     "site": "site19",
@@ -3246,16 +3419,12 @@ def test_human_full_frame_clip_binds_open_directory_to_original_path_chain(
                     )
                 ),
             )
-        except WorkflowError:
-            rejected = True
     finally:
         if swapped:
             swap_source.rename(swap_replacement)
             moved_original.rename(swap_source)
 
-    if not rejected:
-        assert clip is not None
-        assert float(clip["frames"][1].mean()) < 0.1
+    assert swapped is True
 
 
 @REQUIRES_TORCH
@@ -3293,7 +3462,7 @@ def test_human_full_frame_clip_rejects_symlink_parent_component(tmp_path):
 
 
 @REQUIRES_TORCH
-def test_human_full_frame_clip_rejects_ancestor_rename_and_restore(
+def test_human_full_frame_clip_accepts_ancestor_rename_and_restore(
     tmp_path,
     monkeypatch,
 ):
@@ -3322,25 +3491,26 @@ def test_human_full_frame_clip_rejects_ancestor_rename_and_restore(
         image_root=tmp_path / "legacy-images",
     )
 
-    with pytest.raises(WorkflowError, match="component changed|chain changed"):
-        vru_cli_module._load_full_frame_clip(
-            cfg,
-            {
-                "site": "site19",
-                "sequence": "sequence_a",
-                "center_frame": 31,
-                "image_path": center,
-                "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
-            },
-            offsets=(0, 2),
-            cache=SimpleNamespace(
-                get=lambda key: SimpleNamespace(
-                    matrix=np.eye(2, 3, dtype=np.float32)
-                )
-            ),
-        )
+    clip = vru_cli_module._load_full_frame_clip(
+        cfg,
+        {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "center_frame": 31,
+            "image_path": center,
+            "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+        },
+        offsets=(0, 2),
+        cache=SimpleNamespace(
+            get=lambda key: SimpleNamespace(
+                matrix=np.eye(2, 3, dtype=np.float32)
+            )
+        ),
+    )
 
     assert changed is True
+    assert float(clip["frames"][0].mean()) > 0.0
+    assert float(clip["frames"][1].mean()) > 0.0
 
 
 @REQUIRES_TORCH
