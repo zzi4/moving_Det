@@ -275,6 +275,12 @@ def _cfg_required(cfg: object, field: str) -> object:
     return getattr(cfg, field)
 
 
+def _cfg_optional(cfg: object, field: str) -> object | None:
+    if isinstance(cfg, Mapping):
+        return cfg.get(field)
+    return getattr(cfg, field, None)
+
+
 def _serialized_frame_key(value: object) -> FrameKey:
     if isinstance(value, FrameKey):
         return value
@@ -351,13 +357,23 @@ def _evaluation_scope(
             raise ValueError(
                 "validation threshold selection requires the validation split"
             )
-        evidence = load_validation_threshold(
-            _cfg_required(cfg, "threshold_path"),
-            model_name=_cfg_required(cfg, "model_name"),
-            manifest_sha256=_cfg_required(cfg, "manifest_sha256"),
-            checkpoint_sha256=_cfg_required(cfg, "checkpoint_sha256"),
-            evaluation_split="test",
-        )
+        pinned_evidence = _cfg_optional(cfg, "threshold_evidence")
+        if pinned_evidence is None:
+            evidence = load_validation_threshold(
+                _cfg_required(cfg, "threshold_path"),
+                model_name=_cfg_required(cfg, "model_name"),
+                manifest_sha256=_cfg_required(cfg, "manifest_sha256"),
+                checkpoint_sha256=_cfg_required(cfg, "checkpoint_sha256"),
+                evaluation_split="test",
+            )
+        else:
+            evidence = _validated_threshold_payload(
+                pinned_evidence,
+                model_name=_cfg_required(cfg, "model_name"),
+                manifest_sha256=_cfg_required(cfg, "manifest_sha256"),
+                checkpoint_sha256=_cfg_required(cfg, "checkpoint_sha256"),
+                evaluation_split="test",
+            )
         fixed_prediction_rows = tuple(
             item
             for item in prediction_rows
@@ -1289,8 +1305,6 @@ def load_validation_threshold(
     checkpoint_sha256: str,
     evaluation_split: str,
 ) -> ThresholdEvidence:
-    if evaluation_split != "test":
-        raise ValueError("frozen validation threshold is only loaded for test")
     source = Path(path)
     if source.is_symlink() or not source.is_file():
         raise ValueError("threshold evidence is missing or not a regular file")
@@ -1299,10 +1313,29 @@ def load_validation_threshold(
             payload = json.load(stream, object_pairs_hook=_strict_json_object)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("threshold evidence is malformed") from exc
-    if not isinstance(payload, dict) or set(payload) != _THRESHOLD_FIELDS:
+    return _validated_threshold_payload(
+        payload,
+        model_name=model_name,
+        manifest_sha256=manifest_sha256,
+        checkpoint_sha256=checkpoint_sha256,
+        evaluation_split=evaluation_split,
+    )
+
+
+def _validated_threshold_payload(
+    payload: object,
+    *,
+    model_name: str,
+    manifest_sha256: str,
+    checkpoint_sha256: str,
+    evaluation_split: str,
+) -> ThresholdEvidence:
+    if evaluation_split != "test":
+        raise ValueError("frozen validation threshold is only loaded for test")
+    if not isinstance(payload, Mapping) or set(payload) != _THRESHOLD_FIELDS:
         raise ValueError("threshold evidence fields are invalid")
     try:
-        evidence = ThresholdEvidence(**payload)
+        evidence = ThresholdEvidence(**dict(payload))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"threshold evidence is malformed: {exc}") from exc
     if evidence.model_name != model_name:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -962,6 +962,56 @@ def test_primary_test_evaluation_requires_and_enforces_frozen_threshold(
                 checkpoint_sha256="b" * 64,
             ),
         )
+
+
+def test_test_evaluation_prefers_one_validated_threshold_payload_over_path(
+    tmp_path,
+):
+    path = tmp_path / "threshold.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model_name": "baseline",
+                "split": "validation",
+                "manifest_sha256": "a" * 64,
+                "checkpoint_sha256": "b" * 64,
+                "threshold": 0.99,
+                "f1_riou_025": 1.0,
+                "false_detections_per_frame": 0.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    pinned = MappingProxyType(
+        {
+            "schema_version": 1,
+            "model_name": "baseline",
+            "split": "validation",
+            "manifest_sha256": "a" * 64,
+            "checkpoint_sha256": "b" * 64,
+            "threshold": 0.5,
+            "f1_riou_025": 0.8,
+            "false_detections_per_frame": 0.0,
+        }
+    )
+    cfg = _cfg(
+        evaluation_split="test",
+        threshold_path=path,
+        threshold_evidence=pinned,
+        model_name="baseline",
+        manifest_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+    )
+    predictions = (
+        _pred(1, confidence=0.6),
+        _pred(1, cx=100.0, confidence=0.4),
+    )
+
+    metrics = evaluate_temporal_obb(predictions, (_gt(1),), cfg)
+
+    assert metrics["threshold_evidence"]["threshold"] == 0.5
+    assert metrics["prediction_count_fixed"] == 1
 
 
 def test_test_ap_uses_full_ranking_but_fixed_metrics_use_frozen_threshold(

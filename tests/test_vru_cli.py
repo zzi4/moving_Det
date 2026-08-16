@@ -6,9 +6,10 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import stat
 import subprocess
 import threading
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 from PIL import Image
@@ -1059,8 +1060,12 @@ def test_human_benchmark_path_and_motion_flag_reach_evaluator_request(
     _manifest_children(manifest, [])
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"synthetic checkpoint")
-    threshold = tmp_path / "threshold.json"
-    threshold.write_bytes(b"{}\n")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+        model_name="mg_vtod",
+    )
     benchmark = tmp_path / "human-benchmark"
     benchmark.mkdir()
     output = tmp_path / "human-evaluation"
@@ -2498,6 +2503,9 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
         manifest_sha256="a" * 64,
         checkpoint_sha256="b" * 64,
         human_benchmark=tmp_path / "human-benchmark",
+        threshold_evidence=MappingProxyType(
+            json.loads(threshold.read_text(encoding="utf-8"))
+        ),
     )
 
     class HumanModel(torch.nn.Module):
@@ -3986,6 +3994,9 @@ def test_overlapping_detection_and_continuity_frame_is_inferred_and_serialized_o
         alignment_cache=None,
         manifest_sha256="a" * 64,
         checkpoint_sha256="b" * 64,
+        threshold_evidence=MappingProxyType(
+            json.loads(threshold_path.read_text(encoding="utf-8"))
+        ),
     )
     model = torch.nn.Identity()
     inference_calls = []
@@ -4214,6 +4225,9 @@ def test_test_prediction_artifacts_apply_the_exact_frozen_threshold(tmp_path):
         alignment_cache=None,
         manifest_sha256=manifest_sha256,
         checkpoint_sha256=checkpoint_sha256,
+        threshold_evidence=MappingProxyType(
+            json.loads(threshold_path.read_text(encoding="utf-8"))
+        ),
     )
 
     selected = _predictions_for_artifact(predictions, request)
@@ -5478,6 +5492,80 @@ def _evaluation_bundle(
     )
 
 
+def _publish_strict_validation_run(
+    root: Path,
+    *,
+    manifest: Path,
+    checkpoint: Path,
+    model_name: str = "baseline",
+    threshold: float = 0.42,
+) -> Path:
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=root.parent / "images",
+        metadata_root=root.parent / "metadata",
+        output_root=root.parent / "runs",
+    )
+    arguments = [
+        "evaluate",
+        "--model",
+        model_name,
+        "--checkpoint",
+        str(checkpoint),
+        "--manifest",
+        str(manifest),
+        "--split",
+        "validation",
+        "--output",
+        str(root),
+    ]
+    if model_name != "baseline":
+        arguments.extend(
+            ("--alignment-cache", str(root.parent / "alignment-cache"))
+        )
+    args = build_parser().parse_args(arguments)
+
+    def evaluator(request):
+        bundle = _evaluation_bundle(
+            validation=True,
+            manifest_sha256=request.manifest_sha256,
+            checkpoint_sha256=request.checkpoint_sha256,
+        )
+        if model_name == "baseline":
+            selected = bundle
+        else:
+            selected = replace(
+                bundle,
+                threshold_evidence={
+                    **dict(bundle.threshold_evidence),
+                    "model_name": model_name,
+                },
+                alignment_cache_sha256="d" * 64,
+            )
+        return replace(
+            selected,
+            threshold_evidence={
+                **dict(selected.threshold_evidence),
+                "threshold": threshold,
+            },
+        )
+
+    run_evaluate(
+        args,
+        config_loader=lambda _path: cfg,
+        evaluator=evaluator,
+        provenance_collector=lambda *_: {
+            "git_commit": "f" * 40,
+            "git_dirty": False,
+            "environment": _strict_run_environment(),
+            "started_at_utc": "2026-08-07T02:00:00.000000Z",
+            "finished_at_utc": "2026-08-07T02:00:01.000000Z",
+            "duration_seconds": 1.0,
+        },
+    )
+    return root / "threshold.json"
+
+
 def _evaluation_request(tmp_path: Path) -> EvaluationRequest:
     cfg = replace(
         load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
@@ -6718,6 +6806,401 @@ def test_evaluate_validation_writes_deterministic_strict_artifact_schema(
     )
 
 
+def _test_evaluation_args(
+    *,
+    manifest: Path,
+    checkpoint: Path,
+    threshold: Path,
+    output: Path,
+    model_name: str = "baseline",
+):
+    arguments = [
+        "evaluate",
+        "--model",
+        model_name,
+        "--checkpoint",
+        str(checkpoint),
+        "--manifest",
+        str(manifest),
+        "--split",
+        "test",
+        "--threshold",
+        str(threshold),
+        "--output",
+        str(output),
+    ]
+    if model_name != "baseline":
+        arguments.extend(
+            ("--alignment-cache", str(output.parent / "alignment-cache"))
+        )
+    return build_parser().parse_args(arguments)
+
+
+def _fixed_test_provenance(*_args):
+    return {
+        "git_commit": "f" * 40,
+        "git_dirty": False,
+        "environment": _strict_run_environment(),
+        "started_at_utc": "2026-08-07T02:00:00.000000Z",
+        "finished_at_utc": "2026-08-07T02:00:01.000000Z",
+        "duration_seconds": 1.0,
+    }
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("bare", "copied", "edited", "changed-run-digest", "wrong-checkpoint"),
+)
+def test_test_evaluation_authenticates_complete_validation_threshold_run(
+    tmp_path,
+    defect,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    if defect == "bare":
+        threshold = tmp_path / "threshold.json"
+        threshold.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "model_name": "baseline",
+                    "split": "validation",
+                    "manifest_sha256": _manifest_fingerprint(manifest),
+                    "checkpoint_sha256": hashlib.sha256(
+                        checkpoint.read_bytes()
+                    ).hexdigest(),
+                    "threshold": 0.01,
+                    "f1_riou_025": 1.0,
+                    "false_detections_per_frame": 0.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+    else:
+        validation_checkpoint = checkpoint
+        if defect == "wrong-checkpoint":
+            validation_checkpoint = tmp_path / "other.pt"
+            validation_checkpoint.write_bytes(b"different checkpoint")
+        threshold = _publish_strict_validation_run(
+            tmp_path / "validation",
+            manifest=manifest,
+            checkpoint=validation_checkpoint,
+            threshold=0.42,
+        )
+        if defect == "copied":
+            copied = tmp_path / "copied" / "threshold.json"
+            copied.parent.mkdir()
+            copied.write_bytes(threshold.read_bytes())
+            threshold = copied
+        elif defect == "edited":
+            payload = json.loads(threshold.read_text(encoding="utf-8"))
+            payload["threshold"] = 0.99
+            threshold.write_text(
+                json.dumps(payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        elif defect == "changed-run-digest":
+            run_path = threshold.parent / "run.json"
+            run = json.loads(run_path.read_text(encoding="utf-8"))
+            run["artifact_sha256"]["threshold.json"] = "0" * 64
+            run_path.write_text(
+                json.dumps(run, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+    output = tmp_path / "test-run"
+    args = _test_evaluation_args(
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=threshold,
+        output=output,
+    )
+
+    with pytest.raises(WorkflowError, match="threshold|validation|checkpoint"):
+        run_evaluate(
+            args,
+            config_loader=lambda _path: replace(
+                load_temporal_config(
+                    Path("configs/vrud-temporal-obb.yaml")
+                ),
+                image_root=tmp_path / "images",
+                metadata_root=tmp_path / "metadata",
+                output_root=tmp_path / "runs",
+            ),
+            evaluator=lambda _request: _evaluation_bundle(validation=False),
+            provenance_collector=_fixed_test_provenance,
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ("manifest", "checkpoint", "threshold-run"),
+)
+def test_evaluate_consumes_one_private_snapshot_after_source_replacement(
+    tmp_path,
+    replacement,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint bytes")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=0.5,
+    )
+    original_manifest_sha256 = _manifest_fingerprint(manifest)
+    original_checkpoint_sha256 = hashlib.sha256(
+        checkpoint.read_bytes()
+    ).hexdigest()
+    original_threshold_sha256 = hashlib.sha256(
+        threshold.read_bytes()
+    ).hexdigest()
+    output = tmp_path / "test-run"
+    args = _test_evaluation_args(
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=threshold,
+        output=output,
+    )
+    observed = {}
+
+    def evaluator(request):
+        observed["request"] = request
+        observed["snapshot_root"] = request.manifest_dir.parent
+        assert request.manifest_dir != manifest
+        assert request.checkpoint != checkpoint
+        assert request.threshold_path != threshold
+        assert stat.S_IMODE(request.manifest_dir.parent.stat().st_mode) == 0o700
+        if replacement == "manifest":
+            replacement_path = manifest / "test.jsonl.replacement"
+            replacement_path.write_bytes(b'{"replacement":true}\n')
+            replacement_path.replace(manifest / "test.jsonl")
+        elif replacement == "checkpoint":
+            replacement_path = tmp_path / "replacement.pt"
+            replacement_path.write_bytes(b"replacement checkpoint bytes")
+            replacement_path.replace(checkpoint)
+        else:
+            payload = json.loads(threshold.read_text(encoding="utf-8"))
+            payload["threshold"] = 0.99
+            replacement_path = threshold.with_name("replacement.json")
+            replacement_path.write_text(
+                json.dumps(payload, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            replacement_path.replace(threshold)
+            run_path = threshold.parent / "run.json"
+            run = json.loads(run_path.read_text(encoding="utf-8"))
+            run["artifact_sha256"]["threshold.json"] = hashlib.sha256(
+                threshold.read_bytes()
+            ).hexdigest()
+            run_path.write_text(
+                json.dumps(run, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        assert _manifest_fingerprint(request.manifest_dir) == (
+            original_manifest_sha256
+        )
+        assert hashlib.sha256(request.checkpoint.read_bytes()).hexdigest() == (
+            original_checkpoint_sha256
+        )
+        assert hashlib.sha256(request.threshold_path.read_bytes()).hexdigest() == (
+            original_threshold_sha256
+        )
+        assert request.threshold_evidence["threshold"] == 0.5
+        assert isinstance(request.threshold_evidence, MappingProxyType)
+        bundle = _evaluation_bundle(validation=False)
+        low = {
+            **dict(bundle.predictions[0]),
+            "confidence": 0.2,
+            "obb": [80.0, 48.0, 20.0, 8.0, 0.2],
+        }
+        return replace(bundle, predictions=(low, *bundle.predictions))
+
+    run_evaluate(
+        args,
+        config_loader=lambda _path: replace(
+            load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+            image_root=tmp_path / "images",
+            metadata_root=tmp_path / "metadata",
+            output_root=tmp_path / "runs",
+        ),
+        evaluator=evaluator,
+        provenance_collector=_fixed_test_provenance,
+    )
+
+    run = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    predictions = [
+        json.loads(line)
+        for line in (output / "predictions.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert run["manifest_sha256"] == original_manifest_sha256
+    assert run["checkpoint_sha256"] == original_checkpoint_sha256
+    assert run["threshold_sha256"] == original_threshold_sha256
+    assert run["threshold_source"] == str(threshold.resolve())
+    assert [row["confidence"] for row in predictions] == [0.9]
+    assert not observed["snapshot_root"].exists()
+
+
+def test_evaluation_snapshot_cleanup_runs_when_evaluator_raises(tmp_path):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    output = tmp_path / "test-run"
+    args = _test_evaluation_args(
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=threshold,
+        output=output,
+    )
+    snapshot_roots = []
+
+    def fail(request):
+        snapshot_roots.append(request.manifest_dir.parent)
+        raise RuntimeError("injected evaluator failure")
+
+    with pytest.raises(RuntimeError, match="injected evaluator failure"):
+        run_evaluate(
+            args,
+            config_loader=lambda _path: replace(
+                load_temporal_config(
+                    Path("configs/vrud-temporal-obb.yaml")
+                ),
+                image_root=tmp_path / "images",
+                metadata_root=tmp_path / "metadata",
+                output_root=tmp_path / "runs",
+            ),
+            evaluator=fail,
+        )
+
+    assert len(snapshot_roots) == 1
+    assert not snapshot_roots[0].exists()
+    assert not output.exists()
+
+
+def test_test_threshold_requires_exact_threshold_json_lexical_name(tmp_path):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    renamed = threshold.with_name("cutoff.json")
+    renamed.write_bytes(threshold.read_bytes())
+    args = _test_evaluation_args(
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=renamed,
+        output=tmp_path / "test-run",
+    )
+
+    with pytest.raises(WorkflowError, match="exactly threshold.json"):
+        run_evaluate(
+            args,
+            config_loader=lambda _path: replace(
+                load_temporal_config(
+                    Path("configs/vrud-temporal-obb.yaml")
+                ),
+                image_root=tmp_path / "images",
+                metadata_root=tmp_path / "metadata",
+                output_root=tmp_path / "runs",
+            ),
+            evaluator=lambda _request: _evaluation_bundle(validation=False),
+        )
+
+
+def test_evaluation_snapshot_failure_cleans_descriptors_and_private_temp(
+    tmp_path,
+    monkeypatch,
+):
+    proc_fds = Path("/proc/self/fd")
+    if not proc_fds.is_dir():
+        pytest.skip("requires /proc file-descriptor accounting")
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    bare_threshold = tmp_path / "threshold.json"
+    bare_threshold.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(vru_cli_module.tempfile, "tempdir", str(tmp_path))
+    baseline_fds = len(tuple(proc_fds.iterdir()))
+
+    for _ in range(20):
+        with pytest.raises(WorkflowError, match="evaluation run|threshold"):
+            with vru_cli_module._snapshot_evaluation_inputs(
+                manifest,
+                checkpoint,
+                bare_threshold,
+                {"model_name": "baseline"},
+            ):
+                pytest.fail("invalid threshold must not yield a snapshot")
+
+    assert len(tuple(proc_fds.iterdir())) == baseline_fds
+    assert not list(tmp_path.glob("moving-det-evaluation-*"))
+
+
+def test_evaluation_descriptor_close_error_never_retries_reused_fd(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "source"
+    probe = tmp_path / "probe"
+    source.write_bytes(b"source")
+    probe.write_bytes(b"probe")
+    real_open = vru_cli_module.os.open
+    real_close = vru_cli_module.os.close
+    registry = vru_cli_module._EvaluationFileDescriptorRegistry()
+    owned = registry.own(
+        real_open(source, vru_cli_module.os.O_RDONLY),
+        "source",
+    )
+    reused = []
+
+    def close_then_reuse_and_raise(descriptor):
+        real_close(descriptor)
+        probe_fd = real_open(
+            probe,
+            vru_cli_module.os.O_RDONLY | vru_cli_module.os.O_CLOEXEC,
+        )
+        reused.append(probe_fd)
+        raise OSError(errno.EINTR, "injected ambiguous close")
+
+    monkeypatch.setattr(vru_cli_module.os, "close", close_then_reuse_and_raise)
+    try:
+        error = registry.close(owned)
+
+        assert isinstance(error, OSError)
+        assert registry.close_all() == ()
+        assert len(reused) == 1
+        assert vru_cli_module.os.fstat(reused[0]).st_ino == probe.stat().st_ino
+    finally:
+        monkeypatch.setattr(vru_cli_module.os, "close", real_close)
+        for descriptor in reused:
+            real_close(descriptor)
+
+
+def test_evaluation_snapshot_requires_nonzero_write_open_flag(monkeypatch):
+    monkeypatch.setattr(vru_cli_module.os, "O_WRONLY", 0)
+
+    with pytest.raises(WorkflowError, match="O_WRONLY"):
+        vru_cli_module._evaluation_snapshot_open_flags()
+
+
 def test_evaluate_test_records_frozen_threshold_source_and_never_reselects(
     tmp_path,
 ):
@@ -6725,27 +7208,11 @@ def test_evaluate_test_records_frozen_threshold_source_and_never_reselects(
     _manifest_children(manifest, [])
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"synthetic checkpoint")
-    threshold = tmp_path / "threshold.json"
-    threshold.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "model_name": "baseline",
-                "split": "validation",
-                "manifest_sha256": _manifest_fingerprint(manifest),
-                "checkpoint_sha256": hashlib.sha256(
-                    checkpoint.read_bytes()
-                ).hexdigest(),
-                "threshold": 0.42,
-                "f1_riou_025": 0.75,
-                "false_detections_per_frame": 0.5,
-            },
-            allow_nan=False,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=0.42,
     )
     output = tmp_path / "test"
     args = build_parser().parse_args(
@@ -6778,12 +7245,76 @@ def test_evaluate_test_records_frozen_threshold_source_and_never_reselects(
 
     run = json.loads((output / "run.json").read_text(encoding="utf-8"))
     assert requests[0].split == "test"
-    assert requests[0].threshold_path == threshold
+    assert requests[0].threshold_source == threshold.resolve()
+    assert requests[0].threshold_path != threshold
+    assert requests[0].manifest_source == manifest.resolve()
+    assert requests[0].checkpoint_source == checkpoint.resolve()
     assert run["threshold_source"] == str(threshold.resolve())
     assert run["threshold_sha256"] == hashlib.sha256(
         threshold.read_bytes()
     ).hexdigest()
     assert not (output / "threshold.json").exists()
+
+
+def test_strict_test_run_revalidates_available_validation_threshold_source(
+    tmp_path,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"synthetic checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=0.42,
+    )
+    output = tmp_path / "test"
+    args = _test_evaluation_args(
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=threshold,
+        output=output,
+    )
+    run_evaluate(
+        args,
+        config_loader=lambda _path: replace(
+            load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+            image_root=tmp_path / "images",
+            metadata_root=tmp_path / "metadata",
+            output_root=tmp_path / "runs",
+        ),
+        evaluator=lambda _request: _evaluation_bundle(validation=False),
+        provenance_collector=_fixed_test_provenance,
+    )
+    vru_cli_module._load_verified_evaluation_run(output)
+    validation_run_path = threshold.parent / "run.json"
+    validation_run = json.loads(
+        validation_run_path.read_text(encoding="utf-8")
+    )
+    validation_run["artifact_sha256"]["threshold.json"] = "0" * 64
+    validation_run_path.write_text(
+        json.dumps(validation_run, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowError, match="threshold|hash"):
+        vru_cli_module._load_verified_evaluation_run(output)
+
+
+def test_strict_test_run_rejects_recursive_test_threshold_source(tmp_path):
+    root = tmp_path / "test-run"
+    _write_strict_evaluation_run(
+        root,
+        "baseline",
+        source_parent=tmp_path / "unavailable-validation",
+    )
+    run = _read_strict_run(root)
+    run["threshold_source"] = str((root / "threshold.json").resolve())
+    _write_strict_run_json(root, run)
+
+    with pytest.raises(WorkflowError, match="validation"):
+        vru_cli_module._load_verified_evaluation_run(root)
 
 
 def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
@@ -6797,23 +7328,12 @@ def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
     _manifest_children(manifest, [])
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"synthetic MG checkpoint")
-    threshold = tmp_path / "threshold.json"
-    threshold.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "model_name": "mg_vtod",
-                "split": "validation",
-                "manifest_sha256": _manifest_fingerprint(manifest),
-                "checkpoint_sha256": hashlib.sha256(
-                    checkpoint.read_bytes()
-                ).hexdigest(),
-                "threshold": 0.42,
-                "f1_riou_025": 0.75,
-                "false_detections_per_frame": 0.5,
-            }
-        ),
-        encoding="utf-8",
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+        model_name="mg_vtod",
+        threshold=0.42,
     )
     human_root = tmp_path / "human-benchmark"
     human_root.mkdir()
@@ -6924,23 +7444,12 @@ def test_human_evaluate_rejects_fingerprint_change_before_atomic_publication(
     _manifest_children(manifest, [])
     checkpoint = tmp_path / "best.pt"
     checkpoint.write_bytes(b"synthetic MG checkpoint")
-    threshold = tmp_path / "threshold.json"
-    threshold.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "model_name": "mg_vtod",
-                "split": "validation",
-                "manifest_sha256": _manifest_fingerprint(manifest),
-                "checkpoint_sha256": hashlib.sha256(
-                    checkpoint.read_bytes()
-                ).hexdigest(),
-                "threshold": 0.42,
-                "f1_riou_025": 0.75,
-                "false_detections_per_frame": 0.5,
-            }
-        ),
-        encoding="utf-8",
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+        model_name="mg_vtod",
+        threshold=0.42,
     )
     human_root = tmp_path / "human-benchmark"
     human_root.mkdir()

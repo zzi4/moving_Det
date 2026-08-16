@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 import csv
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ import sys
 import tempfile
 import time
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Iterator
 
 
 _DEFAULT_CONFIG = Path("configs/vrud-temporal-obb.yaml")
@@ -225,6 +226,26 @@ class EvaluationRequest:
     checkpoint_sha256: str
     human_benchmark: Path | None = None
     motion_off: bool = False
+    manifest_source: Path | None = None
+    checkpoint_source: Path | None = None
+    threshold_source: Path | None = None
+    threshold_evidence: Mapping[str, object] | None = None
+    threshold_sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class EvaluationInputSnapshot:
+    root: Path
+    manifest_source: Path
+    checkpoint_source: Path
+    threshold_source: Path | None
+    manifest_dir: Path
+    checkpoint: Path
+    threshold_path: Path | None
+    manifest_sha256: str
+    checkpoint_sha256: str
+    threshold_evidence: Mapping[str, object] | None
+    threshold_sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -2908,11 +2929,7 @@ def run_evaluate(
     config_sha256 = _config_fingerprint(cfg)
     manifest = Path(args.manifest)
     checkpoint = Path(args.checkpoint)
-    manifest_sha256 = _manifest_fingerprint(manifest)
-    checkpoint_sha256 = _sha256_file(checkpoint)
     threshold_path = Path(args.threshold) if args.threshold is not None else None
-    if threshold_path is not None:
-        _sha256_file(threshold_path)
     human_benchmark = (
         Path(args.human_benchmark)
         if args.human_benchmark is not None
@@ -2959,18 +2976,68 @@ def run_evaluate(
             Path(getattr(cfg, "metadata_root")),
         ),
     )
+    with _snapshot_evaluation_inputs(
+        manifest,
+        checkpoint,
+        threshold_path,
+        {"model_name": args.model},
+    ) as inputs:
+        return _run_evaluate_from_snapshot(
+            args,
+            cfg=cfg,
+            config_sha256=config_sha256,
+            inputs=inputs,
+            output=output,
+            alignment_cache=alignment_cache,
+            human_benchmark=human_benchmark,
+            human_benchmark_sha256=human_benchmark_sha256,
+            started_utc=started_utc,
+            started_monotonic=started_monotonic,
+            evaluator=evaluator,
+            provenance_collector=provenance_collector,
+        )
+
+
+def _run_evaluate_from_snapshot(
+    args: argparse.Namespace,
+    *,
+    cfg: object,
+    config_sha256: str,
+    inputs: EvaluationInputSnapshot,
+    output: Path,
+    alignment_cache: Path | None,
+    human_benchmark: Path | None,
+    human_benchmark_sha256: str | None,
+    started_utc: datetime,
+    started_monotonic: float,
+    evaluator: Callable[[EvaluationRequest], EvaluationArtifacts] | None,
+    provenance_collector: (
+        Callable[[datetime, float], Mapping[str, object]] | None
+    ),
+) -> int:
+    if human_benchmark is not None:
+        from moving_det.ml.human_benchmark_artifacts import (
+            human_benchmark_fingerprint,
+            load_human_benchmark,
+        )
+
     request = EvaluationRequest(
         cfg=cfg,
         model_name=args.model,
-        checkpoint=checkpoint,
-        manifest_dir=manifest,
+        checkpoint=inputs.checkpoint,
+        manifest_dir=inputs.manifest_dir,
         split=args.split,
-        threshold_path=threshold_path,
+        threshold_path=inputs.threshold_path,
         alignment_cache=alignment_cache,
-        manifest_sha256=manifest_sha256,
-        checkpoint_sha256=checkpoint_sha256,
+        manifest_sha256=inputs.manifest_sha256,
+        checkpoint_sha256=inputs.checkpoint_sha256,
         human_benchmark=human_benchmark,
         motion_off=args.motion_off,
+        manifest_source=inputs.manifest_source,
+        checkpoint_source=inputs.checkpoint_source,
+        threshold_source=inputs.threshold_source,
+        threshold_evidence=inputs.threshold_evidence,
+        threshold_sha256=inputs.threshold_sha256,
     )
     if evaluator is None:
         evaluator = _evaluate_real
@@ -3087,15 +3154,11 @@ def run_evaluate(
             ),
             "alignment_cache_sha256": artifacts.alignment_cache_sha256,
             "threshold_source": (
-                str(request.threshold_path.resolve())
-                if request.threshold_path is not None
+                str(request.threshold_source)
+                if request.threshold_source is not None
                 else None
             ),
-            "threshold_sha256": (
-                _sha256_file(request.threshold_path)
-                if request.threshold_path is not None
-                else None
-            ),
+            "threshold_sha256": request.threshold_sha256,
             **runtime,
             "artifact_schema": artifact_schema,
             "artifact_sha256": artifact_sha256,
@@ -3474,6 +3537,8 @@ def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
 
 def _load_verified_evaluation_run(
     root_value: Path,
+    *,
+    _revalidate_threshold_source: bool = True,
 ) -> tuple[dict[str, object], dict[str, object], Path]:
     root = Path(root_value)
     _reject_symlink_components(root)
@@ -3573,7 +3638,595 @@ def _load_verified_evaluation_run(
                 checkpoint_sha256=str(run["checkpoint_sha256"]),
             ),
         )
+    if (
+        _revalidate_threshold_source
+        and run["evaluation_split"] == "test"
+    ):
+        threshold_source = Path(str(run["threshold_source"]))
+        if threshold_source.name != "threshold.json":
+            raise WorkflowError(
+                "test threshold lexical name must be exactly threshold.json"
+            )
+        validation_root = threshold_source.parent
+        validation_metadata = validation_root / "run.json"
+        if (
+            threshold_source.exists()
+            or threshold_source.is_symlink()
+            or validation_metadata.exists()
+            or validation_metadata.is_symlink()
+        ):
+            validation_run, _, _ = _load_verified_evaluation_run(
+                validation_root,
+                _revalidate_threshold_source=False,
+            )
+            validation_digests = validation_run.get("artifact_sha256")
+            if (
+                validation_run.get("evaluation_split") != "validation"
+                or validation_run.get("model_name") != run["model_name"]
+                or validation_run.get("manifest_sha256")
+                != run["manifest_sha256"]
+                or validation_run.get("checkpoint_sha256")
+                != run["checkpoint_sha256"]
+                or not isinstance(validation_digests, Mapping)
+                or validation_digests.get("threshold.json")
+                != run["threshold_sha256"]
+            ):
+                raise WorkflowError(
+                    "test threshold source validation run provenance is mismatched"
+                )
     return run, metrics, root
+
+
+class _EvaluationFileDescriptorRegistry:
+    def __init__(self) -> None:
+        self._owned: dict[int, str] = {}
+
+    def own(self, descriptor: int, purpose: str) -> int:
+        if (
+            type(descriptor) is not int
+            or descriptor < 0
+            or descriptor in self._owned
+            or not isinstance(purpose, str)
+            or not purpose
+        ):
+            raise WorkflowError(
+                "evaluation snapshot open returned an invalid descriptor"
+            )
+        self._owned[descriptor] = purpose
+        return descriptor
+
+    def close(self, descriptor: int) -> BaseException | None:
+        if descriptor not in self._owned:
+            return RuntimeError("evaluation snapshot descriptor is not owned")
+        del self._owned[descriptor]
+        try:
+            os.close(descriptor)
+        except BaseException as exc:
+            return exc
+        return None
+
+    def close_all(self) -> tuple[tuple[int, str, BaseException], ...]:
+        errors = []
+        for descriptor, purpose in reversed(tuple(self._owned.items())):
+            error = self.close(descriptor)
+            if error is not None:
+                errors.append((descriptor, purpose, error))
+        return tuple(errors)
+
+
+def _evaluation_cleanup_note(
+    descriptor: int,
+    purpose: str,
+    error: BaseException,
+) -> str:
+    errno_value = getattr(error, "errno", None)
+    errno_detail = (
+        f", errno={errno_value}" if errno_value is not None else ""
+    )
+    return (
+        "evaluation snapshot descriptor cleanup error: "
+        f"fd={descriptor}, purpose={purpose}, "
+        f"exception={type(error).__name__}{errno_detail}, message={error}"
+    )
+
+
+def _cleanup_evaluation_descriptors(
+    registry: _EvaluationFileDescriptorRegistry,
+    primary_error: BaseException | None,
+) -> tuple[tuple[int, str, BaseException], ...]:
+    errors = registry.close_all()
+    if not errors:
+        return errors
+    notes = tuple(
+        _evaluation_cleanup_note(descriptor, purpose, error)
+        for descriptor, purpose, error in errors
+    )
+    if primary_error is not None:
+        for note in notes:
+            primary_error.add_note(note)
+        return errors
+    aggregate = WorkflowError(
+        f"failed to close {len(errors)} evaluation snapshot descriptor(s)"
+    )
+    for note in notes:
+        aggregate.add_note(note)
+    raise aggregate
+
+
+def _close_evaluation_descriptor(
+    registry: _EvaluationFileDescriptorRegistry,
+    descriptor: int,
+) -> None:
+    purpose = registry._owned.get(descriptor, "unknown")
+    error = registry.close(descriptor)
+    if error is not None:
+        failure = WorkflowError(
+            f"failed to close evaluation snapshot {purpose} descriptor"
+        )
+        failure.add_note(
+            _evaluation_cleanup_note(descriptor, purpose, error)
+        )
+        raise failure from error
+
+
+def _evaluation_snapshot_open_flags() -> tuple[int, int, int]:
+    values = {}
+    invalid = []
+    for name in (
+        "O_RDONLY",
+        "O_WRONLY",
+        "O_CREAT",
+        "O_EXCL",
+        "O_CLOEXEC",
+        "O_NOFOLLOW",
+        "O_DIRECTORY",
+        "O_NONBLOCK",
+    ):
+        value = vars(os).get(name)
+        if (
+            type(value) is not int
+            or value < 0
+            or (name != "O_RDONLY" and value == 0)
+        ):
+            invalid.append(name)
+        else:
+            values[name] = value
+    if invalid:
+        raise WorkflowError(
+            "secure evaluation snapshots require valid OS flags: "
+            + ", ".join(invalid)
+        )
+    source_flags = (
+        values["O_RDONLY"]
+        | values["O_CLOEXEC"]
+        | values["O_NOFOLLOW"]
+        | values["O_NONBLOCK"]
+    )
+    directory_flags = source_flags | values["O_DIRECTORY"]
+    destination_flags = (
+        values["O_WRONLY"]
+        | values["O_CREAT"]
+        | values["O_EXCL"]
+        | values["O_CLOEXEC"]
+        | values["O_NOFOLLOW"]
+    )
+    return source_flags, directory_flags, destination_flags
+
+
+def _evaluation_file_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        stat.S_IFMT(value.st_mode),
+        value.st_dev,
+        value.st_ino,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _canonical_evaluation_source(path: Path, *, label: str) -> Path:
+    source = Path(path)
+    if not source.parts or ".." in source.parts or "\x00" in str(source):
+        raise WorkflowError(f"{label} path alias or traversal is forbidden")
+    _reject_symlink_components(source)
+    try:
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise WorkflowError(f"{label} is missing or unsafe: {source}") from exc
+    _reject_symlink_components(resolved)
+    return resolved
+
+
+def _open_evaluation_directory(
+    path: Path,
+    *,
+    label: str,
+    flags: int,
+    registry: _EvaluationFileDescriptorRegistry,
+) -> tuple[int, Path]:
+    source = _canonical_evaluation_source(path, label=label)
+    try:
+        before = os.stat(source, follow_symlinks=False)
+        descriptor = registry.own(
+            os.open(source, flags),
+            f"{label} directory",
+        )
+        opened = os.fstat(descriptor)
+        after = os.stat(source, follow_symlinks=False)
+    except WorkflowError:
+        raise
+    except OSError as exc:
+        raise WorkflowError(f"{label} is missing or unsafe: {source}") from exc
+    expected = (
+        stat.S_IFMT(before.st_mode),
+        before.st_dev,
+        before.st_ino,
+    )
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(after.st_mode)
+        or expected
+        != (
+            stat.S_IFMT(opened.st_mode),
+            opened.st_dev,
+            opened.st_ino,
+        )
+        or expected
+        != (
+            stat.S_IFMT(after.st_mode),
+            after.st_dev,
+            after.st_ino,
+        )
+    ):
+        raise WorkflowError(f"{label} changed while opening: {source}")
+    return descriptor, source
+
+
+def _write_evaluation_snapshot_chunk(descriptor: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        try:
+            written = os.write(descriptor, content[offset:])
+        except OSError as exc:
+            raise WorkflowError("evaluation snapshot write failed") from exc
+        if written <= 0:
+            raise WorkflowError("evaluation snapshot write made no progress")
+        offset += written
+
+
+def _copy_evaluation_regular_file(
+    source_name: str | Path,
+    destination: Path,
+    *,
+    label: str,
+    source_flags: int,
+    destination_flags: int,
+    registry: _EvaluationFileDescriptorRegistry,
+    source_directory_fd: int | None = None,
+) -> tuple[str, tuple[int, int]]:
+    if source_directory_fd is None:
+        source_path = _canonical_evaluation_source(
+            Path(source_name),
+            label=label,
+        )
+        open_target: str | Path = source_path
+        stat_target: str | Path = source_path
+        stat_kwargs: dict[str, object] = {"follow_symlinks": False}
+        open_kwargs: dict[str, object] = {}
+    else:
+        if (
+            not isinstance(source_name, str)
+            or not source_name
+            or source_name in {".", ".."}
+            or "/" in source_name
+            or "\\" in source_name
+            or "\x00" in source_name
+        ):
+            raise WorkflowError(f"{label} entry name is unsafe")
+        open_target = source_name
+        stat_target = source_name
+        stat_kwargs = {
+            "dir_fd": source_directory_fd,
+            "follow_symlinks": False,
+        }
+        open_kwargs = {"dir_fd": source_directory_fd}
+    try:
+        before = os.stat(stat_target, **stat_kwargs)
+        source_descriptor = registry.own(
+            os.open(open_target, source_flags, **open_kwargs),
+            f"{label} source",
+        )
+        opened = os.fstat(source_descriptor)
+        path_after_open = os.stat(stat_target, **stat_kwargs)
+    except WorkflowError:
+        raise
+    except OSError as exc:
+        raise WorkflowError(f"{label} is missing or unsafe") from exc
+    opened_identity = (opened.st_dev, opened.st_ino)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(path_after_open.st_mode)
+        or before.st_nlink != 1
+        or opened.st_nlink != 1
+        or path_after_open.st_nlink != 1
+        or (before.st_dev, before.st_ino) != opened_identity
+        or (path_after_open.st_dev, path_after_open.st_ino)
+        != opened_identity
+        or opened.st_size < 0
+    ):
+        raise WorkflowError(f"{label} is not one stable regular file")
+
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(destination.parent, 0o700)
+    try:
+        destination_descriptor = registry.own(
+            os.open(destination, destination_flags, 0o600),
+            f"{label} destination",
+        )
+    except OSError as exc:
+        raise WorkflowError(f"cannot create private {label} snapshot") from exc
+    digest = hashlib.sha256()
+    remaining = opened.st_size
+    while remaining:
+        try:
+            chunk = os.read(
+                source_descriptor,
+                min(_FULL_FRAME_READ_CHUNK_BYTES, remaining),
+            )
+        except OSError as exc:
+            raise WorkflowError(f"{label} changed while snapshotting") from exc
+        if not chunk:
+            raise WorkflowError(f"{label} changed while snapshotting")
+        digest.update(chunk)
+        _write_evaluation_snapshot_chunk(destination_descriptor, chunk)
+        remaining -= len(chunk)
+    try:
+        if os.read(source_descriptor, 1):
+            raise WorkflowError(f"{label} changed while snapshotting")
+        finished = os.fstat(source_descriptor)
+        destination_stat = os.fstat(destination_descriptor)
+        os.fsync(destination_descriptor)
+        os.fchmod(destination_descriptor, stat.S_IRUSR)
+    except WorkflowError:
+        raise
+    except OSError as exc:
+        raise WorkflowError(f"{label} snapshot finalization failed") from exc
+    if (
+        _evaluation_file_signature(finished)
+        != _evaluation_file_signature(opened)
+        or not stat.S_ISREG(destination_stat.st_mode)
+        or destination_stat.st_size != opened.st_size
+    ):
+        raise WorkflowError(f"{label} changed while snapshotting")
+    _close_evaluation_descriptor(registry, destination_descriptor)
+    _close_evaluation_descriptor(registry, source_descriptor)
+    return digest.hexdigest(), opened_identity
+
+
+@contextmanager
+def _snapshot_evaluation_inputs(
+    manifest: Path,
+    checkpoint: Path,
+    threshold: Path | None,
+    request_identity: Mapping[str, str],
+) -> Iterator[EvaluationInputSnapshot]:
+    if (
+        not isinstance(request_identity, Mapping)
+        or not _safe_evidence_identity(request_identity.get("model_name"))
+        or any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in request_identity.items()
+        )
+    ):
+        raise WorkflowError("evaluation snapshot request identity is invalid")
+    model_name = str(request_identity["model_name"])
+    if model_name not in _MODEL_NAMES:
+        raise WorkflowError("evaluation snapshot model identity is unsupported")
+    source_flags, directory_flags, destination_flags = (
+        _evaluation_snapshot_open_flags()
+    )
+    root = Path(tempfile.mkdtemp(prefix="moving-det-evaluation-"))
+    registry = _EvaluationFileDescriptorRegistry()
+    primary_error: BaseException | None = None
+    try:
+        os.chmod(root, 0o700)
+        manifest_snapshot = root / "manifest"
+        manifest_snapshot.mkdir(mode=0o700)
+        manifest_fd, manifest_source = _open_evaluation_directory(
+            Path(manifest),
+            label="evaluation manifest",
+            flags=directory_flags,
+            registry=registry,
+        )
+        source_identities: set[tuple[int, int]] = set()
+        for name in _MANIFEST_ARTIFACTS:
+            _, identity = _copy_evaluation_regular_file(
+                name,
+                manifest_snapshot / name,
+                label=f"manifest artifact {name}",
+                source_flags=source_flags,
+                destination_flags=destination_flags,
+                registry=registry,
+                source_directory_fd=manifest_fd,
+            )
+            if identity in source_identities:
+                raise WorkflowError("manifest artifacts contain path aliases")
+            source_identities.add(identity)
+        _close_evaluation_descriptor(registry, manifest_fd)
+        manifest_sha256 = _manifest_fingerprint(manifest_snapshot)
+
+        checkpoint_source = _canonical_evaluation_source(
+            Path(checkpoint),
+            label="evaluation checkpoint",
+        )
+        checkpoint_snapshot = root / "checkpoint.pt"
+        checkpoint_sha256, checkpoint_identity = (
+            _copy_evaluation_regular_file(
+                checkpoint_source,
+                checkpoint_snapshot,
+                label="evaluation checkpoint",
+                source_flags=source_flags,
+                destination_flags=destination_flags,
+                registry=registry,
+            )
+        )
+        if checkpoint_identity in source_identities:
+            raise WorkflowError("evaluation inputs contain path aliases")
+        source_identities.add(checkpoint_identity)
+        if (
+            "manifest_sha256" in request_identity
+            and request_identity["manifest_sha256"] != manifest_sha256
+        ):
+            raise WorkflowError("evaluation manifest snapshot identity mismatched")
+        if (
+            "checkpoint_sha256" in request_identity
+            and request_identity["checkpoint_sha256"] != checkpoint_sha256
+        ):
+            raise WorkflowError("evaluation checkpoint snapshot identity mismatched")
+
+        threshold_source: Path | None = None
+        threshold_snapshot: Path | None = None
+        threshold_evidence: Mapping[str, object] | None = None
+        threshold_sha256: str | None = None
+        if threshold is not None:
+            requested_threshold = Path(threshold)
+            if requested_threshold.name != "threshold.json":
+                raise WorkflowError(
+                    "test threshold lexical name must be exactly threshold.json"
+                )
+            threshold_source = _canonical_evaluation_source(
+                requested_threshold,
+                label="validation threshold",
+            )
+            validation_source = threshold_source.parent
+            validation_snapshot = root / "validation-run"
+            validation_snapshot.mkdir(mode=0o700)
+            validation_fd, validation_source = _open_evaluation_directory(
+                validation_source,
+                label="validation evaluation run",
+                flags=directory_flags,
+                registry=registry,
+            )
+            try:
+                validation_names = tuple(sorted(os.listdir(validation_fd)))
+            except OSError as exc:
+                raise WorkflowError(
+                    "validation evaluation run cannot be safely listed"
+                ) from exc
+            if not {"run.json", "threshold.json"}.issubset(
+                validation_names
+            ):
+                raise WorkflowError(
+                    "validation threshold must belong to a complete evaluation run"
+                )
+            validation_digests = {}
+            for name in validation_names:
+                digest, identity = _copy_evaluation_regular_file(
+                    name,
+                    validation_snapshot / name,
+                    label=f"validation run artifact {name}",
+                    source_flags=source_flags,
+                    destination_flags=destination_flags,
+                    registry=registry,
+                    source_directory_fd=validation_fd,
+                )
+                if identity in source_identities:
+                    raise WorkflowError(
+                        "evaluation inputs contain path aliases"
+                    )
+                source_identities.add(identity)
+                validation_digests[name] = digest
+            _close_evaluation_descriptor(registry, validation_fd)
+            validation_run, _, _ = _load_verified_evaluation_run(
+                validation_snapshot
+            )
+            if (
+                validation_run.get("evaluation_split") != "validation"
+                or validation_run.get("model_name") != model_name
+                or validation_run.get("manifest_sha256") != manifest_sha256
+                or validation_run.get("checkpoint_sha256")
+                != checkpoint_sha256
+            ):
+                raise WorkflowError(
+                    "validation threshold run model/manifest/checkpoint "
+                    "provenance is mismatched"
+                )
+            declared_digests = validation_run.get("artifact_sha256")
+            if (
+                not isinstance(declared_digests, Mapping)
+                or "threshold.json" not in declared_digests
+                or validation_digests.get("threshold.json")
+                != declared_digests.get("threshold.json")
+            ):
+                raise WorkflowError(
+                    "validation threshold run does not declare pinned threshold bytes"
+                )
+            threshold_snapshot = validation_snapshot / "threshold.json"
+            raw_threshold = _read_json(threshold_snapshot)
+            if not isinstance(raw_threshold, Mapping):
+                raise WorkflowError(
+                    "validation threshold artifact must contain an object"
+                )
+            authentication_request = EvaluationRequest(
+                cfg=None,
+                model_name=model_name,
+                checkpoint=checkpoint_snapshot,
+                manifest_dir=manifest_snapshot,
+                split="validation",
+                threshold_path=None,
+                alignment_cache=None,
+                manifest_sha256=manifest_sha256,
+                checkpoint_sha256=checkpoint_sha256,
+            )
+            threshold_evidence = MappingProxyType(
+                _threshold_payload(raw_threshold, authentication_request)
+            )
+            threshold_sha256 = str(declared_digests["threshold.json"])
+
+        yield EvaluationInputSnapshot(
+            root=root,
+            manifest_source=manifest_source,
+            checkpoint_source=checkpoint_source,
+            threshold_source=threshold_source,
+            manifest_dir=manifest_snapshot,
+            checkpoint=checkpoint_snapshot,
+            threshold_path=threshold_snapshot,
+            manifest_sha256=manifest_sha256,
+            checkpoint_sha256=checkpoint_sha256,
+            threshold_evidence=threshold_evidence,
+            threshold_sha256=threshold_sha256,
+        )
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        try:
+            _cleanup_evaluation_descriptors(registry, primary_error)
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            shutil.rmtree(root)
+        except BaseException as exc:
+            if primary_error is not None:
+                primary_error.add_note(
+                    "evaluation snapshot private-directory cleanup error: "
+                    f"exception={type(exc).__name__}, message={exc}"
+                )
+            elif cleanup_error is not None:
+                cleanup_error.add_note(
+                    "evaluation snapshot private-directory cleanup error: "
+                    f"exception={type(exc).__name__}, message={exc}"
+                )
+            else:
+                raise WorkflowError(
+                    "failed to remove private evaluation snapshot"
+                ) from exc
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def _compatible_ground_truth_sha256(
@@ -5190,24 +5843,13 @@ def _verify_checkpoint_alignment_provenance(
 def _predictions_for_artifact(
     predictions: Sequence[object],
     request: EvaluationRequest,
-    *,
-    threshold_evidence: Mapping[str, object] | None = None,
 ) -> tuple[object, ...]:
     rows = tuple(predictions)
     if request.split == "validation":
         return rows
-    if request.split != "test" or request.threshold_path is None:
+    if request.split != "test" or request.threshold_evidence is None:
         raise WorkflowError("test prediction export requires frozen threshold")
-    if threshold_evidence is None:
-        loaded = _read_json(request.threshold_path)
-        if not isinstance(loaded, Mapping):
-            raise WorkflowError(
-                "frozen threshold artifact must contain an object"
-            )
-        evidence = dict(loaded)
-    else:
-        evidence = dict(threshold_evidence)
-    validated = _threshold_payload(evidence, request)
+    validated = _threshold_payload(request.threshold_evidence, request)
     try:
         threshold = float(validated["threshold"])
     except (TypeError, ValueError, OverflowError) as exc:
@@ -7770,12 +8412,12 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
     }
     threshold_evidence = None
     if human_benchmark is not None:
-        if request.threshold_path is None:
+        if request.threshold_evidence is None:
             raise WorkflowError("human evaluation requires a frozen threshold")
-        frozen = _read_json(request.threshold_path)
-        if not isinstance(frozen, Mapping):
-            raise WorkflowError("frozen threshold artifact must contain an object")
-        threshold_payload = _threshold_payload(frozen, request)
+        threshold_payload = _threshold_payload(
+            request.threshold_evidence,
+            request,
+        )
         metrics = dict(
             evaluate_human_predictions(
                 tuple(predictions),
@@ -7794,8 +8436,9 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         )
         threshold_evidence = asdict(evidence)
     else:
-        assert request.threshold_path is not None
-        evaluation_cfg["threshold_path"] = request.threshold_path
+        if request.threshold_evidence is None:
+            raise WorkflowError("test evaluation requires frozen threshold evidence")
+        evaluation_cfg["threshold_evidence"] = request.threshold_evidence
     if human_benchmark is None:
         metrics = evaluate_temporal_obb(
             tuple(predictions),
@@ -7805,11 +8448,6 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
     artifact_predictions = _predictions_for_artifact(
         tuple(predictions),
         request,
-        threshold_evidence=(
-            metrics.get("threshold_evidence")
-            if request.split == "test"
-            else None
-        ),
     )
     prediction_rows = tuple(
         _serialize_detection(item)
