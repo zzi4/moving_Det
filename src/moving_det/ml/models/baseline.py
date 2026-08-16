@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from torch import Tensor, nn
@@ -9,6 +11,11 @@ from ultralytics import YOLO
 from ultralytics.cfg import get_cfg
 from ultralytics.nn.tasks import OBBModel
 
+from moving_det.ml.pretrained_transfer import (
+    _is_frozen_p2_initialization,
+    compatible_state,
+    load_frozen_p2_initialization,
+)
 from moving_det.ml.yolo_graph import execute_yolo_graph
 
 
@@ -21,11 +28,28 @@ _MODEL_CONFIG = (
 _LOSS_NAMES = ("box_loss", "cls_loss", "dfl_loss", "angle_loss")
 
 
+def _model_config_sha256() -> str:
+    config = Path(_MODEL_CONFIG)
+    if config.is_symlink() or not config.is_file():
+        raise ValueError("P2 target config must be a regular file")
+    return hashlib.sha256(config.read_bytes()).hexdigest()
+
+
+def _immutable_provenance(**values: object) -> Mapping[str, object]:
+    return MappingProxyType(dict(values))
+
+
 def create_p2_obb_detector(
     weights: Path | str | None,
     nc: int = 4,
 ) -> OBBModel:
     """Build the shared P2-P5 OBB detector and optionally transfer weights."""
+    frozen = (
+        weights is not None
+        and _is_frozen_p2_initialization(Path(weights))
+    )
+    if frozen and nc != 4:
+        raise ValueError("frozen P2 initialization requires nc=4")
     detector = OBBModel(
         str(_MODEL_CONFIG),
         ch=3,
@@ -35,16 +59,38 @@ def create_p2_obb_detector(
     detector.args = get_cfg()
     detector.task = "obb"
     detector.transferred_tensors = 0
+    detector.initialization_kind = "random"
+    detector.transfer_provenance = _immutable_provenance(
+        initialization_kind="random",
+        transferred_tensors=0,
+    )
 
-    if weights is not None:
+    if frozen:
+        frozen_state, provenance = load_frozen_p2_initialization(Path(weights))
+        if provenance["target_config_sha256"] != _model_config_sha256():
+            raise ValueError("frozen P2 target config hash is unexpected")
+        target_state = detector.state_dict()
+        if len(target_state) != 859:
+            raise ValueError("P2 target must contain exactly 859 tensors")
+        compatible = compatible_state(frozen_state, target_state)
+        if tuple(compatible) != tuple(sorted(target_state)):
+            raise ValueError("frozen P2 state names or shapes do not match target")
+        detector.load_state_dict(compatible, strict=True)
+        detector.transferred_tensors = int(provenance["transferred_tensors"])
+        detector.initialization_kind = "frozen_p2"
+        detector.transfer_provenance = provenance
+    elif weights is not None:
         source = YOLO(str(weights)).model
         source_state = source.float().state_dict()
         target_state = detector.state_dict()
-        detector.transferred_tensors = sum(
-            key in target_state and target_state[key].shape == value.shape
-            for key, value in source_state.items()
+        transferred = compatible_state(source_state, target_state)
+        detector.load_state_dict(transferred, strict=False)
+        detector.transferred_tensors = len(transferred)
+        detector.initialization_kind = "ultralytics"
+        detector.transfer_provenance = _immutable_provenance(
+            initialization_kind="ultralytics",
+            transferred_tensors=len(transferred),
         )
-        detector.load(source, verbose=False)
     return detector
 
 

@@ -1,11 +1,79 @@
+from collections import OrderedDict
+import hashlib
+
 import pytest
 import torch
 
+from moving_det.ml import pretrained_transfer as transfer_module
 from moving_det.ml.models import baseline as baseline_module
 from moving_det.ml.models.baseline import (
     BaselineOBB,
     create_p2_obb_detector,
 )
+from moving_det.ml.pretrained_transfer import (
+    freeze_p2_initialization,
+    load_frozen_p2_initialization,
+)
+
+
+class _SmallP2Detector:
+    def __init__(self, _config, *, ch, nc, verbose) -> None:
+        assert ch == 3
+        assert verbose is False
+        self.nc = nc
+        self._state = OrderedDict(
+            (
+                f"model.{index:03d}.weight",
+                torch.full((2,), float(index) / 1000),
+            )
+            for index in range(859)
+        )
+
+    def state_dict(self):
+        return OrderedDict(self._state)
+
+    def load_state_dict(self, state, strict: bool):
+        if strict and tuple(state) != tuple(self._state):
+            raise RuntimeError("strict state names do not match")
+        for name, value in state.items():
+            if name not in self._state or value.shape != self._state[name].shape:
+                raise RuntimeError(f"incompatible tensor: {name}")
+            self._state[name] = value.detach().clone()
+
+
+def _freeze_small_p2_artifact(tmp_path, monkeypatch):
+    source_weights = tmp_path / "universal.pt"
+    source_weights.write_bytes(b"synthetic approved Universal checkpoint")
+    source_sha256 = hashlib.sha256(source_weights.read_bytes()).hexdigest()
+    source_state = OrderedDict(
+        (
+            f"model.{index:03d}.weight",
+            torch.tensor([float(index), float(index) + 0.5]),
+        )
+        for index in range(427)
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "APPROVED_UNIVERSAL_SHA256",
+        source_sha256,
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "APPROVED_UNIVERSAL_PATH",
+        source_weights.resolve(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "_load_universal_state",
+        lambda _path: source_state,
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "_build_p2_target",
+        lambda nc: _SmallP2Detector("fake", ch=3, nc=nc, verbose=False),
+    )
+    return freeze_p2_initialization(source_weights, tmp_path / "frozen")
 
 
 def _synthetic_temporal_batch() -> dict[str, object]:
@@ -193,4 +261,85 @@ def test_local_pretrained_source_counts_and_loads_compatible_tensors(
     torch.testing.assert_close(
         detector.model[0].conv.weight,
         source.model[0].conv.weight,
+    )
+
+
+def test_frozen_p2_bypasses_yolo_and_strictly_loads_all_target_tensors(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = _freeze_small_p2_artifact(tmp_path, monkeypatch)
+    expected_state, _ = load_frozen_p2_initialization(artifact)
+
+    def reject_yolo(*_args, **_kwargs):
+        raise AssertionError("frozen P2 loading must not construct YOLO")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_yolo)
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    detector = create_p2_obb_detector(weights=artifact, nc=4)
+
+    assert detector.transferred_tensors == 427
+    assert detector.initialization_kind == "frozen_p2"
+    assert len(detector.state_dict()) == 859
+    for name, value in detector.state_dict().items():
+        torch.testing.assert_close(value, expected_state[name])
+    assert detector.transfer_provenance["target_tensors"] == 859
+    with pytest.raises(TypeError):
+        detector.transfer_provenance["initialization_kind"] = "changed"
+
+
+def test_frozen_p2_rejects_non_four_class_target(tmp_path, monkeypatch):
+    artifact = _freeze_small_p2_artifact(tmp_path, monkeypatch)
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    with pytest.raises(ValueError, match="nc=4"):
+        create_p2_obb_detector(weights=artifact, nc=3)
+
+
+def test_frozen_p2_rejects_unexpected_runtime_target_config_hash(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = _freeze_small_p2_artifact(tmp_path, monkeypatch)
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+    changed_config = tmp_path / "changed-target.yaml"
+    changed_config.write_text("nc: 4\n", encoding="utf-8")
+    monkeypatch.setattr(baseline_module, "_MODEL_CONFIG", changed_config)
+
+    with pytest.raises(ValueError, match="config hash"):
+        create_p2_obb_detector(weights=artifact, nc=4)
+
+
+def test_ordinary_checkpoint_named_p2_init_still_uses_yolo(
+    tmp_path,
+    monkeypatch,
+):
+    ordinary = tmp_path / "p2-init.pt"
+    ordinary.write_bytes(b"ordinary Ultralytics checkpoint placeholder")
+
+    class SourceModel:
+        def float(self):
+            return self
+
+        def state_dict(self):
+            return OrderedDict(
+                {"model.000.weight": torch.tensor([7.0, 8.0])}
+            )
+
+    class LocalYOLO:
+        def __init__(self, weights):
+            assert weights == str(ordinary)
+            self.model = SourceModel()
+
+    monkeypatch.setattr(baseline_module, "YOLO", LocalYOLO)
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    detector = create_p2_obb_detector(weights=ordinary, nc=4)
+
+    assert detector.initialization_kind == "ultralytics"
+    assert detector.transferred_tensors == 1
+    torch.testing.assert_close(
+        detector.state_dict()["model.000.weight"],
+        torch.tensor([7.0, 8.0]),
     )

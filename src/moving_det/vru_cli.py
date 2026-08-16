@@ -261,6 +261,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     human_benchmark.add_argument("--output", type=_path_argument, required=True)
 
+    freeze_p2 = subparsers.add_parser(
+        "freeze-p2-init",
+        help="freeze the approved Universal checkpoint for strict P2 loading",
+    )
+    freeze_p2.add_argument("--weights", type=_path_argument, required=True)
+    freeze_p2.add_argument("--output", type=_path_argument, required=True)
+
     build = subparsers.add_parser(
         "build-manifest",
         help="build the strict frozen VRUD manifests",
@@ -399,6 +406,7 @@ def main(
     selected = (
         {
             "build-human-benchmark": run_build_human_benchmark,
+            "freeze-p2-init": run_freeze_p2_init,
             "build-manifest": run_build_manifest,
             "cache-alignments": run_cache_alignments,
             "train": run_train,
@@ -678,6 +686,35 @@ def run_build_human_benchmark(
     benchmark = builder(resolved_zip, resolved_image_root)
     manifest = Path(freezer(benchmark, resolved_output))
     print(manifest.resolve())
+    return 0
+
+
+def run_freeze_p2_init(
+    args: argparse.Namespace,
+    *,
+    freezer: Callable[[Path, Path], Path] | None = None,
+) -> int:
+    weights = Path(args.weights)
+    output = Path(args.output)
+    _reject_symlink_components(weights)
+    if not weights.is_file():
+        raise WorkflowError(f"Universal weights must be a regular file: {weights}")
+    resolved_weights = weights.resolve(strict=True)
+    if not output.name or ".." in output.parts:
+        raise WorkflowError(f"output path traversal is forbidden: {output}")
+    validated_output = _validate_output(output, inputs=(resolved_weights,))
+    if validated_output.exists() or validated_output.is_symlink():
+        raise WorkflowError("output directory must not already exist")
+    resolved_output = validated_output.resolve(strict=False)
+    if freezer is None:
+        from moving_det.ml.pretrained_transfer import freeze_p2_initialization
+
+        freezer = freeze_p2_initialization
+    artifact = Path(freezer(resolved_weights, resolved_output)).resolve()
+    expected_artifact = (resolved_output / "p2-init.pt").resolve()
+    if artifact != expected_artifact:
+        raise WorkflowError("freezer returned an unexpected artifact path")
+    print(artifact)
     return 0
 
 

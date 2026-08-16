@@ -40,6 +40,7 @@ from moving_det.vru_cli import (
     run_cache_alignments,
     run_compare,
     run_evaluate,
+    run_freeze_p2_init,
     run_train,
     run_visualize,
 )
@@ -47,6 +48,7 @@ from moving_det.vru_cli import (
 
 EXPECTED_COMMANDS = {
     "build-human-benchmark",
+    "freeze-p2-init",
     "build-manifest",
     "cache-alignments",
     "train",
@@ -101,6 +103,10 @@ def test_vru_cli_exposes_exact_workflow_commands():
         (
             "build-human-benchmark --zip manual.zip --image-root /data/images "
             "--output runs/human-benchmark"
+        ),
+        (
+            "freeze-p2-init --weights models/best_vru_universal.pt "
+            "--output runs/p2-init"
         ),
         (
             "build-manifest --config configs/vrud-temporal-obb.yaml "
@@ -198,6 +204,127 @@ def test_build_human_benchmark_parser_preserves_all_required_inputs():
     assert args.zip == Path("manual.zip")
     assert args.image_root == Path("/data/images")
     assert args.output == Path("runs/human-benchmark")
+
+
+def test_freeze_p2_init_parser_preserves_required_paths():
+    args = build_parser().parse_args(
+        [
+            "freeze-p2-init",
+            "--weights",
+            "models/best_vru_universal.pt",
+            "--output",
+            "runs/p2-init",
+        ]
+    )
+
+    assert args.command == "freeze-p2-init"
+    assert args.weights == Path("models/best_vru_universal.pt")
+    assert args.output == Path("runs/p2-init")
+
+
+def test_freeze_p2_init_routes_through_main():
+    captured = {}
+
+    def handler(args):
+        captured["args"] = args
+        return 23
+
+    result = main(
+        "freeze-p2-init --weights universal.pt --output frozen".split(),
+        handlers={"freeze-p2-init": handler},
+    )
+
+    assert result == 23
+    assert captured["args"].command == "freeze-p2-init"
+
+
+def test_freeze_p2_init_handler_resolves_paths_and_prints_artifact(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "universal.pt"
+    source.write_bytes(b"synthetic checkpoint")
+    captured = {}
+
+    def freezer(weights, output):
+        captured["arguments"] = (weights, output)
+        return output / "p2-init.pt"
+
+    args = build_parser().parse_args(
+        "freeze-p2-init --weights universal.pt --output frozen".split()
+    )
+
+    result = run_freeze_p2_init(args, freezer=freezer)
+
+    assert result == 0
+    assert captured["arguments"] == (
+        source.resolve(),
+        (tmp_path / "frozen").resolve(),
+    )
+    assert capsys.readouterr().out.strip() == str(
+        (tmp_path / "frozen" / "p2-init.pt").resolve()
+    )
+
+
+def test_freeze_p2_init_rejects_freezer_artifact_outside_output(tmp_path):
+    source = tmp_path / "universal.pt"
+    source.write_bytes(b"synthetic checkpoint")
+    output = tmp_path / "frozen"
+    args = build_parser().parse_args(
+        [
+            "freeze-p2-init",
+            "--weights",
+            str(source),
+            "--output",
+            str(output),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="unexpected artifact"):
+        run_freeze_p2_init(
+            args,
+            freezer=lambda _weights, _output: tmp_path / "elsewhere.pt",
+        )
+
+
+@pytest.mark.parametrize("unsafe_kind", ["source-symlink", "existing", "overlap"])
+def test_freeze_p2_init_rejects_unsafe_paths_before_freezer(
+    tmp_path,
+    unsafe_kind,
+):
+    source = tmp_path / "universal.pt"
+    source.write_bytes(b"synthetic checkpoint")
+    weights = source
+    output = tmp_path / "frozen"
+    if unsafe_kind == "source-symlink":
+        weights = tmp_path / "universal-link.pt"
+        weights.symlink_to(source)
+    elif unsafe_kind == "existing":
+        output.mkdir()
+    else:
+        output = tmp_path
+    called = False
+
+    def freezer(*_args):
+        nonlocal called
+        called = True
+        raise AssertionError("unsafe paths must fail before freezing")
+
+    args = build_parser().parse_args(
+        [
+            "freeze-p2-init",
+            "--weights",
+            str(weights),
+            "--output",
+            str(output),
+        ]
+    )
+    with pytest.raises((WorkflowError, ValueError), match="symlink|exist|overlaps"):
+        run_freeze_p2_init(args, freezer=freezer)
+
+    assert called is False
 
 
 def test_build_human_benchmark_routes_through_main():
