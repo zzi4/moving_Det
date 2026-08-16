@@ -359,21 +359,16 @@ def _evaluation_scope(
             )
         pinned_evidence = _cfg_optional(cfg, "threshold_evidence")
         if pinned_evidence is None:
-            evidence = load_validation_threshold(
-                _cfg_required(cfg, "threshold_path"),
-                model_name=_cfg_required(cfg, "model_name"),
-                manifest_sha256=_cfg_required(cfg, "manifest_sha256"),
-                checkpoint_sha256=_cfg_required(cfg, "checkpoint_sha256"),
-                evaluation_split="test",
+            raise ValueError(
+                "test evaluation requires pre-authenticated threshold evidence"
             )
-        else:
-            evidence = _validated_threshold_payload(
-                pinned_evidence,
-                model_name=_cfg_required(cfg, "model_name"),
-                manifest_sha256=_cfg_required(cfg, "manifest_sha256"),
-                checkpoint_sha256=_cfg_required(cfg, "checkpoint_sha256"),
-                evaluation_split="test",
-            )
+        evidence = _validated_threshold_payload(
+            pinned_evidence,
+            model_name=_cfg_required(cfg, "model_name"),
+            manifest_sha256=_cfg_required(cfg, "manifest_sha256"),
+            checkpoint_sha256=_cfg_required(cfg, "checkpoint_sha256"),
+            evaluation_split="test",
+        )
         fixed_prediction_rows = tuple(
             item
             for item in prediction_rows

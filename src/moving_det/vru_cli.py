@@ -3825,17 +3825,14 @@ def _evaluation_file_signature(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _canonical_evaluation_source(path: Path, *, label: str) -> Path:
+def _absolute_evaluation_source(path: Path, *, label: str) -> Path:
     source = Path(path)
     if not source.parts or ".." in source.parts or "\x00" in str(source):
         raise WorkflowError(f"{label} path alias or traversal is forbidden")
-    _reject_symlink_components(source)
-    try:
-        resolved = source.resolve(strict=True)
-    except OSError as exc:
-        raise WorkflowError(f"{label} is missing or unsafe: {source}") from exc
-    _reject_symlink_components(resolved)
-    return resolved
+    absolute = Path(os.path.abspath(source))
+    if not absolute.is_absolute() or ".." in absolute.parts:
+        raise WorkflowError(f"{label} must resolve lexically below a trusted root")
+    return absolute
 
 
 def _open_evaluation_directory(
@@ -3845,43 +3842,78 @@ def _open_evaluation_directory(
     flags: int,
     registry: _EvaluationFileDescriptorRegistry,
 ) -> tuple[int, Path]:
-    source = _canonical_evaluation_source(path, label=label)
+    source = _absolute_evaluation_source(path, label=label)
+    components = source.parts[1:]
+    current_descriptor: int | None = None
     try:
-        before = os.stat(source, follow_symlinks=False)
-        descriptor = registry.own(
-            os.open(source, flags),
-            f"{label} directory",
+        current_descriptor = registry.own(
+            os.open(Path("/"), flags),
+            f"{label} trusted-root directory",
         )
-        opened = os.fstat(descriptor)
-        after = os.stat(source, follow_symlinks=False)
+        root_stat = os.fstat(current_descriptor)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise WorkflowError("evaluation trusted root is not a directory")
+        for component in components:
+            if (
+                not component
+                or component in {".", ".."}
+                or "/" in component
+                or "\x00" in component
+            ):
+                raise WorkflowError(f"{label} path component is unsafe")
+            before = os.stat(
+                component,
+                dir_fd=current_descriptor,
+                follow_symlinks=False,
+            )
+            next_descriptor = registry.own(
+                os.open(
+                    component,
+                    flags,
+                    dir_fd=current_descriptor,
+                ),
+                f"{label} path component {component}",
+            )
+            opened = os.fstat(next_descriptor)
+            after = os.stat(
+                component,
+                dir_fd=current_descriptor,
+                follow_symlinks=False,
+            )
+            expected = (
+                stat.S_IFMT(before.st_mode),
+                before.st_dev,
+                before.st_ino,
+            )
+            if (
+                not stat.S_ISDIR(before.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(after.st_mode)
+                or expected
+                != (
+                    stat.S_IFMT(opened.st_mode),
+                    opened.st_dev,
+                    opened.st_ino,
+                )
+                or expected
+                != (
+                    stat.S_IFMT(after.st_mode),
+                    after.st_dev,
+                    after.st_ino,
+                )
+            ):
+                raise WorkflowError(
+                    f"{label} path component changed while opening: {component}"
+                )
+            _close_evaluation_descriptor(registry, current_descriptor)
+            current_descriptor = next_descriptor
     except WorkflowError:
         raise
     except OSError as exc:
         raise WorkflowError(f"{label} is missing or unsafe: {source}") from exc
-    expected = (
-        stat.S_IFMT(before.st_mode),
-        before.st_dev,
-        before.st_ino,
-    )
-    if (
-        not stat.S_ISDIR(before.st_mode)
-        or not stat.S_ISDIR(opened.st_mode)
-        or not stat.S_ISDIR(after.st_mode)
-        or expected
-        != (
-            stat.S_IFMT(opened.st_mode),
-            opened.st_dev,
-            opened.st_ino,
-        )
-        or expected
-        != (
-            stat.S_IFMT(after.st_mode),
-            after.st_dev,
-            after.st_ino,
-        )
-    ):
-        raise WorkflowError(f"{label} changed while opening: {source}")
-    return descriptor, source
+    if current_descriptor is None:  # pragma: no cover - root open is mandatory
+        raise WorkflowError(f"{label} directory open produced no descriptor")
+    return current_descriptor, source
 
 
 def _write_evaluation_snapshot_chunk(descriptor: int, content: bytes) -> None:
@@ -3897,49 +3929,44 @@ def _write_evaluation_snapshot_chunk(descriptor: int, content: bytes) -> None:
 
 
 def _copy_evaluation_regular_file(
-    source_name: str | Path,
+    source_name: str,
     destination: Path,
     *,
     label: str,
     source_flags: int,
     destination_flags: int,
     registry: _EvaluationFileDescriptorRegistry,
-    source_directory_fd: int | None = None,
+    source_directory_fd: int,
 ) -> tuple[str, tuple[int, int]]:
-    if source_directory_fd is None:
-        source_path = _canonical_evaluation_source(
-            Path(source_name),
-            label=label,
-        )
-        open_target: str | Path = source_path
-        stat_target: str | Path = source_path
-        stat_kwargs: dict[str, object] = {"follow_symlinks": False}
-        open_kwargs: dict[str, object] = {}
-    else:
-        if (
-            not isinstance(source_name, str)
-            or not source_name
-            or source_name in {".", ".."}
-            or "/" in source_name
-            or "\\" in source_name
-            or "\x00" in source_name
-        ):
-            raise WorkflowError(f"{label} entry name is unsafe")
-        open_target = source_name
-        stat_target = source_name
-        stat_kwargs = {
-            "dir_fd": source_directory_fd,
-            "follow_symlinks": False,
-        }
-        open_kwargs = {"dir_fd": source_directory_fd}
+    if (
+        not isinstance(source_name, str)
+        or not source_name
+        or source_name in {".", ".."}
+        or "/" in source_name
+        or "\\" in source_name
+        or "\x00" in source_name
+    ):
+        raise WorkflowError(f"{label} entry name is unsafe")
     try:
-        before = os.stat(stat_target, **stat_kwargs)
+        before = os.stat(
+            source_name,
+            dir_fd=source_directory_fd,
+            follow_symlinks=False,
+        )
         source_descriptor = registry.own(
-            os.open(open_target, source_flags, **open_kwargs),
+            os.open(
+                source_name,
+                source_flags,
+                dir_fd=source_directory_fd,
+            ),
             f"{label} source",
         )
         opened = os.fstat(source_descriptor)
-        path_after_open = os.stat(stat_target, **stat_kwargs)
+        path_after_open = os.stat(
+            source_name,
+            dir_fd=source_directory_fd,
+            follow_symlinks=False,
+        )
     except WorkflowError:
         raise
     except OSError as exc:
@@ -4058,21 +4085,32 @@ def _snapshot_evaluation_inputs(
         _close_evaluation_descriptor(registry, manifest_fd)
         manifest_sha256 = _manifest_fingerprint(manifest_snapshot)
 
-        checkpoint_source = _canonical_evaluation_source(
+        checkpoint_source = _absolute_evaluation_source(
             Path(checkpoint),
             label="evaluation checkpoint",
         )
+        checkpoint_parent_fd, checkpoint_parent_source = (
+            _open_evaluation_directory(
+                checkpoint_source.parent,
+                label="evaluation checkpoint parent",
+                flags=directory_flags,
+                registry=registry,
+            )
+        )
+        checkpoint_source = checkpoint_parent_source / checkpoint_source.name
         checkpoint_snapshot = root / "checkpoint.pt"
         checkpoint_sha256, checkpoint_identity = (
             _copy_evaluation_regular_file(
-                checkpoint_source,
+                checkpoint_source.name,
                 checkpoint_snapshot,
                 label="evaluation checkpoint",
                 source_flags=source_flags,
                 destination_flags=destination_flags,
                 registry=registry,
+                source_directory_fd=checkpoint_parent_fd,
             )
         )
+        _close_evaluation_descriptor(registry, checkpoint_parent_fd)
         if checkpoint_identity in source_identities:
             raise WorkflowError("evaluation inputs contain path aliases")
         source_identities.add(checkpoint_identity)
@@ -4097,7 +4135,7 @@ def _snapshot_evaluation_inputs(
                 raise WorkflowError(
                     "test threshold lexical name must be exactly threshold.json"
                 )
-            threshold_source = _canonical_evaluation_source(
+            threshold_source = _absolute_evaluation_source(
                 requested_threshold,
                 label="validation threshold",
             )
@@ -4110,6 +4148,7 @@ def _snapshot_evaluation_inputs(
                 flags=directory_flags,
                 registry=registry,
             )
+            threshold_source = validation_source / threshold_source.name
             try:
                 validation_names = tuple(sorted(os.listdir(validation_fd)))
             except OSError as exc:
@@ -4123,7 +4162,61 @@ def _snapshot_evaluation_inputs(
                     "validation threshold must belong to a complete evaluation run"
                 )
             validation_digests = {}
-            for name in validation_names:
+            run_digest, run_identity = _copy_evaluation_regular_file(
+                "run.json",
+                validation_snapshot / "run.json",
+                label="validation run artifact run.json",
+                source_flags=source_flags,
+                destination_flags=destination_flags,
+                registry=registry,
+                source_directory_fd=validation_fd,
+            )
+            if run_identity in source_identities:
+                raise WorkflowError("evaluation inputs contain path aliases")
+            source_identities.add(run_identity)
+            validation_digests["run.json"] = run_digest
+            validation_run_header = _read_json(
+                validation_snapshot / "run.json"
+            )
+            if not isinstance(validation_run_header, Mapping):
+                raise WorkflowError(
+                    "validation evaluation run metadata must be an object"
+                )
+            _validate_evaluation_run_schema(validation_run_header)
+            if (
+                validation_run_header.get("evaluation_split") != "validation"
+                or validation_run_header.get("model_name") != model_name
+                or validation_run_header.get("manifest_sha256")
+                != manifest_sha256
+                or validation_run_header.get("checkpoint_sha256")
+                != checkpoint_sha256
+            ):
+                raise WorkflowError(
+                    "validation threshold run model/manifest/checkpoint "
+                    "provenance is mismatched"
+                )
+            declared_artifacts = set(
+                validation_run_header["artifact_schema"]
+            )
+            expected_validation_names = {"run.json", *declared_artifacts}
+            actual_validation_names = set(validation_names)
+            if actual_validation_names != expected_validation_names:
+                missing = sorted(
+                    expected_validation_names - actual_validation_names
+                )
+                extra = sorted(
+                    actual_validation_names - expected_validation_names
+                )
+                details = []
+                if missing:
+                    details.append(f"missing: {', '.join(missing)}")
+                if extra:
+                    details.append(f"extra: {', '.join(extra)}")
+                raise WorkflowError(
+                    "validation evaluation run artifact set is invalid"
+                    + (f" ({'; '.join(details)})" if details else "")
+                )
+            for name in sorted(declared_artifacts):
                 digest, identity = _copy_evaluation_regular_file(
                     name,
                     validation_snapshot / name,

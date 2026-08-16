@@ -118,18 +118,17 @@ def _test_cfg(
     continuity_frames,
     threshold=0.5,
 ):
-    threshold_path = freeze_validation_threshold(
-        tmp_path / "threshold.json",
-        ThresholdEvidence(
-            schema_version=1,
-            model_name="baseline",
-            split="validation",
-            manifest_sha256="a" * 64,
-            checkpoint_sha256="b" * 64,
-            threshold=threshold,
-            f1_riou_025=0.5,
-            false_detections_per_frame=0.0,
-        ),
+    threshold_evidence = MappingProxyType(
+        {
+            "schema_version": 1,
+            "model_name": "baseline",
+            "split": "validation",
+            "manifest_sha256": "a" * 64,
+            "checkpoint_sha256": "b" * 64,
+            "threshold": threshold,
+            "f1_riou_025": 0.5,
+            "false_detections_per_frame": 0.0,
+        }
     )
     union = tuple(sorted(set(detection_frames) | set(continuity_frames)))
     return _cfg(
@@ -137,7 +136,7 @@ def _test_cfg(
         detection_frames=detection_frames,
         continuity_frames=continuity_frames,
         evaluation_split="test",
-        threshold_path=threshold_path,
+        threshold_evidence=threshold_evidence,
         model_name="baseline",
         manifest_sha256="a" * 64,
         checkpoint_sha256="b" * 64,
@@ -930,6 +929,9 @@ def test_primary_test_evaluation_requires_and_enforces_frozen_threshold(
     test_cfg = _cfg(
         evaluation_split="test",
         threshold_path=threshold_path,
+        threshold_evidence=MappingProxyType(
+            json.loads(threshold_path.read_text(encoding="utf-8"))
+        ),
         model_name="mg_vtod",
         manifest_sha256="a" * 64,
         checkpoint_sha256="b" * 64,
@@ -946,6 +948,9 @@ def test_primary_test_evaluation_requires_and_enforces_frozen_threshold(
             _cfg(
                 evaluation_split="test",
                 threshold_path=threshold_path,
+                threshold_evidence=MappingProxyType(
+                    json.loads(threshold_path.read_text(encoding="utf-8"))
+                ),
                 model_name="baseline",
                 manifest_sha256="a" * 64,
                 checkpoint_sha256="b" * 64,
@@ -957,6 +962,37 @@ def test_primary_test_evaluation_requires_and_enforces_frozen_threshold(
             (_gt(1),),
             _cfg(
                 evaluation_split="test",
+                model_name="mg_vtod",
+                manifest_sha256="a" * 64,
+                checkpoint_sha256="b" * 64,
+            ),
+        )
+
+
+def test_primary_test_evaluation_rejects_bare_threshold_path_without_evidence(
+    tmp_path,
+):
+    threshold_path = freeze_validation_threshold(
+        tmp_path / "threshold.json",
+        ThresholdEvidence(
+            schema_version=1,
+            model_name="mg_vtod",
+            split="validation",
+            manifest_sha256="a" * 64,
+            checkpoint_sha256="b" * 64,
+            threshold=0.8,
+            f1_riou_025=1.0,
+            false_detections_per_frame=0.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="pre-authenticated|evidence"):
+        evaluate_temporal_obb(
+            (_pred(1, confidence=0.9),),
+            (_gt(1),),
+            _cfg(
+                evaluation_split="test",
+                threshold_path=threshold_path,
                 model_name="mg_vtod",
                 manifest_sha256="a" * 64,
                 checkpoint_sha256="b" * 64,

@@ -2428,14 +2428,15 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
 
     import moving_det.ml.factory as factory
     import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
-    import moving_det.ml.human_evaluation as human_evaluation
     import moving_det.ml.inference as inference
     import moving_det.ml.training as training
     import moving_det.vru_cli as vru_cli
     import moving_det.vrud.alignment as alignment
     import moving_det.vrud.index as index
     from moving_det.ml.human_benchmark import HumanBenchmark, HumanFrame, HumanTruth
+    from moving_det.ml.inference import Detection
     from moving_det.models import OBB
+    from moving_det.vrud.tiling import Tile
 
     image_path = (
         tmp_path / "images" / "site19_sequence" / "sequence_a" / "000031.jpg"
@@ -2520,7 +2521,6 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
     model = HumanModel()
     snapshot = SimpleNamespace(fingerprint="e" * 64)
     loaded_records = []
-    evaluated = []
     monkeypatch.setattr(
         benchmark_artifacts,
         "load_human_benchmark",
@@ -2573,26 +2573,20 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
         }
 
     monkeypatch.setattr(vru_cli, "_load_full_frame_clip", load_clip)
-    monkeypatch.setattr(inference, "infer_full_frame", lambda *values: ())
     monkeypatch.setattr(
-        human_evaluation,
-        "evaluate_human_predictions",
-        lambda predictions, received, received_cfg: evaluated.append(
-            (predictions, received, received_cfg)
-        )
-        or {
-            "per_class": {},
-            "per_size": {},
-            "per_pixel_speed": {},
-            "per_visible_span": {},
-            "per_track": {},
-            "audit": {
-                "edge_ignore_count": 0,
-                "suppressed_prediction_count": 0,
-                "metadata_error_count": 0,
-                "geometry_error_count": 0,
-            },
-        },
+        inference,
+        "infer_full_frame",
+        lambda *values: (
+            Detection(
+                frame=31,
+                obb=OBB(4.0, 4.0, 4.0, 2.0, 0.0),
+                class_id=3,
+                confidence=0.75,
+                tile=Tile(0, 0, 8, 8),
+                site="site19",
+                sequence="sequence_a",
+            ),
+        ),
     )
     for old_loader in (
         (index, "load_track_index"),
@@ -2610,6 +2604,12 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
         "_extract_model_diagnostic",
         lambda *args, **kwargs: {},
     )
+    replacement_threshold = json.loads(threshold.read_text(encoding="utf-8"))
+    replacement_threshold["threshold"] = 0.99
+    threshold.write_text(
+        json.dumps(replacement_threshold, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
     artifacts = _evaluate_real(request)
 
@@ -2622,8 +2622,10 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
             "image_sha256": "d" * 64,
         }
     ]
-    assert evaluated[0][1].truths[0].class_id == 3
-    assert evaluated[0][2]["threshold"] == 0.5
+    assert artifacts.metrics["threshold"] == 0.5
+    assert artifacts.metrics["prediction_count"] == 1
+    assert artifacts.metrics["recall_riou_025"] == 1.0
+    assert len(artifacts.predictions) == 1
     assert artifacts.ground_truth[0]["class_id"] == 3
     assert artifacts.ground_truth[0]["pixel_speed_per_frame"] == 2.5
     assert artifacts.ground_truth[0]["visible_span"] == 6
@@ -6847,6 +6849,275 @@ def _fixed_test_provenance(*_args):
     }
 
 
+def _replacement_snapshot_case(tmp_path: Path, source_kind: str):
+    manifest = tmp_path / "manifest-source"
+    _manifest_children(manifest, [])
+    checkpoint_root = tmp_path / "checkpoint-source"
+    checkpoint_root.mkdir()
+    checkpoint = checkpoint_root / "best.pt"
+    checkpoint.write_bytes(b"original checkpoint bytes")
+    threshold = None
+    if source_kind == "manifest":
+        active = manifest
+        replacement = tmp_path / "replacement-manifest"
+        _manifest_children(replacement, [])
+        (replacement / "test.jsonl").write_bytes(
+            b'{"replacement":true}\n'
+        )
+        stat_trigger = active
+        expected = _manifest_fingerprint(manifest)
+    elif source_kind == "checkpoint":
+        active = checkpoint_root
+        replacement = tmp_path / "replacement-checkpoint-source"
+        replacement.mkdir()
+        (replacement / checkpoint.name).write_bytes(
+            b"replacement checkpoint bytes"
+        )
+        stat_trigger = checkpoint
+        expected = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    elif source_kind == "threshold-run":
+        threshold = _publish_strict_validation_run(
+            tmp_path / "validation-source",
+            manifest=manifest,
+            checkpoint=checkpoint,
+            threshold=0.5,
+        )
+        replacement_threshold = _publish_strict_validation_run(
+            tmp_path / "replacement-validation-source",
+            manifest=manifest,
+            checkpoint=checkpoint,
+            threshold=0.99,
+        )
+        active = threshold.parent
+        replacement = replacement_threshold.parent
+        stat_trigger = active
+        expected = 0.5
+    else:  # pragma: no cover - test parameter contract
+        raise AssertionError(source_kind)
+    return {
+        "manifest": manifest,
+        "checkpoint": checkpoint,
+        "threshold": threshold,
+        "active": active,
+        "replacement": replacement,
+        "stat_trigger": stat_trigger,
+        "expected": expected,
+    }
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    ("manifest", "checkpoint", "threshold-run"),
+)
+def test_evaluation_snapshot_never_consumes_persistent_parent_replacement(
+    tmp_path,
+    monkeypatch,
+    source_kind,
+):
+    case = _replacement_snapshot_case(tmp_path, source_kind)
+    active = case["active"]
+    replacement = case["replacement"]
+    moved = active.with_name(f"{active.name}-opened-original")
+    real_stat = vru_cli_module.os.stat
+    real_open = vru_cli_module.os.open
+    swapped = False
+
+    def persist_replacement():
+        nonlocal swapped
+        if swapped:
+            return
+        active.rename(moved)
+        replacement.rename(active)
+        swapped = True
+
+    def stat_after_canonical_check(path, *args, **kwargs):
+        if (
+            not swapped
+            and kwargs.get("dir_fd") is None
+            and Path(path) == case["stat_trigger"]
+        ):
+            persist_replacement()
+        return real_stat(path, *args, **kwargs)
+
+    def open_component_then_replace(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if (
+            not swapped
+            and kwargs.get("dir_fd") is not None
+            and path == active.name
+            and stat.S_ISDIR(vru_cli_module.os.fstat(descriptor).st_mode)
+        ):
+            persist_replacement()
+        return descriptor
+
+    monkeypatch.setattr(vru_cli_module.os, "stat", stat_after_canonical_check)
+    monkeypatch.setattr(vru_cli_module.os, "open", open_component_then_replace)
+    accepted = False
+    consumed = None
+    try:
+        try:
+            with vru_cli_module._snapshot_evaluation_inputs(
+                case["manifest"],
+                case["checkpoint"],
+                case["threshold"],
+                {"model_name": "baseline"},
+            ) as inputs:
+                accepted = True
+                if source_kind == "manifest":
+                    consumed = inputs.manifest_sha256
+                elif source_kind == "checkpoint":
+                    consumed = inputs.checkpoint_sha256
+                else:
+                    consumed = inputs.threshold_evidence["threshold"]
+        except WorkflowError:
+            pass
+    finally:
+        if moved.exists():
+            if active.exists():
+                active.rename(replacement)
+            moved.rename(active)
+
+    assert swapped is True
+    if accepted:
+        assert consumed == case["expected"]
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    ("manifest", "checkpoint", "threshold-run"),
+)
+def test_evaluation_snapshot_never_consumes_rename_restore_replacement(
+    tmp_path,
+    monkeypatch,
+    source_kind,
+):
+    case = _replacement_snapshot_case(tmp_path, source_kind)
+    active = case["active"]
+    replacement = case["replacement"]
+    moved = active.with_name(f"{active.name}-temporarily-renamed")
+    real_open = vru_cli_module.os.open
+    mutation_count = 0
+
+    def swap():
+        active.rename(moved)
+        replacement.rename(active)
+
+    def restore():
+        active.rename(replacement)
+        moved.rename(active)
+
+    def open_during_rename_restore(path, flags, *args, **kwargs):
+        nonlocal mutation_count
+        full_path_trigger = (
+            kwargs.get("dir_fd") is None
+            and Path(path) == case["stat_trigger"]
+        )
+        relative_component_trigger = (
+            kwargs.get("dir_fd") is not None
+            and path == active.name
+        )
+        if full_path_trigger:
+            swap()
+            try:
+                descriptor = real_open(path, flags, *args, **kwargs)
+            finally:
+                restore()
+            mutation_count += 1
+            return descriptor
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if relative_component_trigger:
+            swap()
+            restore()
+            mutation_count += 1
+        return descriptor
+
+    monkeypatch.setattr(
+        vru_cli_module.os,
+        "open",
+        open_during_rename_restore,
+    )
+    accepted = False
+    consumed = None
+    try:
+        with vru_cli_module._snapshot_evaluation_inputs(
+            case["manifest"],
+            case["checkpoint"],
+            case["threshold"],
+            {"model_name": "baseline"},
+        ) as inputs:
+            accepted = True
+            if source_kind == "manifest":
+                consumed = inputs.manifest_sha256
+            elif source_kind == "checkpoint":
+                consumed = inputs.checkpoint_sha256
+            else:
+                consumed = inputs.threshold_evidence["threshold"]
+    except WorkflowError:
+        pass
+
+    assert mutation_count == 1
+    if accepted:
+        assert consumed == case["expected"]
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "unsafe_parent_kind"),
+    (
+        (source_kind, unsafe_parent_kind)
+        for source_kind in ("manifest", "checkpoint", "threshold-run")
+        for unsafe_parent_kind in ("symlink", "fifo")
+    ),
+)
+def test_evaluation_snapshot_rejects_symlink_or_fifo_parent_component(
+    tmp_path,
+    monkeypatch,
+    source_kind,
+    unsafe_parent_kind,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    safe_parent = tmp_path / "safe-parent"
+    safe_parent.mkdir()
+    if source_kind == "manifest":
+        source = safe_parent / "nested-manifest"
+        _manifest_children(source, [])
+    elif source_kind == "checkpoint":
+        source = safe_parent / "nested-checkpoint.pt"
+        source.write_bytes(b"nested checkpoint")
+    else:
+        source = _publish_strict_validation_run(
+            safe_parent / "nested-validation",
+            manifest=manifest,
+            checkpoint=checkpoint,
+        )
+    unsafe_parent = tmp_path / "unsafe-parent"
+    if unsafe_parent_kind == "symlink":
+        unsafe_parent.symlink_to(safe_parent, target_is_directory=True)
+    else:
+        vru_cli_module.os.mkfifo(unsafe_parent)
+    if source_kind == "manifest":
+        manifest = unsafe_parent / source.name
+    elif source_kind == "checkpoint":
+        checkpoint = unsafe_parent / source.name
+    else:
+        source = unsafe_parent / source.parent.name / "threshold.json"
+    threshold = source if source_kind == "threshold-run" else None
+    monkeypatch.setattr(vru_cli_module.tempfile, "tempdir", str(tmp_path))
+
+    with pytest.raises(WorkflowError, match="symlink|unsafe|missing"):
+        with vru_cli_module._snapshot_evaluation_inputs(
+            manifest,
+            checkpoint,
+            threshold,
+            {"model_name": "baseline"},
+        ):
+            pytest.fail("unsafe parent path must not yield a snapshot")
+
+    assert not list(tmp_path.glob("moving-det-evaluation-*"))
+
+
 @pytest.mark.parametrize(
     "defect",
     ("bare", "copied", "edited", "changed-run-digest", "wrong-checkpoint"),
@@ -7048,6 +7319,91 @@ def test_evaluate_consumes_one_private_snapshot_after_source_replacement(
     assert not observed["snapshot_root"].exists()
 
 
+@REQUIRES_TORCH
+def test_real_checkpoint_and_manifest_consumers_share_the_private_snapshot(
+    tmp_path,
+):
+    import torch
+
+    from moving_det.ml.training import (
+        load_experiment_checkpoint,
+        save_checkpoint,
+    )
+
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    original_row = {
+        "split": "test",
+        "site": "site19",
+        "sequence": "sequence_a",
+        "center_frame": 31,
+        "tile_xywh": [0, 0, 8, 8],
+        "track_keys": [["site19", "sequence_a", 7]],
+        "source": "evaluation",
+    }
+    (manifest / "test.jsonl").write_text(
+        json.dumps(original_row, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    original_model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        original_model.weight.fill_(0.125)
+    checkpoint = save_checkpoint(
+        original_model,
+        manifest,
+        tmp_path / "checkpoints" / "best.pt",
+        model_name="baseline",
+        generation="original",
+    )
+
+    with vru_cli_module._snapshot_evaluation_inputs(
+        manifest,
+        checkpoint,
+        None,
+        {"model_name": "baseline"},
+    ) as inputs:
+        replacement_model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            replacement_model.weight.fill_(0.875)
+        save_checkpoint(
+            replacement_model,
+            manifest,
+            checkpoint,
+            model_name="baseline",
+            generation="replacement",
+        )
+        replacement_row = {
+            **original_row,
+            "center_frame": 99,
+            "track_keys": [["site19", "sequence_a", 9]],
+        }
+        (manifest / "test.jsonl").write_text(
+            json.dumps(replacement_row, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+        loaded_model = torch.nn.Linear(1, 1, bias=False)
+        payload = load_experiment_checkpoint(
+            loaded_model,
+            inputs.checkpoint,
+            inputs.manifest_dir,
+        )
+        records = _evaluation_frame_records(inputs.manifest_dir, "test")
+
+        assert payload["generation"] == "original"
+        assert loaded_model.weight.detach().item() == pytest.approx(0.125)
+        assert records == (
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "track_keys": (("site19", "sequence_a", 7),),
+                "sources": ("evaluation",),
+            },
+        )
+
+
 def test_evaluation_snapshot_cleanup_runs_when_evaluator_raises(tmp_path):
     manifest = tmp_path / "manifest"
     _manifest_children(manifest, [])
@@ -7199,6 +7555,45 @@ def test_evaluation_snapshot_requires_nonzero_write_open_flag(monkeypatch):
 
     with pytest.raises(WorkflowError, match="O_WRONLY"):
         vru_cli_module._evaluation_snapshot_open_flags()
+
+
+def test_validation_snapshot_rejects_extra_before_copying_its_payload(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    extra = threshold.parent / "forbidden-extra.bin"
+    with extra.open("wb") as stream:
+        stream.truncate(2 * 1024 * 1024 * 1024)
+    real_copy = vru_cli_module._copy_evaluation_regular_file
+
+    def forbid_extra_copy(source_name, *args, **kwargs):
+        if source_name == extra.name:
+            raise AssertionError("validation extra payload was read")
+        return real_copy(source_name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_copy_evaluation_regular_file",
+        forbid_extra_copy,
+    )
+
+    with pytest.raises(WorkflowError, match="artifact set|extra"):
+        with vru_cli_module._snapshot_evaluation_inputs(
+            manifest,
+            checkpoint,
+            threshold,
+            {"model_name": "baseline"},
+        ):
+            pytest.fail("validation run with extra payload must be rejected")
 
 
 def test_evaluate_test_records_frozen_threshold_source_and_never_reselects(
