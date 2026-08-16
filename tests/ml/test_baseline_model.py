@@ -1,5 +1,8 @@
 from collections import OrderedDict
 import hashlib
+import json
+import pickle
+import zipfile
 
 import pytest
 import torch
@@ -389,3 +392,257 @@ def test_universal_artifact_marker_always_routes_to_strict_loader(
 
     with pytest.raises(ValueError, match="frozen initialization children"):
         create_p2_obb_detector(weights=artifact, nc=4)
+
+
+@pytest.mark.parametrize("nc", [4, 4.0])
+def test_marker_with_weights_only_unsupported_value_fails_before_models(
+    tmp_path,
+    monkeypatch,
+    nc,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+    )
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("tagged artifact must fail before model construction")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(
+        ValueError,
+        match="frozen initialization children|plain integer nc=4",
+    ):
+        create_p2_obb_detector(weights=artifact, nc=nc)
+
+
+def test_ordered_marker_with_unsupported_value_fails_before_models(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        OrderedDict(
+            (
+                ("artifact_kind", "universal_p2_initialization"),
+                ("unsupported", torch.nn.Linear(2, 2)),
+            )
+        ),
+        artifact,
+    )
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("tagged artifact must fail before model construction")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(ValueError, match="frozen initialization children"):
+        create_p2_obb_detector(weights=artifact, nc=4)
+
+
+@pytest.mark.parametrize(
+    "pickle_protocol",
+    range(pickle.HIGHEST_PROTOCOL + 1),
+)
+def test_legacy_marker_with_unsupported_value_fails_before_models(
+    tmp_path,
+    monkeypatch,
+    pickle_protocol,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+        _use_new_zipfile_serialization=False,
+        pickle_protocol=pickle_protocol,
+    )
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("legacy tagged artifact must fail before construction")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(ValueError, match="frozen initialization children"):
+        create_p2_obb_detector(weights=artifact, nc=4)
+
+
+@pytest.mark.parametrize("indeterminate", ["multiple-pickles", "probe-limit"])
+def test_indeterminate_tagged_torch_archive_fails_before_models(
+    tmp_path,
+    monkeypatch,
+    indeterminate,
+):
+    artifact = tmp_path / "p2-init.pt"
+    torch.save(
+        {
+            "artifact_kind": "universal_p2_initialization",
+            "unsupported": torch.nn.Linear(2, 2),
+        },
+        artifact,
+    )
+    with zipfile.ZipFile(artifact) as archive:
+        pickle_name = next(
+            info.filename
+            for info in archive.infolist()
+            if info.filename.endswith("/data.pkl")
+        )
+        pickle_content = archive.read(pickle_name)
+    if indeterminate == "multiple-pickles":
+        with zipfile.ZipFile(artifact, mode="a") as archive:
+            archive.writestr("ambiguous/data.pkl", pickle_content)
+    else:
+        monkeypatch.setattr(
+            transfer_module,
+            "_PICKLE_PROBE_LIMIT",
+            len(pickle_content) - 1,
+        )
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("indeterminate archive must fail before construction")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(ValueError, match="frozen initialization"):
+        create_p2_obb_detector(weights=artifact, nc=4)
+
+
+def test_complete_tagged_artifact_with_unsupported_value_fails_before_models(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = _freeze_small_p2_artifact(tmp_path, monkeypatch)
+    payload = torch.load(artifact, map_location="cpu", weights_only=True)
+    payload["unsupported"] = torch.nn.Linear(2, 2)
+    torch.save(payload, artifact)
+    run_path = artifact.parent / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["artifacts"]["p2-init.pt"]["sha256"] = hashlib.sha256(
+        artifact.read_bytes()
+    ).hexdigest()
+    run_path.write_text(
+        json.dumps(
+            run,
+            allow_nan=False,
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("tagged artifact must fail before model construction")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(ValueError, match="checkpoint payload is malformed"):
+        create_p2_obb_detector(weights=artifact, nc=4)
+
+
+@pytest.mark.parametrize(
+    ("legacy", "pickle_protocol"),
+    [(False, 2)]
+    + [
+        (True, protocol)
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
+    ],
+)
+def test_unmarked_weights_only_unsupported_checkpoint_still_uses_yolo(
+    tmp_path,
+    monkeypatch,
+    legacy,
+    pickle_protocol,
+):
+    ordinary = tmp_path / "ordinary.pt"
+    torch.save(
+        {"model": torch.nn.Linear(2, 2)},
+        ordinary,
+        _use_new_zipfile_serialization=not legacy,
+        pickle_protocol=pickle_protocol,
+    )
+
+    class SourceModel:
+        def float(self):
+            return self
+
+        def state_dict(self):
+            return OrderedDict(
+                {"model.000.weight": torch.tensor([3.0, 4.0])}
+            )
+
+    class LocalYOLO:
+        def __init__(self, weights):
+            assert weights == str(ordinary)
+            self.model = SourceModel()
+
+    monkeypatch.setattr(baseline_module, "YOLO", LocalYOLO)
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    detector = create_p2_obb_detector(weights=ordinary, nc=4)
+
+    assert detector.initialization_kind == "ultralytics"
+    assert detector.transferred_tensors == 1
+
+
+@pytest.mark.parametrize("root_kind", ["dict", "ordered", "list", "tuple"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_nested_marker_in_ordinary_unsupported_checkpoint_still_uses_yolo(
+    tmp_path,
+    monkeypatch,
+    root_kind,
+    legacy,
+):
+    ordinary = tmp_path / "ordinary.pt"
+    nested = {"artifact_kind": "universal_p2_initialization"}
+    unsupported = torch.nn.Linear(2, 2)
+    if root_kind == "dict":
+        payload = {"metadata": nested, "model": unsupported}
+    elif root_kind == "ordered":
+        payload = OrderedDict(
+            (("metadata", nested), ("model", unsupported))
+        )
+    elif root_kind == "list":
+        payload = [nested, unsupported]
+    else:
+        payload = (nested, unsupported)
+    torch.save(
+        payload,
+        ordinary,
+        _use_new_zipfile_serialization=not legacy,
+    )
+
+    class SourceModel:
+        def float(self):
+            return self
+
+        def state_dict(self):
+            return OrderedDict(
+                {"model.000.weight": torch.tensor([5.0, 6.0])}
+            )
+
+    class LocalYOLO:
+        def __init__(self, weights):
+            assert weights == str(ordinary)
+            self.model = SourceModel()
+
+    monkeypatch.setattr(baseline_module, "YOLO", LocalYOLO)
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    detector = create_p2_obb_detector(weights=ordinary, nc=4)
+
+    assert detector.initialization_kind == "ultralytics"
+    assert detector.transferred_tensors == 1

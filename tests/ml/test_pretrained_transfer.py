@@ -296,6 +296,9 @@ def test_load_rejects_cross_category_target_partition_tamper(
         "mismatch-equal-shapes",
         "unused-bool",
         "unused-overflow",
+        "unused-product-overflow",
+        "mismatch-product-overflow",
+        "unused-zero-stride-overflow",
     ],
 )
 def test_load_rejects_invalid_transfer_report_shape_schema(
@@ -318,13 +321,38 @@ def test_load_rejects_invalid_transfer_report_shape_schema(
         report["shape_mismatch"][0]["source_shape"] = [2]
     elif tamper == "unused-bool":
         report["unused_source"][0]["shape"] = [True]
-    else:
+    elif tamper == "unused-overflow":
         report["unused_source"][0]["shape"] = [2**63]
+    elif tamper == "unused-product-overflow":
+        report["unused_source"][0]["shape"] = [2**62, 2]
+    elif tamper == "mismatch-product-overflow":
+        report["shape_mismatch"][0]["source_shape"] = [2**62, 2]
+    else:
+        report["unused_source"][0]["shape"] = [0, 2**62, 2]
     _canonical_json(report_path, report)
     _refresh_run_hash(artifact.parent, "transfer_report.json")
 
     with pytest.raises(ValueError, match="shape"):
         load_frozen_p2_initialization(artifact)
+
+
+@pytest.mark.parametrize("valid_shape", [[], [0, 3], [2**62, 0, 2]])
+def test_load_accepts_realizable_zero_and_scalar_source_only_shapes(
+    tmp_path,
+    monkeypatch,
+    valid_shape,
+):
+    artifact = _freeze_with_mismatch_and_unused(tmp_path, monkeypatch)
+    report_path = artifact.parent / "transfer_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["unused_source"][0]["shape"] = valid_shape
+    _canonical_json(report_path, report)
+    _refresh_run_hash(artifact.parent, "transfer_report.json")
+
+    state, provenance = load_frozen_p2_initialization(artifact)
+
+    assert len(state) == 859
+    assert provenance["unused_source"][0]["shape"] == tuple(valid_shape)
 
 
 @pytest.mark.parametrize(

@@ -7,12 +7,14 @@ import io
 import json
 import os
 from pathlib import Path
+import pickletools
 import random
 import shutil
 import struct
 import tempfile
 from types import MappingProxyType
 from typing import Any, Iterator
+import zipfile
 
 import numpy as np
 import torch
@@ -76,6 +78,19 @@ _REPORT_FIELDS = frozenset(
     }
 )
 _RUN_FIELDS = frozenset({"artifact_kind", "schema_version", "artifacts"})
+_PICKLE_PROBE_LIMIT = 16 * 1024 * 1024
+_LEGACY_HEADER_LIMIT = 64 * 1024
+_LEGACY_TORCH_MAGIC = 0x1950A86A20F9469CFC6C
+_LEGACY_TORCH_PROTOCOL = 1001
+_PICKLE_MARK = object()
+_PICKLE_OPAQUE = object()
+_PICKLE_SEQUENCE = object()
+_ARCHIVE_NOT_TORCH = object()
+_ARCHIVE_INDETERMINATE = object()
+
+
+class _ProbeDict(dict[object, object]):
+    pass
 
 
 def _validated_state(
@@ -173,6 +188,16 @@ def _require_shape(value: object, *, label: str) -> list[int]:
         raise ValueError(
             f"{label} shape dimensions must be plain non-negative integers"
         )
+    signed_storage_max = 2**63 - 1
+    trailing_stride = 1
+    for dimension in reversed(value[1:]):
+        stride_factor = max(dimension, 1)
+        if trailing_stride > signed_storage_max // stride_factor:
+            raise ValueError(f"{label} shape stride calculation overflows")
+        trailing_stride *= stride_factor
+    if value and 0 not in value:
+        if trailing_stride > signed_storage_max // value[0]:
+            raise ValueError(f"{label} shape storage size overflows")
     return value
 
 
@@ -350,6 +375,308 @@ def _target_config_sha256() -> str:
     return _sha256_regular_file(_P2_MODEL_CONFIG, label="P2 target config")
 
 
+def _marked_items(stack: list[object]) -> tuple[int, list[object]] | None:
+    for index in range(len(stack) - 1, -1, -1):
+        if stack[index] is _PICKLE_MARK:
+            return index, stack[index + 1 :]
+    return None
+
+
+def _probe_pickle_top_level_marker(content: bytes) -> bool | None:
+    stack: list[object] = []
+    memo: dict[int, object] = {}
+    unicode_ops = {
+        "STRING",
+        "UNICODE",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+        "BINUNICODE8",
+    }
+    scalar_ops = {
+        "NONE",
+        "NEWTRUE",
+        "NEWFALSE",
+        "INT",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "LONG",
+        "LONG1",
+        "LONG4",
+        "FLOAT",
+        "BINFLOAT",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "BINBYTES",
+        "SHORT_BINBYTES",
+        "BINBYTES8",
+        "BYTEARRAY8",
+        "PERSID",
+        "NEXT_BUFFER",
+    }
+    memo_put_ops = {"PUT", "BINPUT", "LONG_BINPUT"}
+    memo_get_ops = {"GET", "BINGET", "LONG_BINGET"}
+    try:
+        operations = pickletools.genops(content)
+        for opcode, argument, _position in operations:
+            name = opcode.name
+            if name in {"PROTO", "FRAME"}:
+                continue
+            if name == "MARK":
+                stack.append(_PICKLE_MARK)
+            elif name in unicode_ops:
+                stack.append(argument if isinstance(argument, str) else _PICKLE_OPAQUE)
+            elif name in scalar_ops:
+                stack.append(_PICKLE_OPAQUE)
+            elif name == "EMPTY_DICT":
+                stack.append(_ProbeDict())
+            elif name in {"EMPTY_LIST", "EMPTY_TUPLE", "EMPTY_SET"}:
+                stack.append(_PICKLE_SEQUENCE)
+            elif name == "DICT":
+                marked = _marked_items(stack)
+                if marked is None:
+                    return None
+                mark_index, items = marked
+                del stack[mark_index:]
+                mapping = _ProbeDict()
+                if len(items) % 2:
+                    return None
+                for index in range(0, len(items), 2):
+                    mapping[items[index]] = items[index + 1]
+                stack.append(mapping)
+            elif name == "SETITEM":
+                if len(stack) < 3:
+                    return None
+                value = stack.pop()
+                key = stack.pop()
+                mapping = stack[-1]
+                if mapping is _PICKLE_OPAQUE:
+                    mapping = _ProbeDict()
+                    stack[-1] = mapping
+                if isinstance(mapping, _ProbeDict):
+                    mapping[key] = value
+            elif name == "SETITEMS":
+                marked = _marked_items(stack)
+                if marked is None:
+                    return None
+                mark_index, items = marked
+                if mark_index == 0 or len(items) % 2:
+                    return None
+                mapping = stack[mark_index - 1]
+                del stack[mark_index:]
+                if mapping is _PICKLE_OPAQUE:
+                    mapping = _ProbeDict()
+                    stack[mark_index - 1] = mapping
+                if isinstance(mapping, _ProbeDict):
+                    for index in range(0, len(items), 2):
+                        mapping[items[index]] = items[index + 1]
+            elif name in {"LIST", "TUPLE", "FROZENSET"}:
+                marked = _marked_items(stack)
+                if marked is None:
+                    return None
+                mark_index, _items = marked
+                del stack[mark_index:]
+                stack.append(_PICKLE_SEQUENCE)
+            elif name in {"TUPLE1", "TUPLE2", "TUPLE3"}:
+                item_count = int(name[-1])
+                if len(stack) < item_count:
+                    return None
+                del stack[-item_count:]
+                stack.append(_PICKLE_SEQUENCE)
+            elif name in {"APPEND", "ADDITEM"}:
+                if len(stack) < 2:
+                    return None
+                stack.pop()
+            elif name in {"APPENDS", "ADDITEMS"}:
+                marked = _marked_items(stack)
+                if marked is None or marked[0] == 0:
+                    return None
+                del stack[marked[0]:]
+            elif name in memo_put_ops:
+                if not stack:
+                    return None
+                memo[int(argument)] = stack[-1]
+            elif name == "MEMOIZE":
+                if not stack:
+                    return None
+                memo[len(memo)] = stack[-1]
+            elif name in memo_get_ops:
+                memo_index = int(argument)
+                if memo_index not in memo:
+                    return None
+                stack.append(memo[memo_index])
+            elif name == "POP":
+                if not stack:
+                    return None
+                stack.pop()
+            elif name == "POP_MARK":
+                marked = _marked_items(stack)
+                if marked is None:
+                    return None
+                del stack[marked[0]:]
+            elif name == "DUP":
+                if not stack:
+                    return None
+                stack.append(stack[-1])
+            elif name in {"GLOBAL", "EXT1", "EXT2", "EXT4"}:
+                stack.append(_PICKLE_OPAQUE)
+            elif name == "STACK_GLOBAL":
+                if len(stack) < 2:
+                    return None
+                del stack[-2:]
+                stack.append(_PICKLE_OPAQUE)
+            elif name in {"REDUCE", "NEWOBJ"}:
+                if len(stack) < 2:
+                    return None
+                del stack[-2:]
+                stack.append(_PICKLE_OPAQUE)
+            elif name == "NEWOBJ_EX":
+                if len(stack) < 3:
+                    return None
+                del stack[-3:]
+                stack.append(_PICKLE_OPAQUE)
+            elif name == "BUILD":
+                if len(stack) < 2:
+                    return None
+                stack.pop()
+            elif name == "BINPERSID":
+                if not stack:
+                    return None
+                stack[-1] = _PICKLE_OPAQUE
+            elif name in {"OBJ", "INST"}:
+                marked = _marked_items(stack)
+                if marked is None:
+                    return None
+                del stack[marked[0]:]
+                stack.append(_PICKLE_OPAQUE)
+            elif name == "READONLY_BUFFER":
+                if not stack:
+                    return None
+            elif name == "STOP":
+                if not stack:
+                    return None
+                root = stack[-1]
+                if root is _PICKLE_SEQUENCE:
+                    return False
+                if not isinstance(root, _ProbeDict):
+                    return None
+                return root.get("artifact_kind") == _ARTIFACT_KIND
+            else:
+                return None
+    except (ValueError, OverflowError):
+        return None
+    return None
+
+
+def _legacy_scalar_pickle(
+    content: bytes,
+    offset: int,
+) -> tuple[int, int] | None:
+    try:
+        operations = iter(pickletools.genops(content[offset:]))
+        first, first_argument, _first_position = next(operations)
+        if first.name == "PROTO":
+            value, value_argument, _value_position = next(operations)
+            while value.name == "FRAME":
+                value, value_argument, _value_position = next(operations)
+        else:
+            value, value_argument = first, first_argument
+        stop, _stop_argument, stop_position = next(operations)
+    except (StopIteration, ValueError, OverflowError):
+        return None
+    if (
+        value.name
+        not in {
+            "INT",
+            "BININT",
+            "BININT1",
+            "BININT2",
+            "LONG",
+            "LONG1",
+            "LONG4",
+        }
+        or type(value_argument) is not int
+        or stop.name != "STOP"
+    ):
+        return None
+    return value_argument, offset + stop_position + 1
+
+
+def _pickle_stream_end(content: bytes, offset: int) -> int | None:
+    try:
+        for opcode, _argument, position in pickletools.genops(content[offset:]):
+            if opcode.name == "STOP":
+                return offset + position + 1
+    except (ValueError, OverflowError):
+        return None
+    return None
+
+
+def _legacy_torch_pickle(path: Path) -> bytes | object:
+    try:
+        with path.open("rb") as stream:
+            content = stream.read(
+                _PICKLE_PROBE_LIMIT + _LEGACY_HEADER_LIMIT + 1
+            )
+    except OSError:
+        return _ARCHIVE_INDETERMINATE
+    magic = _legacy_scalar_pickle(content, 0)
+    if magic is None or magic[0] != _LEGACY_TORCH_MAGIC:
+        return _ARCHIVE_NOT_TORCH
+    protocol = _legacy_scalar_pickle(content, magic[1])
+    if protocol is None:
+        return _ARCHIVE_INDETERMINATE
+    if protocol[0] != _LEGACY_TORCH_PROTOCOL:
+        return _ARCHIVE_NOT_TORCH
+    system_info_end = _pickle_stream_end(content, protocol[1])
+    if system_info_end is None or system_info_end > _LEGACY_HEADER_LIMIT:
+        return _ARCHIVE_INDETERMINATE
+    payload_end = _pickle_stream_end(content, system_info_end)
+    if payload_end is None:
+        return _ARCHIVE_INDETERMINATE
+    if payload_end - system_info_end > _PICKLE_PROBE_LIMIT:
+        return _ARCHIVE_INDETERMINATE
+    return content[system_info_end:payload_end]
+
+
+def _torch_archive_pickle(path: Path) -> bytes | object:
+    if not path.is_file():
+        return _ARCHIVE_NOT_TORCH
+    try:
+        with zipfile.ZipFile(path) as archive:
+            candidates = [
+                info
+                for info in archive.infolist()
+                if info.filename == "data.pkl"
+                or info.filename.endswith("/data.pkl")
+            ]
+            if len(candidates) != 1:
+                return _ARCHIVE_INDETERMINATE
+            info = candidates[0]
+            if info.file_size < 0 or info.file_size > _PICKLE_PROBE_LIMIT:
+                return _ARCHIVE_INDETERMINATE
+            with archive.open(info) as stream:
+                content = stream.read(_PICKLE_PROBE_LIMIT + 1)
+            if len(content) > _PICKLE_PROBE_LIMIT:
+                return _ARCHIVE_INDETERMINATE
+            return content
+    except zipfile.BadZipFile:
+        return _legacy_torch_pickle(path)
+    except (OSError, ValueError):
+        return _ARCHIVE_INDETERMINATE
+
+
+def _static_frozen_marker_evidence(path: Path) -> bool | None:
+    content = _torch_archive_pickle(path)
+    if content is _ARCHIVE_NOT_TORCH:
+        return False
+    if content is _ARCHIVE_INDETERMINATE:
+        return None
+    assert isinstance(content, bytes)
+    probed = _probe_pickle_top_level_marker(content)
+    return probed
+
+
 def _is_frozen_p2_initialization(path: Path) -> bool:
     try:
         payload = torch.load(
@@ -358,9 +685,10 @@ def _is_frozen_p2_initialization(path: Path) -> bool:
             weights_only=True,
         )
     except Exception:
-        return False
+        marker_evidence = _static_frozen_marker_evidence(path)
+        return marker_evidence is not False
     return (
-        isinstance(payload, dict)
+        isinstance(payload, Mapping)
         and payload.get("artifact_kind") == _ARTIFACT_KIND
     )
 

@@ -53,6 +53,10 @@ def create_p2_obb_detector(
         or nc != 4
     ):
         raise ValueError("frozen P2 initialization requires plain integer nc=4")
+    frozen_state = None
+    provenance = None
+    if frozen:
+        frozen_state, provenance = load_frozen_p2_initialization(Path(weights))
     detector = OBBModel(
         str(_MODEL_CONFIG),
         ch=3,
@@ -69,7 +73,8 @@ def create_p2_obb_detector(
     )
 
     if frozen:
-        frozen_state, provenance = load_frozen_p2_initialization(Path(weights))
+        assert frozen_state is not None
+        assert provenance is not None
         if provenance["target_config_sha256"] != _model_config_sha256():
             raise ValueError("frozen P2 target config hash is unexpected")
         target_state = detector.state_dict()
