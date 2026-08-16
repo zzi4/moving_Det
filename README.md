@@ -129,7 +129,7 @@ conda run -n moving-det-vru moving-det-vru train \
   --config configs/vrud-temporal-obb.yaml \
   --manifest runs/vrud-pilot/manifest \
   --output runs/vrud-pilot/baseline \
-  --weights yolo11m-obb.pt
+  --weights runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt
 ```
 
 MG 和 LSTFE 只能从同一个正式 Baseline `best.pt` 初始化。该 checkpoint 必须直接由
@@ -165,7 +165,7 @@ conda run -n moving-det-vru moving-det-vru train \
   --model baseline \
   --manifest runs/vrud-pilot/manifest \
   --output runs/vrud-pilot/baseline-overfit \
-  --weights yolo11m-obb.pt \
+  --weights runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt \
   --overfit-samples 64 \
   --max-steps 300
 ```
@@ -173,6 +173,18 @@ conda run -n moving-det-vru moving-det-vru train \
 训练输出的主 checkpoint 是 `<output>/checkpoints/best.pt`。恢复同一 run
 使用 `--resume <output>/checkpoints/last.pt`。非默认缓存可通过
 `--alignment-cache /safe/path/alignment-cache` 显式指定。
+
+正式 Baseline 若中断，继续同一输出目录并只使用内部 `last.pt` 恢复；此时不要再传
+`--weights`，原冻结 P2 来源会由 checkpoint 的 `load_provenance` 延续：
+
+```bash
+conda run -n moving-det-vru moving-det-vru train \
+  --model baseline \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/baseline \
+  --resume runs/vrud-pilot/baseline/checkpoints/last.pt
+```
 
 评测必须先在 validation 选择并冻结阈值，再应用到 test：
 
@@ -247,10 +259,12 @@ immutable snapshot 指纹，再把同一个 snapshot 注入真实 MG-VTOD 与 LS
   内容指纹。
 - `<train-output>/run.json`：训练环境、manifest/cache 指纹和
   `load_provenance`；公开权重的实际绝对路径与内容 SHA-256 和 checkpoint
-  使用同一份 provenance。
+  使用同一份 provenance。完成的 run 还用 `checkpoint_artifacts` 分别声明
+  `best.pt`/`last.pt` 的角色、SHA-256、epoch、模型、manifest 与加载来源。
 - `<train-output>/checkpoints/{best,last}.pt`：包含 manifest 指纹、模型名、
-  优化器、恢复状态和 `load_provenance` 的内部实验 checkpoint；从公开 YOLO
-  权重初始化时，后者记录实际已加载本地文件的绝对路径与 SHA-256。内部
+  明确的 `checkpoint_role`、优化器、恢复状态和 `load_provenance` 的内部实验
+  checkpoint；从公开 YOLO 权重初始化时，后者记录实际已加载本地文件的绝对路径
+  与 SHA-256。内部
   init/resume 与公开权重字段严格分离；checkpoint 不能当作公开 YOLO 权重读取。
   正式时序 checkpoint 还会完整保留 Baseline best 的路径/SHA-256/epoch/manifest，
   以及冻结 P2 的路径/SHA-256、Universal 来源 SHA-256 和 427/859 计数。

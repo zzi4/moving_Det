@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import errno
 import hashlib
 import json
 import os
@@ -785,3 +786,166 @@ def test_freeze_rejects_float_nc_before_publishing(tmp_path, monkeypatch):
         freeze_p2_initialization(source_weights, tmp_path / "frozen", nc=4.0)
 
     assert not (tmp_path / "frozen").exists()
+
+
+@pytest.mark.parametrize("restore_original", [False, True])
+def test_checkpoint_snapshot_binds_parent_before_final_file_open(
+    tmp_path,
+    monkeypatch,
+    restore_original,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    source = parent / "weights.pt"
+    source.write_bytes(b"original-parent-bytes")
+    replacement_parent = tmp_path / "replacement-parent"
+    replacement_parent.mkdir()
+    (replacement_parent / source.name).write_bytes(b"replacement-parent-bytes")
+    parked_parent = tmp_path / "parked-parent"
+    real_open = os.open
+    replaced = False
+
+    def replacing_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and Path(path) in {source, Path(source.name)}:
+            parent.rename(parked_parent)
+            replacement_parent.rename(parent)
+            replaced = True
+            descriptor = real_open(path, flags, *args, **kwargs)
+            if restore_original:
+                parent.rename(replacement_parent)
+                parked_parent.rename(parent)
+            return descriptor
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(transfer_module.os, "open", replacing_open)
+
+    with transfer_module._open_checkpoint_snapshot(
+        source,
+        label="test checkpoint",
+    ) as snapshot:
+        snapshot.stream.seek(0)
+        consumed = snapshot.stream.read()
+
+    assert replaced is True
+    assert consumed == b"original-parent-bytes"
+
+
+def test_checkpoint_snapshot_allows_unrelated_ancestor_sibling_creation(
+    tmp_path,
+    monkeypatch,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    source = parent / "weights.pt"
+    source.write_bytes(b"stable")
+    real_open = os.open
+    inserted = False
+
+    def inserting_open(path, flags, *args, **kwargs):
+        nonlocal inserted
+        if not inserted and Path(path) in {source, Path(source.name)}:
+            (tmp_path / "unrelated-sibling").mkdir()
+            inserted = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(transfer_module.os, "open", inserting_open)
+
+    with transfer_module._open_checkpoint_snapshot(
+        source,
+        label="test checkpoint",
+    ) as snapshot:
+        snapshot.stream.seek(0)
+        assert snapshot.stream.read() == b"stable"
+
+    assert inserted is True
+
+
+@pytest.mark.parametrize(
+    "required_flag",
+    ["O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC"],
+)
+def test_checkpoint_snapshot_fails_closed_without_required_open_flags(
+    tmp_path,
+    monkeypatch,
+    required_flag,
+):
+    source = tmp_path / "weights.pt"
+    source.write_bytes(b"checkpoint")
+    monkeypatch.delattr(transfer_module.os, required_flag)
+
+    with pytest.raises(ValueError, match="requires.*support"):
+        with transfer_module._open_checkpoint_snapshot(
+            source,
+            label="test checkpoint",
+        ):
+            raise AssertionError("unsafe open flags must fail before yield")
+
+
+@pytest.mark.parametrize("unsafe_parent", ["symlink", "fifo"])
+def test_checkpoint_snapshot_rejects_unsafe_parent_component_without_blocking(
+    tmp_path,
+    unsafe_parent,
+):
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    (real_parent / "weights.pt").write_bytes(b"checkpoint")
+    parent = tmp_path / "unsafe-parent"
+    if unsafe_parent == "symlink":
+        parent.symlink_to(real_parent, target_is_directory=True)
+    else:
+        os.mkfifo(parent)
+
+    with pytest.raises(ValueError, match="symlink|directory|safely"):
+        with transfer_module._open_checkpoint_snapshot(
+            parent / "weights.pt",
+            label="test checkpoint",
+        ):
+            raise AssertionError("unsafe parent must fail before yield")
+
+
+def test_checkpoint_snapshot_ambiguous_close_never_retries_reused_fd(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "weights.pt"
+    source.write_bytes(b"checkpoint")
+    probe_path = tmp_path / "probe"
+    probe_path.write_bytes(b"probe")
+    real_open = os.open
+    real_close = os.close
+    source_fd = None
+    probe_fd = None
+    injected = False
+
+    def tracking_open(path, flags, *args, **kwargs):
+        nonlocal source_fd
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if Path(path) == Path(source.name) and kwargs.get("dir_fd") is not None:
+            source_fd = descriptor
+        return descriptor
+
+    def ambiguous_close(descriptor):
+        nonlocal injected, probe_fd
+        if descriptor == source_fd and not injected:
+            injected = True
+            real_close(descriptor)
+            probe_fd = real_open(probe_path, os.O_RDONLY)
+            assert probe_fd == descriptor
+            raise OSError(errno.EINTR, "injected ambiguous close")
+        return real_close(descriptor)
+
+    monkeypatch.setattr(transfer_module.os, "open", tracking_open)
+    monkeypatch.setattr(transfer_module.os, "close", ambiguous_close)
+
+    with pytest.raises(ValueError, match="close"):
+        with transfer_module._open_checkpoint_snapshot(
+            source,
+            label="test checkpoint",
+        ):
+            pass
+
+    assert injected is True
+    assert probe_fd is not None
+    os.fstat(probe_fd)
+    real_close(probe_fd)

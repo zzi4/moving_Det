@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import copy
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import random
+import shutil
 import subprocess
 import tempfile
 import time
@@ -304,24 +305,30 @@ def save_checkpoint(
     path: Path,
     *,
     alignment_cache_sha256: str | None = None,
+    checkpoint_role: str | None = None,
     **state: Any,
 ) -> Path:
     reserved = {
         "model",
         "manifest_sha256",
         "alignment_cache_sha256",
+        "checkpoint_role",
     }
     overlap = reserved.intersection(state)
     if overlap:
         raise ValueError(
             f"checkpoint state cannot override reserved keys: {sorted(overlap)}"
         )
+    if checkpoint_role not in (None, "best", "last"):
+        raise ValueError("checkpoint_role must be 'best', 'last', or None")
     payload = {
         "model": model.state_dict(),
         "manifest_sha256": manifest_fingerprint(Path(manifest_dir)),
         "alignment_cache_sha256": alignment_cache_sha256,
         **state,
     }
+    if checkpoint_role is not None:
+        payload["checkpoint_role"] = checkpoint_role
     return _atomic_torch_save(payload, Path(path))
 
 
@@ -367,6 +374,193 @@ def _load_checkpoint_payload(checkpoint: Path) -> dict[str, Any]:
         raise ValueError(
             f"failed to load internal experiment checkpoint: {checkpoint}"
         ) from exc
+
+
+_CHECKPOINT_DECLARATION_FIELDS = frozenset(
+    {
+        "path",
+        "sha256",
+        "checkpoint_role",
+        "epoch",
+        "manifest_sha256",
+        "model_name",
+        "load_provenance",
+    }
+)
+
+
+def _checkpoint_artifact_declaration(
+    checkpoint: Path,
+    *,
+    expected_role: str,
+) -> dict[str, Any]:
+    source = Path(checkpoint)
+    with pretrained_transfer_module._open_checkpoint_snapshot(
+        source,
+        label=f"published {expected_role} checkpoint",
+    ) as snapshot:
+        payload = _load_checkpoint_payload_stream(
+            snapshot.stream,
+            source,
+            checkpoint_sha256=snapshot.sha256,
+        )
+    if payload.get("checkpoint_role") != expected_role:
+        raise ValueError(
+            f"published {expected_role} checkpoint has an invalid role"
+        )
+    epoch = payload.get("epoch")
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError(
+            f"published {expected_role} checkpoint epoch is invalid"
+        )
+    model_name = payload.get("model_name")
+    manifest_sha256 = payload.get("manifest_sha256")
+    load_provenance = payload.get("load_provenance")
+    if (
+        type(model_name) is not str
+        or not model_name
+        or type(manifest_sha256) is not str
+        or not isinstance(load_provenance, Mapping)
+    ):
+        raise ValueError(
+            f"published {expected_role} checkpoint metadata is invalid"
+        )
+    return {
+        "path": source.name,
+        "sha256": snapshot.sha256,
+        "checkpoint_role": expected_role,
+        "epoch": epoch,
+        "manifest_sha256": manifest_sha256,
+        "model_name": model_name,
+        "load_provenance": dict(load_provenance),
+    }
+
+
+def _published_checkpoint_artifacts(
+    *,
+    best_checkpoint: Path,
+    last_checkpoint: Path,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "best": _checkpoint_artifact_declaration(
+            best_checkpoint,
+            expected_role="best",
+        ),
+        "last": _checkpoint_artifact_declaration(
+            last_checkpoint,
+            expected_role="last",
+        ),
+    }
+
+
+def _load_run_json_snapshot(path: Path) -> Mapping[str, Any]:
+    source = Path(path)
+    with pretrained_transfer_module._open_checkpoint_snapshot(
+        source,
+        label="formal training run metadata",
+    ) as snapshot:
+        if snapshot.file_size > 16 * 1024 * 1024:
+            raise ValueError("formal training run metadata is too large")
+        snapshot.stream.seek(0)
+        try:
+            payload = json.loads(snapshot.stream.read().decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                "formal training run metadata is invalid JSON"
+            ) from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("formal training run metadata must be a mapping")
+    return MappingProxyType(dict(payload))
+
+
+def _validate_checkpoint_declaration(
+    declaration: Any,
+    payload: Mapping[str, Any],
+    *,
+    expected_path: str,
+    expected_role: str,
+    checkpoint_sha256: str,
+) -> None:
+    if (
+        not isinstance(declaration, Mapping)
+        or set(declaration) != _CHECKPOINT_DECLARATION_FIELDS
+    ):
+        raise ValueError(
+            f"formal {expected_role} checkpoint declaration fields are invalid"
+        )
+    expected = {
+        "path": expected_path,
+        "sha256": checkpoint_sha256,
+        "checkpoint_role": expected_role,
+        "epoch": payload.get("epoch"),
+        "manifest_sha256": payload.get("manifest_sha256"),
+        "model_name": payload.get("model_name"),
+        "load_provenance": payload.get("load_provenance"),
+    }
+    if dict(declaration) != expected:
+        raise ValueError(
+            f"formal {expected_role} checkpoint declaration does not match "
+            "the published artifact"
+        )
+
+
+def _validate_formal_baseline_publication(
+    payload: Mapping[str, Any],
+    checkpoint: Path,
+) -> None:
+    if payload.get("checkpoint_role") != "best":
+        raise ValueError(
+            "temporal initialization requires checkpoint role 'best'"
+        )
+    checkpoint_sha256 = getattr(payload, "checkpoint_sha256", None)
+    if checkpoint_sha256 is None:
+        checkpoint_sha256 = _file_sha256(checkpoint)
+    run = _load_run_json_snapshot(Path(checkpoint).parent / "run.json")
+    if (
+        run.get("status") != "completed"
+        or run.get("model_name") != "baseline"
+        or run.get("manifest_sha256") != payload.get("manifest_sha256")
+        or run.get("load_provenance") != payload.get("load_provenance")
+    ):
+        raise ValueError(
+            "formal baseline run metadata does not match the best checkpoint"
+        )
+    declarations = run.get("checkpoint_artifacts")
+    if (
+        not isinstance(declarations, Mapping)
+        or set(declarations) != {"schema_version", "best", "last"}
+        or declarations.get("schema_version") != 1
+    ):
+        raise ValueError(
+            "formal baseline checkpoint artifact declarations are invalid"
+        )
+    _validate_checkpoint_declaration(
+        declarations["best"],
+        payload,
+        expected_path="best.pt",
+        expected_role="best",
+        checkpoint_sha256=checkpoint_sha256,
+    )
+    last_path = Path(checkpoint).parent / "last.pt"
+    with pretrained_transfer_module._open_checkpoint_snapshot(
+        last_path,
+        label="formal baseline last checkpoint",
+    ) as last_snapshot:
+        last_payload = _load_checkpoint_payload_stream(
+            last_snapshot.stream,
+            last_path,
+            checkpoint_sha256=last_snapshot.sha256,
+        )
+    if last_payload.get("checkpoint_role") != "last":
+        raise ValueError("formal baseline last checkpoint role is invalid")
+    _validate_checkpoint_declaration(
+        declarations["last"],
+        last_payload,
+        expected_path="last.pt",
+        expected_role="last",
+        checkpoint_sha256=last_snapshot.sha256,
+    )
 
 
 def _verify_manifest_sha256(
@@ -494,6 +688,7 @@ def _validated_baseline_initialization(
         raise ValueError(
             "temporal initialization requires a baseline model checkpoint"
         )
+    _validate_formal_baseline_publication(payload, checkpoint)
     if (
         "alignment_cache_sha256" not in payload
         or payload["alignment_cache_sha256"] is not None
@@ -1105,27 +1300,82 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _public_weight_fingerprint(
-    weights: Path | str | None,
-) -> tuple[str | None, str | None]:
-    if weights is None:
-        return None, None
-    requested = Path(weights)
-    if requested.is_symlink():
-        raise ValueError(
-            f"public pretrained weights are missing or unsafe: {requested}"
+@dataclass(frozen=True)
+class _MaterializedPublicWeight:
+    source_path: str | None
+    path: Path | None
+    sha256: str | None
+
+
+def _materialize_checkpoint_snapshot(
+    snapshot: Any,
+    destination: Path,
+) -> None:
+    snapshot.stream.seek(0)
+    with destination.open("xb") as output:
+        shutil.copyfileobj(
+            snapshot.stream,
+            output,
+            length=1024 * 1024,
         )
+        output.flush()
+        os.fsync(output.fileno())
+    if destination.stat().st_size != snapshot.file_size:
+        raise ValueError("public pretrained weights snapshot is incomplete")
+    destination.chmod(0o400)
+
+
+@contextmanager
+def _materialized_public_weight(
+    weights: Path | str | None,
+) -> Iterable[_MaterializedPublicWeight]:
+    if weights is None:
+        yield _MaterializedPublicWeight(None, None, None)
+        return
+    requested = Path(weights)
     try:
-        resolved = requested.resolve(strict=True)
-    except OSError as exc:
+        with ExitStack() as snapshots:
+            primary = snapshots.enter_context(
+                pretrained_transfer_module._open_checkpoint_snapshot(
+                    requested,
+                    label="public pretrained weights",
+                )
+            )
+            artifacts = {requested.name: primary}
+            marker_evidence = (
+                pretrained_transfer_module
+                ._static_frozen_marker_evidence_from_snapshot(primary)
+            )
+            if marker_evidence is not False:
+                for sibling_name in ("transfer_report.json", "run.json"):
+                    artifacts[sibling_name] = snapshots.enter_context(
+                        pretrained_transfer_module._open_checkpoint_snapshot(
+                            primary.source_path.parent / sibling_name,
+                            label=f"public pretrained weights {sibling_name}",
+                        )
+                    )
+            with tempfile.TemporaryDirectory(
+                prefix="moving-det-public-weight-"
+            ) as temporary_root:
+                private_root = Path(temporary_root)
+                for artifact_name, snapshot in artifacts.items():
+                    _materialize_checkpoint_snapshot(
+                        snapshot,
+                        private_root / artifact_name,
+                    )
+                yield _MaterializedPublicWeight(
+                    source_path=str(primary.source_path),
+                    path=private_root / requested.name,
+                    sha256=primary.sha256,
+                )
+    except pretrained_transfer_module._CheckpointMissingError as exc:
         raise ValueError(
             f"public pretrained weights are missing or unsafe: {requested}"
         ) from exc
-    if resolved.is_symlink() or not resolved.is_file():
+    except pretrained_transfer_module._CheckpointUnsafeError as exc:
         raise ValueError(
             f"public pretrained weights are missing or unsafe: {requested}"
-        )
-    return str(resolved), _file_sha256(resolved)
+        ) from exc
 
 
 def _component_state(component: Any) -> Any | None:
@@ -2050,19 +2300,8 @@ def train_model(
         weights: Path | str | None = (
             None if internal_load is not None else cfg.pretrained_weights
         )
-        model = selected_hooks.model_factory(
-            model_name,
-            weights,
-            cfg,
-        )
-        public_weights, public_weights_sha256 = _public_weight_fingerprint(
-            weights
-        )
-        model = model.to(device)
-        history: list[dict[str, Any]] = []
-        start_epoch = 0
-        epochs_without_improvement = 0
-
+        init_payload: Mapping[str, Any] | None = None
+        validated_initialization: Mapping[str, object] | None = None
         if init_checkpoint is not None:
             source = Path(init_checkpoint)
             with pretrained_transfer_module._open_checkpoint_snapshot(
@@ -2081,9 +2320,25 @@ def train_model(
                         manifest_root,
                     )
                 )
+        with _materialized_public_weight(weights) as weight_snapshot:
+            model = selected_hooks.model_factory(
+                model_name,
+                weight_snapshot.path,
+                cfg,
+            )
+        public_weights = weight_snapshot.source_path
+        public_weights_sha256 = weight_snapshot.sha256
+        if init_payload is not None:
             source_state = dict(init_payload["model"])
             allowed_missing = _validate_model_state(model, source_state)
             _apply_model_state(model, source_state, allowed_missing)
+        model = model.to(device)
+        history: list[dict[str, Any]] = []
+        start_epoch = 0
+        epochs_without_improvement = 0
+
+        if init_checkpoint is not None:
+            assert validated_initialization is not None
             load_provenance = dict(validated_initialization)
         elif resume_checkpoint is not None:
             source = Path(resume_checkpoint)
@@ -2473,6 +2728,7 @@ def train_model(
                     manifest_root,
                     last_checkpoint,
                     alignment_cache_sha256=alignment_cache_sha256,
+                    checkpoint_role="last",
                     **checkpoint_state,
                 )
                 if improved:
@@ -2481,6 +2737,7 @@ def train_model(
                         manifest_root,
                         best_checkpoint,
                         alignment_cache_sha256=alignment_cache_sha256,
+                        checkpoint_role="best",
                         **checkpoint_state,
                     )
             if distributed_context is not None:
@@ -2533,6 +2790,11 @@ def train_model(
                     },
                 )
 
+        if is_primary:
+            run["checkpoint_artifacts"] = _published_checkpoint_artifacts(
+                best_checkpoint=best_checkpoint,
+                last_checkpoint=last_checkpoint,
+            )
         run["status"] = "completed"
         run["gate_passed"] = gate_passed
         run["history_path"] = str(history_path)

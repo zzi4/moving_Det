@@ -403,6 +403,109 @@ def _write_all(descriptor: int, content: bytes) -> None:
         offset += written
 
 
+class _CheckpointFileDescriptorRegistry:
+    """Own descriptors without ever retrying an ambiguous close."""
+
+    def __init__(self) -> None:
+        self._owned: dict[int, None] = {}
+
+    def own(self, descriptor: int) -> int:
+        if (
+            type(descriptor) is not int
+            or descriptor < 0
+            or descriptor in self._owned
+        ):
+            raise _CheckpointUnsafeError(
+                "checkpoint path open returned an invalid descriptor"
+            )
+        self._owned[descriptor] = None
+        return descriptor
+
+    def close_all(self) -> tuple[tuple[int, BaseException], ...]:
+        errors = []
+        for descriptor in reversed(tuple(self._owned)):
+            # POSIX close errors are ambiguous: ownership ends before close and
+            # this integer must never be retried after it may have been reused.
+            del self._owned[descriptor]
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                errors.append((descriptor, exc))
+        return tuple(errors)
+
+
+def _required_checkpoint_open_flag(name: str, *, label: str) -> int:
+    value = getattr(os, name, None)
+    if type(value) is not int or value <= 0:
+        raise _CheckpointUnsafeError(f"{label} requires {name} support")
+    return value
+
+
+def _open_checkpoint_source_descriptor(
+    source: Path,
+    *,
+    label: str,
+    owned_fds: _CheckpointFileDescriptorRegistry,
+    directory_flags: int,
+    file_flags: int,
+) -> tuple[Path, int]:
+    absolute_source = source if source.is_absolute() else Path.cwd() / source
+    components = absolute_source.parts[1:]
+    if not components:
+        raise _CheckpointUnsafeError(
+            f"{label} must identify a file below the filesystem root"
+        )
+    try:
+        current_fd = owned_fds.own(os.open(Path("/"), directory_flags))
+        root_metadata = os.fstat(current_fd)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise _CheckpointUnsafeError(
+                f"{label} filesystem root is not a directory"
+            )
+        for component in components[:-1]:
+            current_fd = owned_fds.own(
+                os.open(component, directory_flags, dir_fd=current_fd)
+            )
+            if not stat.S_ISDIR(os.fstat(current_fd).st_mode):
+                raise _CheckpointUnsafeError(
+                    f"{label} parent component is not a directory: {component}"
+                )
+        source_descriptor = owned_fds.own(
+            os.open(components[-1], file_flags, dir_fd=current_fd)
+        )
+    except FileNotFoundError as exc:
+        raise _CheckpointMissingError(
+            f"{label} does not exist: {absolute_source}"
+        ) from exc
+    except _CheckpointUnsafeError:
+        raise
+    except OSError as exc:
+        raise _CheckpointUnsafeError(
+            f"{label} cannot be opened safely: {absolute_source}"
+        ) from exc
+    return absolute_source, source_descriptor
+
+
+def _report_checkpoint_close_errors(
+    errors: tuple[tuple[int, BaseException], ...],
+    *,
+    label: str,
+    primary_error: BaseException | None,
+) -> None:
+    if not errors:
+        return
+    notes = [
+        f"{label} descriptor close failed: fd={descriptor}, "
+        f"exception={type(error).__name__}, message={error}"
+        for descriptor, error in errors
+    ]
+    if primary_error is not None:
+        for note in notes:
+            primary_error.add_note(note)
+        return
+    raise _CheckpointUnsafeError(notes[0]) from errors[0][1]
+
+
 @contextmanager
 def _open_checkpoint_snapshot(
     path: Path,
@@ -412,30 +515,22 @@ def _open_checkpoint_snapshot(
     source = Path(path)
     if ".." in source.parts:
         raise _CheckpointUnsafeError(f"{label} path traversal is forbidden")
+    directory = _required_checkpoint_open_flag("O_DIRECTORY", label=label)
+    nofollow = _required_checkpoint_open_flag("O_NOFOLLOW", label=label)
+    nonblock = _required_checkpoint_open_flag("O_NONBLOCK", label=label)
+    cloexec = _required_checkpoint_open_flag("O_CLOEXEC", label=label)
+    directory_flags = os.O_RDONLY | directory | nofollow | nonblock | cloexec
+    file_flags = os.O_RDONLY | nofollow | nonblock | cloexec
+    owned_fds = _CheckpointFileDescriptorRegistry()
+    primary_error: BaseException | None = None
     try:
-        _reject_symlink_components(source)
-    except ValueError as exc:
-        raise _CheckpointUnsafeError(str(exc)) from exc
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        raise _CheckpointUnsafeError(
-            f"{label} requires O_NOFOLLOW support"
+        source, source_descriptor = _open_checkpoint_source_descriptor(
+            source,
+            label=label,
+            owned_fds=owned_fds,
+            directory_flags=directory_flags,
+            file_flags=file_flags,
         )
-    flags = (
-        os.O_RDONLY
-        | nofollow
-        | os.O_NONBLOCK
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    try:
-        source_descriptor = os.open(source, flags)
-    except FileNotFoundError as exc:
-        raise _CheckpointMissingError(f"{label} does not exist: {source}") from exc
-    except OSError as exc:
-        raise _CheckpointUnsafeError(
-            f"{label} cannot be opened safely: {source}"
-        ) from exc
-    try:
         initial_metadata = os.fstat(source_descriptor)
         if (
             not stat.S_ISREG(initial_metadata.st_mode)
@@ -455,7 +550,7 @@ def _open_checkpoint_snapshot(
                 os.O_RDWR
                 | os.O_CREAT
                 | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0)
+                | cloexec
             )
             snapshot_descriptor = os.open(
                 snapshot_path,
@@ -517,8 +612,15 @@ def _open_checkpoint_snapshot(
                     snapshot_stream.close()
                 elif snapshot_descriptor >= 0:
                     os.close(snapshot_descriptor)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        os.close(source_descriptor)
+        _report_checkpoint_close_errors(
+            owned_fds.close_all(),
+            label=label,
+            primary_error=primary_error,
+        )
 
 
 def _regular_file_bytes(path: Path, *, label: str) -> bytes:
