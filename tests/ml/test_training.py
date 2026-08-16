@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import replace
 import hashlib
 import json
@@ -43,6 +44,60 @@ _MANIFEST_CHILDREN = (
     "class-audit.json",
     "manifest.json",
 )
+
+
+class _ProtocolSplitModelState(Mapping[str, Tensor]):
+    """Expose finite values through items(), poison through mapping reads."""
+
+    access_log: list[str] = []
+
+    def __init__(self, finite: Tensor, poison: Tensor) -> None:
+        self._finite = finite
+        self._poison = poison
+
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self):
+        type(self).access_log.append("iter")
+        return iter(("detector.weight",))
+
+    def keys(self):
+        type(self).access_log.append("keys")
+        return ("detector.weight",)
+
+    def __getitem__(self, key: str) -> Tensor:
+        type(self).access_log.append("getitem")
+        if key != "detector.weight":
+            raise KeyError(key)
+        return self._poison
+
+    def items(self):
+        type(self).access_log.append("items")
+        return (("detector.weight", self._finite),)
+
+
+class _ExplodingModelState(Mapping[str, Tensor]):
+    def __init__(self, defect: str) -> None:
+        self._defect = defect
+
+    def __len__(self) -> int:
+        return 1
+
+    def __iter__(self):
+        return iter(("detector.weight",))
+
+    def keys(self):
+        if self._defect == "keys":
+            raise RuntimeError("injected keys failure")
+        return ("detector.weight",)
+
+    def __getitem__(self, key: str) -> Tensor:
+        if self._defect == "getitem":
+            raise RuntimeError("injected getitem failure")
+        if key != "detector.weight":
+            raise KeyError(key)
+        return torch.ones(1, 1)
 
 
 @pytest.fixture
@@ -176,6 +231,22 @@ def test_baseline_init_finite_preflight_fails_closed_on_check_error(
     with pytest.raises(ValueError, match="finite.*failed|failed.*finite"):
         training_module._validate_finite_baseline_initialization_state(
             {"detector.weight": torch.ones(1)}
+        )
+
+
+@pytest.mark.parametrize("defect", ["keys", "getitem"])
+def test_baseline_init_state_materialization_fails_closed(defect):
+    with pytest.raises(ValueError, match="materialize.*model state"):
+        training_module._materialize_baseline_initialization_state(
+            _ExplodingModelState(defect)
+        )
+
+
+@pytest.mark.parametrize("invalid_key", [1, ""])
+def test_baseline_init_state_materialization_rejects_invalid_keys(invalid_key):
+    with pytest.raises(ValueError, match="state.*key"):
+        training_module._materialize_baseline_initialization_state(
+            {invalid_key: torch.ones(1)}
         )
 
 
@@ -1861,6 +1932,122 @@ def test_nonfinite_formal_baseline_state_is_rejected_before_any_mutation(
             hooks=_tiny_hooks(target, map50_values=[0.3]),
         )
 
+    assert target.to_calls == 0
+    assert optimizer_factory_calls == []
+    after = target.state_dict()
+    assert set(after) == set(before)
+    for name, value in after.items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        assert (
+            value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            == before_bytes[name]
+        )
+
+
+def test_formal_baseline_state_mapping_is_materialized_once_before_mutation(
+    tmp_path,
+    temporal_config,
+    monkeypatch,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    _fixture_checkpoint, p2_init, _universal_sha256 = (
+        _formal_baseline_checkpoint(
+            tmp_path / "frozen-source",
+            monkeypatch,
+            manifest,
+        )
+    )
+
+    def baseline_factory(_name, requested, _cfg):
+        state, _provenance = (
+            transfer_module.load_frozen_p2_initialization(Path(requested))
+        )
+        return TinyOBB(initial=float(state["model.000.weight"][0]))
+
+    published = train_model(
+        "baseline",
+        replace(
+            temporal_config,
+            pilot_epochs=1,
+            learning_rate=0.0,
+            pretrained_weights=str(p2_init),
+        ),
+        manifest,
+        tmp_path / "formal-baseline",
+        hooks=replace(
+            _tiny_hooks(TinyOBB(), map50_values=[0.2]),
+            model_factory=baseline_factory,
+        ),
+    )
+    payload = torch.load(
+        published.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    finite = payload["model"]["detector.weight"].detach().clone()
+    payload["model"] = _ProtocolSplitModelState(
+        finite,
+        torch.full_like(finite, float("nan")),
+    )
+    torch.save(payload, published.best_checkpoint)
+    run_path = published.output_dir / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["checkpoint_artifacts"]["best"]["sha256"] = hashlib.sha256(
+        published.best_checkpoint.read_bytes()
+    ).hexdigest()
+    _write_canonical_json(run_path, run)
+    _ProtocolSplitModelState.access_log.clear()
+
+    class MutationObservingTemporal(TinyTemporalOBB):
+        def __init__(self):
+            super().__init__()
+            self.to_calls = 0
+
+        def to(self, *args, **kwargs):
+            self.to_calls += 1
+            return super().to(*args, **kwargs)
+
+    target = MutationObservingTemporal()
+    before = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+    }
+    before_bytes = {
+        name: value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        for name, value in before.items()
+    }
+    model_factory_calls = []
+    hooks = replace(
+        _tiny_hooks(target, map50_values=[0.3]),
+        model_factory=lambda name, weights, cfg: (
+            model_factory_calls.append((name, weights, cfg)) or target
+        ),
+    )
+    real_build_optimizer = training_module.build_optimizer
+    optimizer_factory_calls = []
+
+    def observing_optimizer_factory(model, cfg):
+        optimizer_factory_calls.append((model, cfg))
+        return real_build_optimizer(model, cfg)
+
+    monkeypatch.setattr(
+        training_module,
+        "build_optimizer",
+        observing_optimizer_factory,
+    )
+
+    with pytest.raises(ValueError, match="finite|non-finite"):
+        train_model(
+            "mg_vtod",
+            replace(temporal_config, pilot_epochs=1),
+            manifest,
+            tmp_path / "reject-stateful-mapping",
+            init_checkpoint=published.best_checkpoint,
+            hooks=hooks,
+        )
+
+    assert _ProtocolSplitModelState.access_log == ["keys", "getitem"]
+    assert model_factory_calls == []
     assert target.to_calls == 0
     assert optimizer_factory_calls == []
     after = target.state_dict()

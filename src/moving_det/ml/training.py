@@ -637,6 +637,28 @@ def _validate_finite_baseline_initialization_state(
             )
 
 
+def _materialize_baseline_initialization_state(
+    source_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Consume an untrusted state mapping once into an ordinary fixed dict."""
+    try:
+        fixed_state = dict(source_state)
+    except Exception as exc:
+        raise ValueError(
+            "failed to materialize baseline initialization model state"
+        ) from exc
+    invalid_keys = [
+        key
+        for key in fixed_state
+        if type(key) is not str or not key
+    ]
+    if invalid_keys:
+        raise ValueError(
+            "baseline initialization model state contains an invalid key"
+        )
+    return fixed_state
+
+
 def _validate_model_state(
     model: nn.Module,
     source_state: Mapping[str, Any],
@@ -2328,6 +2350,7 @@ def train_model(
             None if internal_load is not None else cfg.pretrained_weights
         )
         init_payload: Mapping[str, Any] | None = None
+        init_source_state: dict[str, Any] | None = None
         validated_initialization: Mapping[str, object] | None = None
         if init_checkpoint is not None:
             source = Path(init_checkpoint)
@@ -2347,8 +2370,13 @@ def train_model(
                         manifest_root,
                     )
                 )
+                init_source_state = (
+                    _materialize_baseline_initialization_state(
+                        init_payload["model"]
+                    )
+                )
                 _validate_finite_baseline_initialization_state(
-                    init_payload["model"]
+                    init_source_state
                 )
         with _materialized_public_weight(weights) as weight_snapshot:
             model = selected_hooks.model_factory(
@@ -2358,10 +2386,16 @@ def train_model(
             )
         public_weights = weight_snapshot.source_path
         public_weights_sha256 = weight_snapshot.sha256
-        if init_payload is not None:
-            source_state = dict(init_payload["model"])
-            allowed_missing = _validate_model_state(model, source_state)
-            _apply_model_state(model, source_state, allowed_missing)
+        if init_source_state is not None:
+            allowed_missing = _validate_model_state(
+                model,
+                init_source_state,
+            )
+            _apply_model_state(
+                model,
+                init_source_state,
+                allowed_missing,
+            )
         model = model.to(device)
         history: list[dict[str, Any]] = []
         start_epoch = 0
