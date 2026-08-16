@@ -13,20 +13,17 @@ import shutil
 import tempfile
 from types import MappingProxyType
 from typing import Any, BinaryIO
-import zipfile
 
 from moving_det.ml.human_benchmark import (
-    IMAGE_HEIGHT,
-    IMAGE_WIDTH,
     VEHICLE_LABELS,
     HumanBenchmark,
     HumanFrame,
     HumanIgnore,
     HumanTruth,
-    _derive_truth_motion,
-    _validated_points,
+    SequenceSpec,
+    assert_human_benchmark_matches_source,
+    parse_human_benchmark_snapshot,
 )
-from moving_det.geometry.obb import obb_to_points, points_to_obb
 from moving_det.models import OBB
 
 
@@ -81,8 +78,6 @@ _IGNORE_FIELDS = frozenset(
     }
 )
 _SHA256_HEX_LENGTH = 64
-_TRUTH_BOUNDARY_TOLERANCE = 1e-12
-_SPEED_ULP_TOLERANCE = 4
 _STREAM_CHUNK_SIZE = 1024 * 1024
 
 
@@ -474,6 +469,12 @@ def freeze_human_benchmark(benchmark: HumanBenchmark, output: Path) -> Path:
         if snapshots.source.sha256 != benchmark.source_zip_sha256:
             raise ValueError("source ZIP SHA-256 mismatch")
         image_root = _validate_benchmark_semantics(benchmark, snapshots)
+        rebuilt = _rebuild_from_source_annotations(
+            benchmark,
+            snapshots,
+            image_root,
+        )
+        assert_human_benchmark_matches_source(benchmark, rebuilt)
         children, inputs, _, _ = _record_payloads(benchmark, snapshots)
         destination = _validate_output(
             Path(output),
@@ -753,120 +754,74 @@ def _validate_frame_sources(
     return image_roots.pop()
 
 
+def _sequence_contract_from_frames(
+    frames: tuple[HumanFrame, ...],
+) -> Mapping[str, SequenceSpec]:
+    grouped: dict[str, list[HumanFrame]] = {}
+    for row in frames:
+        directory = str(PurePosixPath(row.annotation_member).parent)
+        grouped.setdefault(directory, []).append(row)
+
+    contract: dict[str, SequenceSpec] = {}
+    for directory, rows in grouped.items():
+        sites = {row.site for row in rows}
+        sequences = {row.sequence for row in rows}
+        frame_numbers = sorted(row.frame for row in rows)
+        if len(sites) != 1 or len(sequences) != 1:
+            raise ValueError(
+                "source annotation directory maps to multiple frame identities"
+            )
+        first_frame = frame_numbers[0]
+        last_frame = frame_numbers[-1]
+        if frame_numbers != list(range(first_frame, last_frame + 1)):
+            raise ValueError(
+                "source annotation frame contract must be contiguous"
+            )
+        contract[directory] = SequenceSpec(
+            site=next(iter(sites)),
+            sequence=next(iter(sequences)),
+            first_frame=first_frame,
+            last_frame=last_frame,
+        )
+    return MappingProxyType(contract)
+
+
+def _rebuild_from_source_annotations(
+    benchmark: HumanBenchmark,
+    snapshots: _BenchmarkSnapshots,
+    image_root: Path,
+) -> HumanBenchmark:
+    sequence_contract = _sequence_contract_from_frames(benchmark.frames)
+
+    def image_sha256(path: Path) -> str:
+        try:
+            return snapshots.images[Path(path)].sha256
+        except KeyError as exc:
+            raise ValueError(
+                f"source annotation image is absent from frame snapshots: {path}"
+            ) from exc
+
+    snapshots.source.rewind()
+    try:
+        return parse_human_benchmark_snapshot(
+            snapshots.source.path,
+            snapshots.source.sha256,
+            snapshots.source.stream,
+            image_root,
+            image_sha256,
+            sequence_contract=sequence_contract,
+        )
+    except (OSError, ValueError) as exc:
+        if "source annotation" in str(exc):
+            raise
+        raise ValueError(f"source annotation rebuild failed: {exc}") from exc
+
+
 def _archive_frame(member: str) -> int:
     stem = PurePosixPath(member).stem
     if not stem.isascii() or not stem.isdigit():
         raise ValueError(f"source ZIP member frame stem must be numeric: {member}")
     return int(stem)
-
-
-def _unsafe_zip_member(info: zipfile.ZipInfo) -> bool:
-    path = PurePosixPath(info.filename)
-    return (
-        info.is_dir()
-        or path.is_absolute()
-        or ".." in path.parts
-        or stat.S_ISLNK(info.external_attr >> 16)
-    )
-
-
-def _index_source_archive(
-    infos: list[zipfile.ZipInfo],
-) -> tuple[
-    dict[str, zipfile.ZipInfo],
-    dict[tuple[str, str, int], zipfile.ZipInfo],
-]:
-    by_name: dict[str, zipfile.ZipInfo] = {}
-    by_numeric_frame: dict[tuple[str, str, int], zipfile.ZipInfo] = {}
-    for info in infos:
-        if info.filename in by_name:
-            raise ValueError(f"duplicate source ZIP member: {info.filename}")
-        by_name[info.filename] = info
-        if info.is_dir():
-            continue
-        member = PurePosixPath(info.filename)
-        suffix = member.suffix.lower()
-        if suffix not in {".jpg", ".json"}:
-            continue
-        frame = _archive_frame(info.filename)
-        key = (str(member.parent), suffix, frame)
-        if key in by_numeric_frame:
-            raise ValueError(
-                "duplicate source ZIP numeric frame: "
-                f"{member.parent} frame {frame} {suffix}"
-            )
-        by_numeric_frame[key] = info
-    return by_name, by_numeric_frame
-
-
-def _validate_source_archive(
-    benchmark: HumanBenchmark,
-    snapshots: _BenchmarkSnapshots,
-) -> None:
-    try:
-        snapshots.source.rewind()
-        with zipfile.ZipFile(snapshots.source.stream) as archive:
-            infos = archive.infolist()
-            by_name, by_numeric_frame = _index_source_archive(infos)
-
-            for row in benchmark.frames:
-                annotation = by_name.get(row.annotation_member)
-                if annotation is None or _unsafe_zip_member(annotation):
-                    raise ValueError(
-                        "source ZIP member is missing or unsafe: "
-                        f"{row.annotation_member}"
-                    )
-                annotation_path = PurePosixPath(annotation.filename)
-                if (
-                    annotation_path.suffix.lower() != ".json"
-                    or _archive_frame(annotation.filename) != row.frame
-                ):
-                    raise ValueError(
-                        f"source ZIP member does not match frame: {annotation.filename}"
-                    )
-                annotation_key = (
-                    str(annotation_path.parent),
-                    ".json",
-                    row.frame,
-                )
-                if by_numeric_frame.get(annotation_key) is not annotation:
-                    raise ValueError(
-                        "source ZIP annotation is not its unique numeric member: "
-                        f"{row.annotation_member}"
-                    )
-                jpeg_member = by_numeric_frame.get(
-                    (str(annotation_path.parent), ".jpg", row.frame)
-                )
-                if jpeg_member is None or _unsafe_zip_member(jpeg_member):
-                    raise ValueError(
-                        "source ZIP member has no safe paired JPEG: "
-                        f"{row.annotation_member}"
-                    )
-                if (
-                    PurePosixPath(jpeg_member.filename).name
-                    != snapshots.image_for(row).path.name
-                ):
-                    raise ValueError(
-                        "source ZIP paired JPEG does not match image path name: "
-                        f"{snapshots.image_for(row).path.name}"
-                    )
-                image = snapshots.image_for(row)
-                image.rewind()
-                with archive.open(jpeg_member) as zip_stream:
-                    while True:
-                        zip_chunk = zip_stream.read(_STREAM_CHUNK_SIZE)
-                        image_chunk = image.stream.read(_STREAM_CHUNK_SIZE)
-                        if zip_chunk != image_chunk:
-                            raise ValueError(
-                                "image bytes differ from source ZIP: "
-                                f"{image.path}"
-                            )
-                        if not image_chunk:
-                            break
-    except zipfile.BadZipFile as exc:
-        raise ValueError(
-            f"invalid human benchmark source ZIP: {snapshots.source.path}"
-        ) from exc
 
 
 def _load_truths(
@@ -984,93 +939,6 @@ def _load_ignores(
     return tuple(ignores)
 
 
-def _validate_truth_motion(truths: tuple[HumanTruth, ...]) -> None:
-    derived = tuple(_derive_truth_motion(list(truths)))
-    if len(derived) != len(truths):
-        raise ValueError("truth derived motion row count mismatch")
-    for stored, expected in zip(truths, derived, strict=True):
-        speed_tolerance = _SPEED_ULP_TOLERANCE * max(
-            math.ulp(stored.pixel_speed),
-            math.ulp(expected.pixel_speed),
-        )
-        if (
-            abs(stored.pixel_speed - expected.pixel_speed) > speed_tolerance
-            or stored.visible_span != expected.visible_span
-        ):
-            raise ValueError(
-                "truth derived motion mismatch: "
-                f"{(stored.site, stored.sequence, stored.frame, stored.track_id)}"
-            )
-
-
-def _validate_truth_geometry(truths: tuple[HumanTruth, ...]) -> None:
-    for row in truths:
-        points = obb_to_points(row.obb)
-        try:
-            validated_points = _validated_points(points.tolist())
-            canonical = points_to_obb(validated_points)
-        except ValueError as exc:
-            raise ValueError("truth OBB must be a non-degenerate rectangle") from exc
-        stored_values = (
-            row.obb.cx,
-            row.obb.cy,
-            row.obb.width,
-            row.obb.height,
-            row.obb.theta,
-        )
-        canonical_values = (
-            canonical.cx,
-            canonical.cy,
-            canonical.width,
-            canonical.height,
-            canonical.theta,
-        )
-        if (
-            row.obb.width < row.obb.height
-            or not -math.pi / 2 <= row.obb.theta < math.pi / 2
-            or any(
-                not math.isclose(
-                    stored,
-                    expected,
-                    rel_tol=1e-12,
-                    abs_tol=1e-9,
-                )
-                for stored, expected in zip(
-                    stored_values,
-                    canonical_values,
-                    strict=True,
-                )
-            )
-        ):
-            raise ValueError("truth OBB width/theta must use canonical form")
-        if any(
-            x < -_TRUTH_BOUNDARY_TOLERANCE
-            or x >= IMAGE_WIDTH + _TRUTH_BOUNDARY_TOLERANCE
-            or y < -_TRUTH_BOUNDARY_TOLERANCE
-            or y >= IMAGE_HEIGHT + _TRUTH_BOUNDARY_TOLERANCE
-            for x, y in validated_points
-        ):
-            raise ValueError("truth OBB points must all remain inside the image")
-
-
-def _validate_ignore_geometry(ignores: tuple[HumanIgnore, ...]) -> None:
-    for row in ignores:
-        try:
-            points = _validated_points(
-                [[x, y] for x, y in row.points]
-            )
-            points_to_obb(points)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "ignore geometry must be a finite strictly convex rectangle"
-            ) from exc
-        if not any(
-            x < 0 or x >= IMAGE_WIDTH or y < 0 or y >= IMAGE_HEIGHT
-            for x, y in points
-        ):
-            raise ValueError("ignore rectangle must contain an outside-image point")
-
-
 def _load_vehicle_audit(
     content: bytes,
     *,
@@ -1165,7 +1033,6 @@ def _validate_benchmark_semantics(
     ):
         raise ValueError("frame records must have sorted unique identities")
     image_root = _validate_frame_sources(benchmark.frames, snapshots)
-    _validate_source_archive(benchmark, snapshots)
     frame_identity_set = frozenset(frame_identities)
 
     if not isinstance(benchmark.truths, tuple):
@@ -1189,8 +1056,6 @@ def _validate_benchmark_semantics(
         or len(truth_identities) != len(set(truth_identities))
     ):
         raise ValueError("truth records must have sorted unique identities")
-    _validate_truth_geometry(benchmark.truths)
-    _validate_truth_motion(benchmark.truths)
 
     if not isinstance(benchmark.ignores, tuple):
         raise ValueError("benchmark ignores must be a tuple")
@@ -1220,7 +1085,6 @@ def _validate_benchmark_semantics(
         or len(ignore_identities) != len(set(ignore_identities))
     ):
         raise ValueError("ignore records must have sorted unique identities")
-    _validate_ignore_geometry(benchmark.ignores)
     _validate_track_identities(benchmark.truths, benchmark.ignores)
 
     if not isinstance(benchmark.vehicle_counts, Mapping):
@@ -1321,7 +1185,13 @@ def load_human_benchmark(output: Path) -> HumanBenchmark:
     ) as snapshots:
         if snapshots.source.sha256 != source_zip_sha256:
             raise ValueError("source ZIP fingerprint mismatch")
-        _validate_benchmark_semantics(benchmark, snapshots)
+        image_root = _validate_benchmark_semantics(benchmark, snapshots)
+        rebuilt = _rebuild_from_source_annotations(
+            benchmark,
+            snapshots,
+            image_root,
+        )
+        assert_human_benchmark_matches_source(benchmark, rebuilt)
         snapshots.assert_stable()
     return benchmark
 

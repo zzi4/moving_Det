@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from moving_det.geometry.obb import points_to_obb
 from moving_det.models import OBB
@@ -33,6 +33,9 @@ CLASS_TO_ID = {
     "motorcycle": 3,
 }
 VEHICLE_LABELS = frozenset({"car", "truck", "bus", "engineering_vehicle"})
+APPROVED_SOURCE_ZIP_SHA256 = (
+    "c27dce796ae24d7028913ea6d7fcd72acd1d23807a430e2baf487129794ddf31"
+)
 
 
 @dataclass(frozen=True)
@@ -294,7 +297,10 @@ def _parse_shape(
     if not isinstance(shape, dict):
         raise ValueError(f"{context}: shape must be an object")
     label = shape.get("label")
-    if label not in CLASS_TO_ID and label not in VEHICLE_LABELS:
+    if (
+        not isinstance(label, str)
+        or (label not in CLASS_TO_ID and label not in VEHICLE_LABELS)
+    ):
         raise ValueError(f"{context}: unsupported label: {label!r}")
     if shape.get("shape_type") != "rotation":
         raise ValueError(f"{context}: shape_type must be rotation")
@@ -366,18 +372,23 @@ def _derive_truth_motion(truths: list[HumanTruth]) -> list[HumanTruth]:
     return sorted(derived, key=_truth_sort_key)
 
 
-def parse_human_benchmark(
+def parse_human_benchmark_snapshot(
     zip_path: Path,
+    source_zip_sha256: str,
+    stream: BinaryIO,
     image_root: Path,
+    image_sha256: Callable[[Path], str],
     *,
     sequence_contract: Mapping[str, SequenceSpec] = APPROVED_SEQUENCES,
 ) -> HumanBenchmark:
     zip_path = Path(zip_path)
     image_root = Path(image_root)
-    if not zip_path.is_file():
-        raise FileNotFoundError(f"human annotation ZIP does not exist: {zip_path}")
     if not image_root.is_dir():
         raise FileNotFoundError(f"human benchmark image root does not exist: {image_root}")
+    if not isinstance(source_zip_sha256, str):
+        raise ValueError("source ZIP SHA-256 must be a string")
+    if not callable(image_sha256):
+        raise TypeError("image_sha256 must be callable")
 
     frames: list[HumanFrame] = []
     truths: list[HumanTruth] = []
@@ -387,7 +398,8 @@ def parse_human_benchmark(
     annotation_count = 0
 
     try:
-        with zipfile.ZipFile(zip_path) as archive:
+        stream.seek(0)
+        with zipfile.ZipFile(stream) as archive:
             archive_index = _index_archive(archive, sequence_contract)
             for directory, frame_members in archive_index.items():
                 spec = sequence_contract[directory]
@@ -404,8 +416,8 @@ def parse_human_benchmark(
                             f"human benchmark source image does not exist: {source_image}"
                         )
                     with archive.open(members.image) as image_stream:
-                        image_sha256 = _sha256_stream(image_stream)
-                    if _sha256_path(source_image) != image_sha256:
+                        archive_image_sha256 = _sha256_stream(image_stream)
+                    if image_sha256(source_image) != archive_image_sha256:
                         raise ValueError("image bytes differ")
 
                     payload = _load_annotation(archive, members.annotation)
@@ -421,7 +433,7 @@ def parse_human_benchmark(
                             frame=frame,
                             image_path=source_image,
                             annotation_member=members.annotation.filename,
-                            image_sha256=image_sha256,
+                            image_sha256=archive_image_sha256,
                         )
                     )
 
@@ -495,10 +507,85 @@ def parse_human_benchmark(
     )
     return HumanBenchmark(
         source_zip=zip_path,
-        source_zip_sha256=_sha256_path(zip_path),
+        source_zip_sha256=source_zip_sha256,
         annotation_count=annotation_count,
         frames=tuple(frames),
         truths=tuple(truths),
         ignores=tuple(ignores),
         vehicle_counts=MappingProxyType(dict(sorted(vehicle_counts.items()))),
     )
+
+
+def parse_human_benchmark(
+    zip_path: Path,
+    image_root: Path,
+    *,
+    sequence_contract: Mapping[str, SequenceSpec] = APPROVED_SEQUENCES,
+) -> HumanBenchmark:
+    zip_path = Path(zip_path)
+    image_root = Path(image_root)
+    if not zip_path.is_file():
+        raise FileNotFoundError(f"human annotation ZIP does not exist: {zip_path}")
+    if not image_root.is_dir():
+        raise FileNotFoundError(f"human benchmark image root does not exist: {image_root}")
+    with zip_path.open("rb") as stream:
+        source_zip_sha256 = _sha256_stream(stream)
+        stream.seek(0)
+        return parse_human_benchmark_snapshot(
+            zip_path,
+            source_zip_sha256,
+            stream,
+            image_root,
+            _sha256_path,
+            sequence_contract=sequence_contract,
+        )
+
+
+def assert_human_benchmark_matches_source(
+    candidate: HumanBenchmark,
+    rebuilt: HumanBenchmark,
+) -> None:
+    if (
+        candidate.source_zip != rebuilt.source_zip
+        or candidate.source_zip_sha256 != rebuilt.source_zip_sha256
+    ):
+        raise ValueError("source annotation identity mismatch")
+    if candidate.annotation_count != rebuilt.annotation_count:
+        raise ValueError("source annotation count mismatch")
+    if candidate.frames != rebuilt.frames:
+        raise ValueError("source annotation frames mismatch")
+
+    candidate_truths = tuple(
+        (
+            row.site,
+            row.sequence,
+            row.frame,
+            row.class_id,
+            row.track_id,
+            row.obb,
+        )
+        for row in candidate.truths
+    )
+    rebuilt_truths = tuple(
+        (
+            row.site,
+            row.sequence,
+            row.frame,
+            row.class_id,
+            row.track_id,
+            row.obb,
+        )
+        for row in rebuilt.truths
+    )
+    if candidate_truths != rebuilt_truths:
+        raise ValueError("source annotation truths mismatch")
+    if tuple(
+        (row.pixel_speed, row.visible_span) for row in candidate.truths
+    ) != tuple(
+        (row.pixel_speed, row.visible_span) for row in rebuilt.truths
+    ):
+        raise ValueError("source annotation motion mismatch")
+    if candidate.ignores != rebuilt.ignores:
+        raise ValueError("source annotation ignores mismatch")
+    if dict(candidate.vehicle_counts) != dict(rebuilt.vehicle_counts):
+        raise ValueError("source annotation vehicle audit mismatch")

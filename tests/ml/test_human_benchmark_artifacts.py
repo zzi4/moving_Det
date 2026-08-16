@@ -48,20 +48,74 @@ def synthetic_benchmark(tmp_path: Path) -> HumanBenchmark:
     second_image.write_bytes(b"second synthetic image")
     first_annotation = "synthetic/site19_sequence/sequence_a/000010.json"
     second_annotation = "synthetic/site19_sequence/sequence_a/000011.json"
+    first_truth_points = [[96.0, 99.0], [104.0, 99.0], [104.0, 103.0], [96.0, 103.0]]
+    second_truth_points = [[98.0, 99.0], [106.0, 99.0], [106.0, 103.0], [98.0, 103.0]]
+    ignore_points = [[-1.0, 50.0], [3.0, 50.0], [3.0, 54.0], [-1.0, 54.0]]
+
+    def annotation(image_name: str, shapes: list[dict[str, object]]) -> bytes:
+        return json.dumps(
+            {
+                "version": "4.0.2",
+                "flags": {},
+                "shapes": shapes,
+                "imagePath": image_name,
+                "imageData": None,
+                "imageHeight": 2160,
+                "imageWidth": 3840,
+            },
+            allow_nan=False,
+        ).encode("utf-8")
+
+    def shape(
+        label: str,
+        group_id: int,
+        points: list[list[float]],
+    ) -> dict[str, object]:
+        return {
+            "label": label,
+            "points": points,
+            "group_id": group_id,
+            "description": str(group_id),
+            "shape_type": "rotation",
+        }
+
     with zipfile.ZipFile(source_zip, "w") as archive:
-        archive.writestr(first_annotation, b"{}")
+        archive.writestr(
+            first_annotation,
+            annotation(
+                "000010.jpg",
+                [
+                    shape("pedestrian", 7, first_truth_points),
+                    shape("bicycle", 8, ignore_points),
+                    shape(
+                        "car",
+                        70,
+                        [[196.0, 99.0], [204.0, 99.0], [204.0, 103.0], [196.0, 103.0]],
+                    ),
+                ],
+            ),
+        )
         archive.writestr(
             first_annotation.removesuffix(".json") + ".jpg",
             first_image.read_bytes(),
         )
-        archive.writestr(second_annotation, b"{}")
+        archive.writestr(
+            second_annotation,
+            annotation(
+                "000011.jpg",
+                [
+                    shape("pedestrian", 7, second_truth_points),
+                    shape(
+                        "car",
+                        70,
+                        [[198.0, 99.0], [206.0, 99.0], [206.0, 103.0], [198.0, 103.0]],
+                    ),
+                ],
+            ),
+        )
         archive.writestr(
             second_annotation.removesuffix(".json") + ".jpg",
             second_image.read_bytes(),
-        )
-        archive.writestr(
-            "annotation-only/site19_sequence/sequence_a/000010.json",
-            b"{}",
         )
     frames = (
         HumanFrame(
@@ -93,7 +147,7 @@ def synthetic_benchmark(tmp_path: Path) -> HumanBenchmark:
                 frame=10,
                 class_id=0,
                 track_id=7,
-                obb=OBB(100.0, 101.0, 8.0, 4.0, 0.25),
+                obb=OBB(100.0, 101.0, 8.0, 4.0, 0.0),
                 pixel_speed=2.0,
                 visible_span=0,
             ),
@@ -103,7 +157,7 @@ def synthetic_benchmark(tmp_path: Path) -> HumanBenchmark:
                 frame=11,
                 class_id=0,
                 track_id=7,
-                obb=OBB(102.0, 101.0, 8.0, 4.0, 0.25),
+                obb=OBB(102.0, 101.0, 8.0, 4.0, 0.0),
                 pixel_speed=2.0,
                 visible_span=0,
             ),
@@ -157,7 +211,7 @@ def test_freeze_is_byte_deterministic_and_declares_exact_children(
     }
     truth = json.loads((first / "ground-truth.jsonl").read_text().splitlines()[0])
     ignore = json.loads((first / "ignore.jsonl").read_text().splitlines()[0])
-    assert truth["obb"] == [100.0, 101.0, 8.0, 4.0, 0.25]
+    assert truth["obb"] == [100.0, 101.0, 8.0, 4.0, 0.0]
     assert ignore["points"] == [
         [-1.0, 50.0],
         [3.0, 50.0],
@@ -273,7 +327,7 @@ def test_freeze_rejects_truth_that_strict_loader_could_not_load(
                     value.truths[1],
                 ),
             ),
-            "truth OBB.*canonical",
+            "source annotation truths",
         ),
         (
             lambda value: replace(
@@ -283,7 +337,7 @@ def test_freeze_rejects_truth_that_strict_loader_could_not_load(
                     value.truths[1],
                 ),
             ),
-            "derived motion mismatch",
+            "source annotation motion",
         ),
         (
             lambda value: replace(
@@ -364,6 +418,195 @@ def _rewrite_jsonl(output: Path, name: str, update) -> None:
         manifest["files"][name]["sha256"] = hashlib.sha256(content).hexdigest()
 
     _rewrite_manifest(output, refresh)
+
+
+def _rewrite_json(output: Path, name: str, update) -> None:
+    path = output / name
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    update(payload)
+    content = _canonical_bytes(payload)
+    path.write_bytes(content)
+
+    def refresh(manifest):
+        manifest["files"][name]["sha256"] = hashlib.sha256(content).hexdigest()
+
+    _rewrite_manifest(output, refresh)
+
+
+def _forge_benchmark_source_field(
+    benchmark: HumanBenchmark,
+    field: str,
+) -> HumanBenchmark:
+    if field == "class_id":
+        return replace(
+            benchmark,
+            truths=tuple(replace(row, class_id=1) for row in benchmark.truths),
+        )
+    if field == "track_id":
+        return replace(
+            benchmark,
+            truths=tuple(replace(row, track_id=17) for row in benchmark.truths),
+        )
+    if field == "obb":
+        return replace(
+            benchmark,
+            truths=tuple(
+                replace(row, obb=replace(row.obb, cx=row.obb.cx + 10.0))
+                for row in benchmark.truths
+            ),
+        )
+    if field == "ignore":
+        return replace(
+            benchmark,
+            ignores=tuple(
+                replace(
+                    row,
+                    points=tuple((x - 1.0, y) for x, y in row.points),
+                )
+                for row in benchmark.ignores
+            ),
+        )
+    if field == "pixel_speed":
+        return replace(
+            benchmark,
+            truths=tuple(replace(row, pixel_speed=2.5) for row in benchmark.truths),
+        )
+    if field == "visible_span":
+        return replace(
+            benchmark,
+            truths=tuple(replace(row, visible_span=1) for row in benchmark.truths),
+        )
+    if field == "vehicle_counts":
+        return replace(benchmark, vehicle_counts={"car": 1, "truck": 1})
+    if field == "annotation_count":
+        return replace(
+            benchmark,
+            annotation_count=6,
+            vehicle_counts={"car": 3},
+        )
+    raise AssertionError(f"unsupported source-field forgery: {field}")
+
+
+def _forge_frozen_source_field(output: Path, field: str) -> None:
+    if field == "class_id":
+        _rewrite_jsonl(
+            output,
+            "ground-truth.jsonl",
+            lambda rows: [row.update(class_id=1) for row in rows],
+        )
+        return
+    if field == "track_id":
+        _rewrite_jsonl(
+            output,
+            "ground-truth.jsonl",
+            lambda rows: [row.update(track_id=17) for row in rows],
+        )
+        return
+    if field == "obb":
+        _rewrite_jsonl(
+            output,
+            "ground-truth.jsonl",
+            lambda rows: [row["obb"].__setitem__(0, row["obb"][0] + 10.0) for row in rows],
+        )
+        return
+    if field == "ignore":
+        _rewrite_jsonl(
+            output,
+            "ignore.jsonl",
+            lambda rows: [
+                row.update(points=[[x - 1.0, y] for x, y in row["points"]])
+                for row in rows
+            ],
+        )
+        return
+    if field == "pixel_speed":
+        _rewrite_jsonl(
+            output,
+            "ground-truth.jsonl",
+            lambda rows: [row.update(pixel_speed=2.5) for row in rows],
+        )
+        return
+    if field == "visible_span":
+        _rewrite_jsonl(
+            output,
+            "ground-truth.jsonl",
+            lambda rows: [row.update(visible_span=1) for row in rows],
+        )
+        return
+    if field == "vehicle_counts":
+        _rewrite_json(
+            output,
+            "vehicle-audit.json",
+            lambda audit: audit.update(vehicle_counts={"car": 1, "truck": 1}),
+        )
+        return
+    if field == "annotation_count":
+        _rewrite_json(
+            output,
+            "vehicle-audit.json",
+            lambda audit: audit.update(
+                annotation_count=6,
+                vehicle_counts={"car": 3},
+            ),
+        )
+        _rewrite_manifest(
+            output,
+            lambda manifest: manifest.update(annotation_count=6),
+        )
+        return
+    raise AssertionError(f"unsupported frozen source-field forgery: {field}")
+
+
+@pytest.mark.parametrize(
+    ("field", "error"),
+    [
+        ("class_id", "source annotation truths"),
+        ("track_id", "source annotation truths"),
+        ("obb", "source annotation truths"),
+        ("ignore", "source annotation ignores"),
+        ("pixel_speed", "source annotation motion"),
+        ("visible_span", "source annotation motion"),
+        ("vehicle_counts", "source annotation vehicle audit"),
+        ("annotation_count", "source annotation count"),
+    ],
+)
+def test_freeze_rejects_truth_forged_away_from_source_annotation(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    field: str,
+    error: str,
+) -> None:
+    forged = _forge_benchmark_source_field(synthetic_benchmark, field)
+
+    with pytest.raises(ValueError, match=error):
+        freeze_human_benchmark(forged, tmp_path / f"forged-{field}")
+
+
+@pytest.mark.parametrize(
+    ("field", "error"),
+    [
+        ("class_id", "source annotation truths"),
+        ("track_id", "source annotation truths"),
+        ("obb", "source annotation truths"),
+        ("ignore", "source annotation ignores"),
+        ("pixel_speed", "source annotation motion"),
+        ("visible_span", "source annotation motion"),
+        ("vehicle_counts", "source annotation vehicle audit"),
+        ("annotation_count", "source annotation count"),
+    ],
+)
+def test_load_rejects_synchronized_frozen_truth_forgery(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    field: str,
+    error: str,
+) -> None:
+    output = tmp_path / f"forged-{field}"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    _forge_frozen_source_field(output, field)
+
+    with pytest.raises(ValueError, match=error):
+        load_human_benchmark(output)
 
 
 @pytest.mark.parametrize(
@@ -464,17 +707,17 @@ def _append_source_zip_symlink(
         (
             "synthetic/site19_sequence/sequence_a/000010.json",
             b"{}",
-            "duplicate source ZIP member",
+            "source annotation rebuild failed: duplicate archive name",
         ),
         (
             "synthetic/site19_sequence/sequence_a/10.JSON",
             b"{}",
-            "duplicate source ZIP numeric frame",
+            "source annotation rebuild failed: duplicate archive frame",
         ),
         (
             "synthetic/site19_sequence/sequence_a/10.JPG",
             b"first synthetic image",
-            "duplicate source ZIP numeric frame",
+            "source annotation rebuild failed: duplicate archive frame",
         ),
     ],
 )
@@ -550,7 +793,10 @@ def test_freeze_and_load_reject_symlink_source_zip_numeric_aliases(
         synthetic_benchmark.source_zip.read_bytes()
     ).hexdigest()
 
-    with pytest.raises(ValueError, match="duplicate source ZIP numeric frame"):
+    with pytest.raises(
+        ValueError,
+        match="source annotation rebuild failed: duplicate archive frame",
+    ):
         if operation == "freeze":
             freeze_human_benchmark(
                 replace(
@@ -589,7 +835,7 @@ def test_load_requires_real_annotation_and_paired_jpeg_members(
         lambda rows: rows[0].update(annotation_member=annotation_member),
     )
 
-    with pytest.raises(ValueError, match="source ZIP member"):
+    with pytest.raises(ValueError, match="source annotation rebuild failed"):
         load_human_benchmark(output)
 
 
@@ -616,7 +862,7 @@ def test_load_rejects_rehashed_images_from_a_forged_common_root(
 
     _rewrite_jsonl(output, "frames.jsonl", replace_images)
 
-    with pytest.raises(ValueError, match="image bytes differ.*source ZIP"):
+    with pytest.raises(ValueError, match="source annotation rebuild.*image bytes"):
         load_human_benchmark(output)
 
 
@@ -635,7 +881,7 @@ def test_load_binds_image_basename_to_the_paired_zip_jpeg(
         lambda rows: rows[0].update(image_path=str(alias.resolve())),
     )
 
-    with pytest.raises(ValueError, match="paired JPEG.*image path"):
+    with pytest.raises(ValueError, match="source annotation image.*frame snapshots"):
         load_human_benchmark(output)
 
 
@@ -659,7 +905,12 @@ def test_freeze_accepts_task1_numeric_stems_and_case_insensitive_suffixes(
                 original_frame.annotation_member.removesuffix(".json")
                 + ".jpg": renamed_jpeg,
             }.get(info.filename, info.filename)
-            destination.writestr(name, source.read(info))
+            content = source.read(info)
+            if info.filename == original_frame.annotation_member:
+                payload = json.loads(content)
+                payload["imagePath"] = "10.JpG"
+                content = json.dumps(payload).encode("utf-8")
+            destination.writestr(name, content)
     first_frame = replace(
         original_frame,
         image_path=renamed_image,
@@ -725,56 +976,25 @@ def test_load_rederives_truth_motion_instead_of_trusting_rehashed_values(
         lambda rows: rows[0].update({field: value}),
     )
 
-    with pytest.raises(ValueError, match="derived motion mismatch"):
+    with pytest.raises(ValueError, match="source annotation motion"):
         load_human_benchmark(output)
 
 
-def test_load_accepts_a_few_speed_ulps_and_keeps_zero_stable(
+def test_load_rejects_even_one_speed_ulp_away_from_source_annotation(
     tmp_path: Path,
     synthetic_benchmark: HumanBenchmark,
 ) -> None:
     one_ulp = math.nextafter(2.0, math.inf)
-    four_ulps = 2.0
-    for _ in range(4):
-        four_ulps = math.nextafter(four_ulps, math.inf)
-    for index, stored_speed in enumerate((one_ulp, four_ulps)):
-        output = tmp_path / f"accepted-{index}"
-        freeze_human_benchmark(synthetic_benchmark, output)
-        _rewrite_jsonl(
-            output,
-            "ground-truth.jsonl",
-            lambda rows, value=stored_speed: rows[0].update(pixel_speed=value),
-        )
-
-        loaded = load_human_benchmark(output)
-
-        assert loaded.truths[0].pixel_speed == stored_speed
-
-    zero_truth = replace(synthetic_benchmark.truths[0], pixel_speed=0.0)
-    zero_benchmark = replace(
-        synthetic_benchmark,
-        annotation_count=4,
-        truths=(zero_truth,),
-    )
-    zero = tmp_path / "zero"
-    freeze_human_benchmark(zero_benchmark, zero)
-
-    assert load_human_benchmark(zero) == zero_benchmark
-
-    zero_ulp = tmp_path / "zero-ulp"
-    freeze_human_benchmark(zero_benchmark, zero_ulp)
+    output = tmp_path / "one-ulp"
+    freeze_human_benchmark(synthetic_benchmark, output)
     _rewrite_jsonl(
-        zero_ulp,
+        output,
         "ground-truth.jsonl",
-        lambda rows: rows[0].update(
-            pixel_speed=math.nextafter(0.0, math.inf)
-        ),
+        lambda rows: rows[0].update(pixel_speed=one_ulp),
     )
 
-    assert load_human_benchmark(zero_ulp).truths[0].pixel_speed == math.nextafter(
-        0.0,
-        math.inf,
-    )
+    with pytest.raises(ValueError, match="source annotation motion"):
+        load_human_benchmark(output)
 
 
 def test_load_rejects_speed_difference_of_five_e_minus_ten(
@@ -789,7 +1009,7 @@ def test_load_rejects_speed_difference_of_five_e_minus_ten(
         lambda rows: rows[0].update(pixel_speed=2.0 + 5e-10),
     )
 
-    with pytest.raises(ValueError, match="derived motion mismatch"):
+    with pytest.raises(ValueError, match="source annotation motion"):
         load_human_benchmark(output)
 
 
@@ -798,20 +1018,20 @@ def test_load_rejects_speed_difference_of_five_e_minus_ten(
     [
         (
             lambda rows: rows[0].update(obb=[100.0, 101.0, 4.0, 8.0, 0.25]),
-            "truth OBB.*canonical",
+            "source annotation truths",
         ),
         (
             lambda rows: rows[0].update(
                 obb=[100.0, 101.0, 8.0, 4.0, math.pi]
             ),
-            "truth OBB.*canonical",
+            "source annotation truths",
         ),
         (
             lambda rows: [
                 row.update(obb=[row["obb"][0] - 99.0, *row["obb"][1:]])
                 for row in rows
             ],
-            "truth OBB.*inside",
+            "source annotation truths",
         ),
     ],
 )
@@ -834,11 +1054,11 @@ def test_load_rejects_truth_geometry_outside_task1_semantics(
     [
         (
             [[-1.0, 50.0], [3.0, 50.0], [4.0, 54.0], [-1.0, 54.0]],
-            "ignore.*rectangle",
+            "source annotation ignores",
         ),
         (
             [[1.0, 50.0], [3.0, 50.0], [3.0, 54.0], [1.0, 54.0]],
-            "ignore.*outside",
+            "source annotation ignores",
         ),
     ],
 )
@@ -860,7 +1080,7 @@ def test_load_rejects_ignore_geometry_outside_task1_semantics(
         load_human_benchmark(output)
 
 
-def test_truth_boundary_accepts_roundoff_but_rejects_real_excursion(
+def test_freeze_rejects_boundary_geometry_forged_away_from_source_annotation(
     tmp_path: Path,
     synthetic_benchmark: HumanBenchmark,
 ) -> None:
@@ -876,21 +1096,20 @@ def test_truth_boundary_accepts_roundoff_but_rejects_real_excursion(
     )
     boundary = replace(
         synthetic_benchmark,
-        annotation_count=4,
-        truths=(boundary_truth,),
+        truths=(boundary_truth, synthetic_benchmark.truths[1]),
     )
-    output = tmp_path / "boundary"
-
-    freeze_human_benchmark(boundary, output)
-
-    assert load_human_benchmark(output) == boundary
+    with pytest.raises(ValueError, match="source annotation truths"):
+        freeze_human_benchmark(boundary, tmp_path / "boundary")
 
     outside_obb = replace(boundary_obb, cx=boundary_obb.cx - 1e-6)
     outside = replace(
         boundary,
-        truths=(replace(boundary_truth, obb=outside_obb),),
+        truths=(
+            replace(boundary_truth, obb=outside_obb),
+            synthetic_benchmark.truths[1],
+        ),
     )
-    with pytest.raises(ValueError, match="truth OBB.*inside"):
+    with pytest.raises(ValueError, match="source annotation truths"):
         freeze_human_benchmark(outside, tmp_path / "outside")
 
 
@@ -922,22 +1141,21 @@ def test_load_treats_vehicle_none_as_a_stable_track_class(
     tmp_path: Path,
     synthetic_benchmark: HumanBenchmark,
 ) -> None:
-    valid_truth = replace(
-        synthetic_benchmark.truths[1],
-        track_id=9,
-        pixel_speed=0.0,
-    )
-    source = replace(
-        synthetic_benchmark,
-        annotation_count=4,
-        truths=(valid_truth,),
-    )
     output = tmp_path / "benchmark"
-    freeze_human_benchmark(source, output)
+    freeze_human_benchmark(synthetic_benchmark, output)
+    _rewrite_jsonl(
+        output,
+        "ground-truth.jsonl",
+        lambda rows: rows.pop(0),
+    )
+    _rewrite_manifest(
+        output,
+        lambda manifest: manifest["counts"].update(truths=1),
+    )
     _rewrite_jsonl(
         output,
         "ignore.jsonl",
-        lambda rows: rows[0].update(class_id=None, track_id=9),
+        lambda rows: rows[0].update(class_id=None, track_id=7),
     )
     audit_path = output / "vehicle-audit.json"
     audit = json.loads(audit_path.read_text(encoding="utf-8"))

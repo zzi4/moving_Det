@@ -1,4 +1,5 @@
 import json
+import hashlib
 import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -8,6 +9,7 @@ import pytest
 from moving_det.ml.human_benchmark import (
     SequenceSpec,
     parse_human_benchmark,
+    parse_human_benchmark_snapshot,
 )
 
 
@@ -162,6 +164,95 @@ def test_parser_maps_vru_and_retains_vehicle_only_for_audit(
     )
 
 
+def test_snapshot_parser_matches_path_wrapper(
+    human_archive: tuple[Path, Path],
+) -> None:
+    human_zip, image_root = human_archive
+    expected = parse_human_benchmark(
+        human_zip,
+        image_root,
+        sequence_contract=SYNTHETIC_CONTRACT,
+    )
+
+    with human_zip.open("rb") as stream:
+        actual = parse_human_benchmark_snapshot(
+            human_zip,
+            hashlib.sha256(human_zip.read_bytes()).hexdigest(),
+            stream,
+            image_root,
+            lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+            sequence_contract=SYNTHETIC_CONTRACT,
+        )
+
+    assert actual == expected
+
+
+def test_snapshot_parser_consumes_open_zip_after_path_replacement(
+    human_archive: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    human_zip, image_root = human_archive
+    original_sha256 = hashlib.sha256(human_zip.read_bytes()).hexdigest()
+    replacement = tmp_path / "replacement.zip"
+    with (
+        zipfile.ZipFile(human_zip) as source,
+        zipfile.ZipFile(replacement, "w") as target,
+    ):
+        for info in source.infolist():
+            content = source.read(info)
+            if info.filename.endswith("000010.json"):
+                payload = json.loads(content)
+                payload["shapes"][0]["group_id"] = 99
+                content = json.dumps(payload).encode("utf-8")
+            target.writestr(info, content)
+
+    with human_zip.open("rb") as stream:
+        replacement.replace(human_zip)
+        result = parse_human_benchmark_snapshot(
+            human_zip,
+            original_sha256,
+            stream,
+            image_root,
+            lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
+            sequence_contract=SYNTHETIC_CONTRACT,
+        )
+
+    assert result.source_zip_sha256 == original_sha256
+    assert result.truths[0].track_id == 7
+
+
+def test_snapshot_parser_consumes_pinned_image_digest_after_path_replacement(
+    human_archive: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    human_zip, image_root = human_archive
+    first_image = image_root / "site19_sequence" / "sequence_a" / "000010.jpg"
+    replacement = tmp_path / "replacement.jpg"
+    replacement.write_bytes(b"replacement image bytes")
+
+    with first_image.open("rb") as pinned_image, human_zip.open("rb") as zip_stream:
+        pinned_sha256 = hashlib.sha256(pinned_image.read()).hexdigest()
+        pinned_image.seek(0)
+        replacement.replace(first_image)
+
+        def image_sha256(path: Path) -> str:
+            if path == first_image:
+                return hashlib.sha256(pinned_image.read()).hexdigest()
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        result = parse_human_benchmark_snapshot(
+            human_zip,
+            hashlib.sha256(zip_stream.read()).hexdigest(),
+            zip_stream,
+            image_root,
+            image_sha256,
+            sequence_contract=SYNTHETIC_CONTRACT,
+        )
+
+    assert result.frames[0].image_sha256 == pinned_sha256
+    assert hashlib.sha256(first_image.read_bytes()).hexdigest() != pinned_sha256
+
+
 def test_parser_maps_all_four_human_vru_labels(tmp_path: Path) -> None:
     zip_path, image_root = _write_benchmark(
         tmp_path,
@@ -305,6 +396,23 @@ def test_parser_rejects_invalid_shapes(
     )
 
     with pytest.raises(ValueError, match=error):
+        parse_human_benchmark(
+            zip_path,
+            image_root,
+            sequence_contract=SYNTHETIC_CONTRACT,
+        )
+
+
+def test_parser_rejects_non_string_label_with_context(tmp_path: Path) -> None:
+    malformed = _shape("pedestrian", 7)
+    malformed["label"] = []
+    zip_path, image_root = _write_benchmark(
+        tmp_path,
+        frames={SYNTHETIC_DIRECTORY: {10: [malformed], 11: []}},
+        contract=SYNTHETIC_CONTRACT,
+    )
+
+    with pytest.raises(ValueError, match="unsupported label"):
         parse_human_benchmark(
             zip_path,
             image_root,

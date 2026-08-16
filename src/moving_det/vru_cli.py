@@ -2220,7 +2220,19 @@ def _validate_ground_truth_rows(
 def _fixed_human_frame_universe(
     benchmark: object,
 ) -> tuple[tuple[str, str, int], ...]:
-    from moving_det.ml.human_benchmark import APPROVED_SEQUENCES
+    from moving_det.ml.human_benchmark import (
+        APPROVED_SEQUENCES,
+        APPROVED_SOURCE_ZIP_SHA256,
+    )
+
+    if getattr(benchmark, "source_zip_sha256", None) != APPROVED_SOURCE_ZIP_SHA256:
+        raise WorkflowError(
+            "human benchmark must use the approved source ZIP SHA-256"
+        )
+    if getattr(benchmark, "annotation_count", None) != 78_335:
+        raise WorkflowError(
+            "human benchmark must contain exactly 78,335 source annotations"
+        )
 
     frames = tuple(getattr(benchmark, "frames", ()))
     expected = tuple(
@@ -2241,8 +2253,20 @@ def _fixed_human_frame_universe(
     if len(ignores) != 334:
         raise WorkflowError("human benchmark must contain exactly 334 edge ignores")
     truths = tuple(getattr(benchmark, "truths", ()))
+    if len(truths) != 53_735:
+        raise WorkflowError(
+            "human benchmark must contain exactly 53,735 manual truths"
+        )
     if {getattr(truth, "class_id", None) for truth in truths} != {0, 1, 2, 3}:
         raise WorkflowError("human benchmark must contain manual classes 0..3")
+    if dict(getattr(benchmark, "vehicle_counts", {})) != {
+        "bus": 291,
+        "car": 23_975,
+        "truck": 291,
+    }:
+        raise WorkflowError(
+            "human benchmark vehicle audit must match the approved exact counts"
+        )
     expected_set = set(expected)
     if any(
         (str(row.site), str(row.sequence), int(row.frame)) not in expected_set

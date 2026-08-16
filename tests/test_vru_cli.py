@@ -5500,7 +5500,6 @@ def _evaluation_request(tmp_path: Path) -> EvaluationRequest:
 
 def _fixed_human_benchmark(tmp_path: Path):
     from moving_det.ml.human_benchmark import (
-        HumanBenchmark,
         HumanFrame,
         HumanIgnore,
         HumanTruth,
@@ -5556,7 +5555,8 @@ def _fixed_human_benchmark(tmp_path: Path):
         )
         for index, frame in enumerate(frames[:334])
     )
-    return HumanBenchmark(
+    return SimpleNamespace(
+        _synthetic_test_contract=True,
         source_zip=tmp_path / "manual.zip",
         source_zip_sha256="c" * 64,
         annotation_count=len(truths) + len(ignores),
@@ -5565,6 +5565,106 @@ def _fixed_human_benchmark(tmp_path: Path):
         ignores=ignores,
         vehicle_counts={},
     )
+
+
+@pytest.fixture(autouse=True)
+def _explicit_synthetic_human_universe(monkeypatch):
+    production_validator = vru_cli_module._fixed_human_frame_universe
+
+    def validate(benchmark):
+        if getattr(benchmark, "_synthetic_test_contract", False) is not True:
+            return production_validator(benchmark)
+        frames = tuple(benchmark.frames)
+        identities = tuple(
+            (str(row.site), str(row.sequence), int(row.frame))
+            for row in frames
+        )
+        if len(identities) != 873 or len(set(identities)) != 873:
+            raise WorkflowError(
+                "synthetic human benchmark must contain exactly 873 frame identities"
+            )
+        if len(tuple(benchmark.ignores)) != 334:
+            raise WorkflowError(
+                "synthetic human benchmark must contain exactly 334 edge ignores"
+            )
+        if {
+            row.class_id for row in benchmark.truths
+        } != {0, 1, 2, 3}:
+            raise WorkflowError("synthetic human benchmark must contain classes 0..3")
+        return identities
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_fixed_human_frame_universe",
+        validate,
+    )
+
+
+def _production_human_contract_stub():
+    from moving_det.ml.human_benchmark import APPROVED_SEQUENCES
+
+    frames = tuple(
+        SimpleNamespace(site=spec.site, sequence=spec.sequence, frame=frame)
+        for spec in APPROVED_SEQUENCES.values()
+        for frame in range(spec.first_frame, spec.last_frame + 1)
+    )
+    class_rows = tuple(
+        SimpleNamespace(
+            site=frames[index].site,
+            sequence=frames[index].sequence,
+            frame=frames[index].frame,
+            class_id=index,
+        )
+        for index in range(4)
+    )
+    truths = (*class_rows, *((class_rows[0],) * (53_735 - len(class_rows))))
+    vehicle_ignore = SimpleNamespace(
+        site=frames[0].site,
+        sequence=frames[0].sequence,
+        frame=frames[0].frame,
+        class_id=None,
+    )
+    ignores = (vehicle_ignore,) * 334
+    return SimpleNamespace(
+        source_zip_sha256=(
+            "c27dce796ae24d7028913ea6d7fcd72acd1d23807a430e2baf487129794ddf31"
+        ),
+        annotation_count=78_335,
+        frames=frames,
+        truths=truths,
+        ignores=ignores,
+        vehicle_counts={"bus": 291, "car": 23_975, "truck": 291},
+    )
+
+
+def test_fixed_human_universe_accepts_only_the_exact_production_contract():
+    benchmark = _production_human_contract_stub()
+
+    universe = vru_cli_module._fixed_human_frame_universe(benchmark)
+
+    assert len(universe) == 873
+    assert universe[0] == ("site19", "DJI_20240919093341_0002_V", 2926)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("source_zip_sha256", "d" * 64, "approved source ZIP"),
+        ("annotation_count", 78_334, "78,335 source annotations"),
+        ("truths", (), "53,735 manual truths"),
+        ("vehicle_counts", {"car": 23_975}, "vehicle audit"),
+    ],
+)
+def test_fixed_human_universe_rejects_nonproduction_counts(
+    field,
+    value,
+    error,
+):
+    benchmark = _production_human_contract_stub()
+    setattr(benchmark, field, value)
+
+    with pytest.raises(WorkflowError, match=error):
+        vru_cli_module._fixed_human_frame_universe(benchmark)
 
 
 def _human_evaluation_request_and_bundle(tmp_path: Path):
@@ -5872,9 +5972,11 @@ def test_human_artifacts_accept_visible_span_zero(tmp_path, monkeypatch):
 
     benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
     zero_truth = replace(benchmark.truths[0], visible_span=0)
-    benchmark = replace(
-        benchmark,
-        truths=(zero_truth, *benchmark.truths[1:]),
+    benchmark = SimpleNamespace(
+        **{
+            **vars(benchmark),
+            "truths": (zero_truth, *benchmark.truths[1:]),
+        }
     )
     zero_row = {**dict(bundle.ground_truth[0]), "visible_span": 0}
     bundle = replace(
