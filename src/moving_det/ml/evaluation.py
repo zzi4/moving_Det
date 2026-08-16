@@ -201,10 +201,13 @@ class ThresholdEvidence:
 
 
 @dataclass(frozen=True)
-class _MatchResult:
+class MatchResult:
     matched_gt: frozenset[int]
     prediction_is_true_positive: tuple[bool, ...]
     prediction_to_gt: Mapping[int, int]
+
+
+_MatchResult = MatchResult
 
 
 def _prediction_key(
@@ -373,13 +376,13 @@ def _evaluation_scope(
     )
 
 
-def _match(
+def match_detections(
     predictions: tuple[Detection, ...],
     ground_truth: tuple[GroundTruth, ...],
     threshold: float,
     *,
     class_id: int | None = None,
-) -> _MatchResult:
+) -> MatchResult:
     threshold = _unit_interval(threshold, "rotated IoU threshold")
     eligible_predictions = [
         (index, item)
@@ -425,11 +428,14 @@ def _match(
         matched_gt.add(truth_index)
         true_by_prediction[prediction_index] = True
         prediction_to_gt[prediction_index] = truth_index
-    return _MatchResult(
+    return MatchResult(
         matched_gt=frozenset(matched_gt),
         prediction_is_true_positive=tuple(true_by_prediction),
         prediction_to_gt=MappingProxyType(prediction_to_gt),
     )
+
+
+_match = match_detections
 
 
 def _average_precision(

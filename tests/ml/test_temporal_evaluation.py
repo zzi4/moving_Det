@@ -6,16 +6,19 @@ from types import SimpleNamespace
 
 import pytest
 
+import moving_det.ml.evaluation as evaluation_module
 import moving_det.ml.inference as inference_module
 from moving_det.models import OBB
 from moving_det.ml.evaluation import (
     GroundTruth,
+    MatchResult,
     ThresholdEvidence,
     evaluate_temporal_gate,
     evaluate_temporal_obb,
     freeze_validation_threshold,
     load_validation_threshold,
     longest_consecutive_miss,
+    match_detections,
     paired_track_bootstrap,
     select_validation_threshold,
     stopped_interval_mask,
@@ -266,6 +269,23 @@ def test_confidence_order_controls_one_to_one_match_and_cross_class_never_matche
     assert metrics["per_class"]["1"]["gt_count"] == 0
     assert metrics["per_class"]["1"]["ap50"] is None
     assert metrics["per_class"]["1"]["ap50_95"] is None
+
+
+def test_public_matcher_preserves_private_alias_and_deterministic_behavior():
+    ground_truth = (_gt(1),)
+    predictions = (
+        _pred(1, cx=12, confidence=0.9),
+        _pred(1, cx=10, confidence=0.8),
+    )
+
+    result = match_detections(predictions, ground_truth, 0.5)
+
+    assert isinstance(result, MatchResult)
+    assert result.matched_gt == frozenset({0})
+    assert result.prediction_is_true_positive == (True, False)
+    assert dict(result.prediction_to_gt) == {0: 0}
+    assert evaluation_module._MatchResult is MatchResult
+    assert evaluation_module._match is match_detections
 
 
 def test_matching_is_namespaced_by_site_and_sequence_identity():
