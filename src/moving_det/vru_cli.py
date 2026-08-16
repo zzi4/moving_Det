@@ -5508,6 +5508,70 @@ def _stable_file_signature(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+class _HumanFileDescriptorRegistry:
+    def __init__(self) -> None:
+        self._owned: dict[int, None] = {}
+
+    def own(self, descriptor: int) -> int:
+        if (
+            type(descriptor) is not int
+            or descriptor < 0
+            or descriptor in self._owned
+        ):
+            raise WorkflowError("human path open returned an invalid descriptor")
+        self._owned[descriptor] = None
+        return descriptor
+
+    def close(self, descriptor: int) -> BaseException | None:
+        if descriptor not in self._owned:
+            return RuntimeError("human path descriptor is not owned")
+        del self._owned[descriptor]
+        try:
+            os.close(descriptor)
+        except BaseException as exc:
+            return exc
+        return None
+
+    def close_all(self) -> tuple[BaseException, ...]:
+        errors = []
+        for descriptor in reversed(tuple(self._owned)):
+            error = self.close(descriptor)
+            if error is not None:
+                errors.append(error)
+        return tuple(errors)
+
+
+def _close_owned_human_fd(
+    owned_fds: _HumanFileDescriptorRegistry,
+    descriptor: int,
+    *,
+    purpose: str,
+) -> None:
+    error = owned_fds.close(descriptor)
+    if error is not None:
+        raise WorkflowError(
+            f"failed to close human path {purpose} descriptor"
+        ) from error
+
+
+def _cleanup_owned_human_fds(
+    owned_fds: _HumanFileDescriptorRegistry,
+    primary_error: BaseException | None,
+) -> None:
+    errors = owned_fds.close_all()
+    if not errors:
+        return
+    if primary_error is not None:
+        primary_error.add_note(
+            f"{len(errors)} additional human file-descriptor cleanup "
+            "error(s) were suppressed"
+        )
+        return
+    raise WorkflowError(
+        f"failed to close {len(errors)} owned human path descriptor(s)"
+    ) from errors[0]
+
+
 def _load_stable_human_rgb(
     path: Path,
     *,
@@ -5516,19 +5580,20 @@ def _load_stable_human_rgb(
     directory_fd: int,
     entry_name: str,
     expected_stat: os.stat_result,
+    open_flags: int,
+    owned_fds: _HumanFileDescriptorRegistry,
 ) -> Any:
     import numpy as np
     from PIL import Image
 
     source = Path(path)
-    descriptor = -1
     try:
-        descriptor = os.open(
-            entry_name,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory_fd,
+        descriptor = owned_fds.own(
+            os.open(
+                entry_name,
+                open_flags,
+                dir_fd=directory_fd,
+            )
         )
         opened = os.fstat(descriptor)
         path_stat = os.stat(
@@ -5580,9 +5645,11 @@ def _load_stable_human_rgb(
         raise
     except OSError as exc:
         raise WorkflowError(f"{label} is missing or unsafe: {source}") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    _close_owned_human_fd(
+        owned_fds,
+        descriptor,
+        purpose="image",
+    )
     digest = hashlib.sha256(content).hexdigest()
     if expected_sha256 is not None:
         if not _is_sha256(expected_sha256) or digest != expected_sha256:
@@ -5596,14 +5663,38 @@ def _load_stable_human_rgb(
         raise WorkflowError(f"{label} is undecodable: {source}") from exc
 
 
-def _human_directory_open_flags() -> int:
-    return (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NONBLOCK", 0)
+def _human_secure_open_flags() -> tuple[int, int]:
+    values = {}
+    invalid = []
+    for name in (
+        "O_RDONLY",
+        "O_CLOEXEC",
+        "O_NOFOLLOW",
+        "O_DIRECTORY",
+        "O_NONBLOCK",
+    ):
+        value = vars(os).get(name)
+        if (
+            type(value) is not int
+            or value < 0
+            or (name != "O_RDONLY" and value == 0)
+        ):
+            invalid.append(name)
+        else:
+            values[name] = value
+    if invalid:
+        raise WorkflowError(
+            "secure human path opening requires valid OS flags: "
+            + ", ".join(invalid)
+        )
+    regular_file_flags = (
+        values["O_RDONLY"]
+        | values["O_CLOEXEC"]
+        | values["O_NOFOLLOW"]
+        | values["O_NONBLOCK"]
     )
+    directory_flags = regular_file_flags | values["O_DIRECTORY"]
+    return regular_file_flags, directory_flags
 
 
 def _open_human_directory_component(
@@ -5611,6 +5702,8 @@ def _open_human_directory_component(
     name: str,
     *,
     expected_stat: os.stat_result | None = None,
+    open_flags: int,
+    owned_fds: _HumanFileDescriptorRegistry,
 ) -> tuple[int, os.stat_result]:
     try:
         before = os.stat(
@@ -5632,12 +5725,13 @@ def _open_human_directory_component(
         != _stable_file_signature(expected_stat)
     ):
         raise WorkflowError(f"human path component changed: {name}")
-    descriptor = -1
     try:
-        descriptor = os.open(
-            name,
-            _human_directory_open_flags(),
-            dir_fd=parent_fd,
+        descriptor = owned_fds.own(
+            os.open(
+                name,
+                open_flags,
+                dir_fd=parent_fd,
+            )
         )
         opened = os.fstat(descriptor)
         if (
@@ -5648,23 +5742,18 @@ def _open_human_directory_component(
             raise WorkflowError(f"human path component changed: {name}")
         return descriptor, before
     except WorkflowError:
-        if descriptor >= 0:
-            os.close(descriptor)
         raise
     except OSError as exc:
-        if descriptor >= 0:
-            os.close(descriptor)
         raise WorkflowError(
             f"human path component is missing or unsafe: {name}"
         ) from exc
-    except BaseException:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
 
 
 def _open_stable_human_path_chain(
     center_path: Path,
+    *,
+    open_flags: int,
+    owned_fds: _HumanFileDescriptorRegistry,
 ) -> tuple[
     int,
     int,
@@ -5681,10 +5770,8 @@ def _open_stable_human_path_chain(
         raise WorkflowError(
             "human center frame must use a canonical absolute path"
         )
-    root_fd = -1
-    current_fd = -1
     try:
-        root_fd = os.open(Path("/"), _human_directory_open_flags())
+        root_fd = owned_fds.own(os.open(Path("/"), open_flags))
         root_stat = os.fstat(root_fd)
         if not stat.S_ISDIR(root_stat.st_mode):
             raise WorkflowError("human path root is not a directory")
@@ -5694,34 +5781,26 @@ def _open_stable_human_path_chain(
             next_fd, component_stat = _open_human_directory_component(
                 current_fd,
                 component,
+                open_flags=open_flags,
+                owned_fds=owned_fds,
             )
             if current_fd != root_fd:
-                os.close(current_fd)
+                _close_owned_human_fd(
+                    owned_fds,
+                    current_fd,
+                    purpose="traversal",
+                )
             current_fd = next_fd
             snapshots.append((component, component_stat))
         if current_fd == root_fd:
-            current_fd = os.dup(root_fd)
+            current_fd = owned_fds.own(os.dup(root_fd))
         return root_fd, current_fd, root_stat, tuple(snapshots)
     except WorkflowError:
-        if current_fd >= 0 and current_fd != root_fd:
-            os.close(current_fd)
-        if root_fd >= 0:
-            os.close(root_fd)
         raise
     except OSError as exc:
-        if current_fd >= 0 and current_fd != root_fd:
-            os.close(current_fd)
-        if root_fd >= 0:
-            os.close(root_fd)
         raise WorkflowError(
             f"human image path chain is missing or unsafe: {parent}"
         ) from exc
-    except BaseException:
-        if current_fd >= 0 and current_fd != root_fd:
-            os.close(current_fd)
-        if root_fd >= 0:
-            os.close(root_fd)
-        raise
 
 
 def _assert_stable_human_path_chain(
@@ -5730,6 +5809,9 @@ def _assert_stable_human_path_chain(
     directory_fd: int,
     root_stat: os.stat_result,
     snapshots: Sequence[tuple[str, os.stat_result]],
+    *,
+    open_flags: int,
+    owned_fds: _HumanFileDescriptorRegistry,
 ) -> None:
     parent = Path(center_path).parent
     current_fd = root_fd
@@ -5746,9 +5828,15 @@ def _assert_stable_human_path_chain(
                 current_fd,
                 component,
                 expected_stat=expected_stat,
+                open_flags=open_flags,
+                owned_fds=owned_fds,
             )
             if current_fd != root_fd:
-                os.close(current_fd)
+                _close_owned_human_fd(
+                    owned_fds,
+                    current_fd,
+                    purpose="post-walk",
+                )
             current_fd = next_fd
         walked = os.fstat(current_fd)
         opened = os.fstat(directory_fd)
@@ -5765,9 +5853,12 @@ def _assert_stable_human_path_chain(
         raise WorkflowError(
             f"human image path chain changed while reading: {parent}"
         ) from exc
-    finally:
-        if current_fd != root_fd:
-            os.close(current_fd)
+    if current_fd != root_fd:
+        _close_owned_human_fd(
+            owned_fds,
+            current_fd,
+            purpose="post-walk",
+        )
 
 
 def _resolve_human_jpeg_entries(
@@ -5859,13 +5950,20 @@ def _load_human_clip_rgb(
     if not _is_sha256(center_sha256):
         raise WorkflowError("human frame image_sha256 is invalid")
     frame_numbers = tuple(center_frame + offset for offset in offsets)
-    (
-        root_fd,
-        directory_fd,
-        root_stat,
-        path_snapshots,
-    ) = _open_stable_human_path_chain(center_path)
+    regular_file_flags, directory_flags = _human_secure_open_flags()
+    owned_fds = _HumanFileDescriptorRegistry()
+    primary_error: BaseException | None = None
     try:
+        (
+            root_fd,
+            directory_fd,
+            root_stat,
+            path_snapshots,
+        ) = _open_stable_human_path_chain(
+            center_path,
+            open_flags=directory_flags,
+            owned_fds=owned_fds,
+        )
         resolved = _resolve_human_jpeg_entries(
             center_path,
             center_frame=center_frame,
@@ -5887,6 +5985,8 @@ def _load_human_clip_rgb(
                 directory_fd=directory_fd,
                 entry_name=path.name,
                 expected_stat=entry_stat,
+                open_flags=regular_file_flags,
+                owned_fds=owned_fds,
             )
             paths[offset] = path
         _assert_stable_human_path_chain(
@@ -5895,13 +5995,15 @@ def _load_human_clip_rgb(
             directory_fd,
             root_stat,
             path_snapshots,
+            open_flags=directory_flags,
+            owned_fds=owned_fds,
         )
         return arrays, paths
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        try:
-            os.close(directory_fd)
-        finally:
-            os.close(root_fd)
+        _cleanup_owned_human_fds(owned_fds, primary_error)
 
 
 def _load_full_frame_clip(

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import errno
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -2797,6 +2799,354 @@ def test_human_full_frame_clip_rejects_symlink_selected_support(tmp_path):
             offsets=(0, 2),
             cache=SimpleNamespace(get=lambda key: None),
         )
+
+
+@pytest.mark.parametrize(
+    "missing_flags",
+    (
+        ("O_RDONLY",),
+        ("O_CLOEXEC",),
+        ("O_NOFOLLOW",),
+        ("O_DIRECTORY",),
+        ("O_NONBLOCK",),
+        ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK"),
+        ("O_RDONLY", "O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK"),
+    ),
+    ids=(
+        "rdonly",
+        "cloexec",
+        "nofollow",
+        "directory",
+        "nonblock",
+        "security-combination",
+        "all",
+    ),
+)
+def test_human_secure_path_flags_fail_closed_before_opening_fifo_path(
+    tmp_path,
+    monkeypatch,
+    missing_flags,
+):
+    fifo_component = tmp_path / "fifo-component"
+    vru_cli_module.os.mkfifo(fifo_component)
+    attempted_opens = []
+
+    for name in missing_flags:
+        monkeypatch.delattr(vru_cli_module.os, name, raising=False)
+
+    def reject_path_open(*args, **kwargs):
+        attempted_opens.append((args, kwargs))
+        raise AssertionError("secure flags must be validated before path open")
+
+    monkeypatch.setattr(vru_cli_module.os, "open", reject_path_open)
+
+    with pytest.raises(WorkflowError, match="secure human path opening requires"):
+        vru_cli_module._load_human_clip_rgb(
+            {
+                "image_path": fifo_component / "31.jpg",
+                "image_sha256": "a" * 64,
+            },
+            center_frame=31,
+            offsets=(0,),
+        )
+
+    assert attempted_opens == []
+
+
+@pytest.mark.parametrize(
+    ("flag_name", "invalid_value"),
+    (
+        ("O_RDONLY", True),
+        ("O_RDONLY", -1),
+        ("O_CLOEXEC", False),
+        ("O_NOFOLLOW", 0),
+        ("O_DIRECTORY", "65536"),
+        ("O_NONBLOCK", None),
+    ),
+)
+def test_human_secure_path_flags_reject_non_plain_or_invalid_integers(
+    tmp_path,
+    monkeypatch,
+    flag_name,
+    invalid_value,
+):
+    attempted_opens = []
+    monkeypatch.setattr(vru_cli_module.os, flag_name, invalid_value)
+
+    def reject_path_open(*args, **kwargs):
+        attempted_opens.append((args, kwargs))
+        raise AssertionError("invalid flags must be rejected before path open")
+
+    monkeypatch.setattr(vru_cli_module.os, "open", reject_path_open)
+
+    with pytest.raises(WorkflowError, match="secure human path opening requires"):
+        vru_cli_module._load_human_clip_rgb(
+            {
+                "image_path": tmp_path / "31.jpg",
+                "image_sha256": "a" * 64,
+            },
+            center_frame=31,
+            offsets=(0,),
+        )
+
+    assert attempted_opens == []
+
+
+def test_human_image_open_does_not_block_if_regular_entry_becomes_fifo(
+    tmp_path,
+    monkeypatch,
+):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    backup = image_dir / "original.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    record = {
+        "image_path": center,
+        "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+    }
+    real_stat = vru_cli_module.os.stat
+    real_open = vru_cli_module.os.open
+    real_close = vru_cli_module.os.close
+    swapped = threading.Event()
+    errors = []
+
+    def stat_then_replace_with_fifo(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if (
+            path == center.name
+            and kwargs.get("dir_fd") is not None
+            and not swapped.is_set()
+        ):
+            center.rename(backup)
+            vru_cli_module.os.mkfifo(center)
+            swapped.set()
+        return result
+
+    def load_center():
+        try:
+            vru_cli_module._load_human_clip_rgb(
+                record,
+                center_frame=31,
+                offsets=(0,),
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(vru_cli_module.os, "stat", stat_then_replace_with_fifo)
+    worker = threading.Thread(target=load_center, daemon=True)
+    worker.start()
+    assert swapped.wait(timeout=2)
+    worker.join(timeout=0.5)
+    blocked = worker.is_alive()
+    if blocked:
+        writer_fd = real_open(
+            center,
+            vru_cli_module.os.O_WRONLY | vru_cli_module.os.O_NONBLOCK,
+        )
+        real_close(writer_fd)
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert blocked is False
+    assert len(errors) == 1
+    assert isinstance(errors[0], WorkflowError)
+    assert "missing, unsafe, or too large" in str(errors[0])
+
+
+def test_human_path_walk_close_after_close_eintr_does_not_reclose_reused_fd(
+    tmp_path,
+    monkeypatch,
+):
+    proc_fds = Path("/proc/self/fd")
+    if not proc_fds.is_dir():
+        pytest.skip("requires /proc file-descriptor accounting")
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    record = {
+        "image_path": center,
+        "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+    }
+    probe_paths = []
+    for index in range(400):
+        probe = tmp_path / f"fd-reuse-probe-{index}"
+        probe.write_bytes(str(index).encode())
+        probe_paths.append(probe)
+    real_close = vru_cli_module.os.close
+    real_open = vru_cli_module.os.open
+    probes = []
+
+    def close_then_reuse_and_raise(descriptor):
+        real_close(descriptor)
+        probe_fd = real_open(
+            probe_paths[len(probes)],
+            vru_cli_module.os.O_RDONLY | vru_cli_module.os.O_CLOEXEC,
+        )
+        probes.append((probe_fd, vru_cli_module.os.fstat(probe_fd).st_ino))
+        raise OSError(errno.EINTR, "injected close-after-close interruption")
+
+    monkeypatch.setattr(vru_cli_module.os, "close", close_then_reuse_and_raise)
+    before = len(tuple(proc_fds.iterdir()))
+
+    for _ in range(100):
+        start = len(probes)
+        try:
+            with pytest.raises(WorkflowError, match="failed to close human path"):
+                vru_cli_module._load_human_clip_rgb(
+                    record,
+                    center_frame=31,
+                    offsets=(0,),
+                )
+            iteration_probes = probes[start:]
+            assert len(iteration_probes) >= 3
+            for probe_fd, expected_inode in iteration_probes:
+                assert vru_cli_module.os.fstat(probe_fd).st_ino == expected_inode
+        finally:
+            for probe_fd in {fd for fd, _ in probes[start:]}:
+                try:
+                    real_close(probe_fd)
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:
+                        raise
+
+    after = len(tuple(proc_fds.iterdir()))
+    assert after == before
+
+
+def test_human_post_walk_close_after_close_eintr_keeps_all_owned_fds(
+    tmp_path,
+    monkeypatch,
+):
+    proc_fds = Path("/proc/self/fd")
+    if not proc_fds.is_dir():
+        pytest.skip("requires /proc file-descriptor accounting")
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    record = {
+        "image_path": center,
+        "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+    }
+    probe_paths = []
+    for index in range(500):
+        probe = tmp_path / f"post-walk-fd-reuse-probe-{index}"
+        probe.write_bytes(str(index).encode())
+        probe_paths.append(probe)
+    real_close = vru_cli_module.os.close
+    real_open = vru_cli_module.os.open
+    real_loader = vru_cli_module._load_stable_human_rgb
+    probes = []
+    inject_close_errors = False
+
+    def load_then_arm_close_fault(*args, **kwargs):
+        nonlocal inject_close_errors
+        result = real_loader(*args, **kwargs)
+        inject_close_errors = True
+        return result
+
+    def close_then_reuse_and_raise(descriptor):
+        if not inject_close_errors:
+            real_close(descriptor)
+            return
+        real_close(descriptor)
+        probe_fd = real_open(
+            probe_paths[len(probes)],
+            vru_cli_module.os.O_RDONLY | vru_cli_module.os.O_CLOEXEC,
+        )
+        probes.append((probe_fd, vru_cli_module.os.fstat(probe_fd).st_ino))
+        raise OSError(errno.EINTR, "injected post-walk close interruption")
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_stable_human_rgb",
+        load_then_arm_close_fault,
+    )
+    monkeypatch.setattr(vru_cli_module.os, "close", close_then_reuse_and_raise)
+    before = len(tuple(proc_fds.iterdir()))
+
+    for _ in range(100):
+        inject_close_errors = False
+        start = len(probes)
+        try:
+            with pytest.raises(WorkflowError, match="failed to close human path"):
+                vru_cli_module._load_human_clip_rgb(
+                    record,
+                    center_frame=31,
+                    offsets=(0,),
+                )
+            iteration_probes = probes[start:]
+            assert len(iteration_probes) >= 4
+            for probe_fd, expected_inode in iteration_probes:
+                assert vru_cli_module.os.fstat(probe_fd).st_ino == expected_inode
+        finally:
+            for probe_fd in {fd for fd, _ in probes[start:]}:
+                try:
+                    real_close(probe_fd)
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:
+                        raise
+
+    after = len(tuple(proc_fds.iterdir()))
+    assert after == before
+
+
+def test_human_cleanup_close_errors_do_not_mask_original_security_error(
+    tmp_path,
+    monkeypatch,
+):
+    proc_fds = Path("/proc/self/fd")
+    if not proc_fds.is_dir():
+        pytest.skip("requires /proc file-descriptor accounting")
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center = image_dir / "31.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center)
+    record = {
+        "image_path": center,
+        "image_sha256": hashlib.sha256(center.read_bytes()).hexdigest(),
+    }
+    real_close = vru_cli_module.os.close
+    real_listdir = vru_cli_module.os.listdir
+    inject_close_errors = False
+    failed_closes = []
+
+    def listdir_then_arm_close_fault(descriptor):
+        nonlocal inject_close_errors
+        names = real_listdir(descriptor)
+        if isinstance(descriptor, int):
+            inject_close_errors = True
+        return names
+
+    def close_then_raise(descriptor):
+        real_close(descriptor)
+        if inject_close_errors:
+            failed_closes.append(descriptor)
+            raise OSError(errno.EINTR, "injected cleanup close interruption")
+
+    monkeypatch.setattr(vru_cli_module.os, "listdir", listdir_then_arm_close_fault)
+    monkeypatch.setattr(vru_cli_module.os, "close", close_then_raise)
+    before = len(tuple(proc_fds.iterdir()))
+
+    with pytest.raises(
+        WorkflowError,
+        match="human support frame is missing for numeric frame 33",
+    ) as raised:
+        vru_cli_module._load_human_clip_rgb(
+            record,
+            center_frame=31,
+            offsets=(0, 2),
+        )
+
+    after = len(tuple(proc_fds.iterdir()))
+    assert len(failed_closes) == 2
+    assert after == before
+    assert any(
+        "additional human file-descriptor cleanup" in note
+        for note in getattr(raised.value, "__notes__", ())
+    )
 
 
 @REQUIRES_TORCH
