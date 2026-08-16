@@ -9,7 +9,6 @@ import numpy as np
 from shapely.errors import GEOSException
 from shapely.geometry import Polygon, box
 
-from moving_det.evaluation.metrics import longest_consecutive_miss
 from moving_det.geometry.obb import normalize_theta, obb_to_points
 from moving_det.ml.evaluation import GroundTruth, match_detections
 from moving_det.ml.human_benchmark import (
@@ -187,7 +186,7 @@ def _validate_human_benchmark(
         raise ValueError("human benchmark contains duplicate frames")
     truth_rows = tuple(benchmark.truths)
     identities: list[tuple[str, str, int, int, int]] = []
-    track_span_classes: dict[tuple[str, str, int, int], int] = {}
+    track_classes: dict[tuple[str, str, int], int] = {}
     for truth in truth_rows:
         if not isinstance(truth, HumanTruth):
             raise ValueError("benchmark truths must contain HumanTruth records")
@@ -217,15 +216,14 @@ def _validate_human_benchmark(
         )
         identity = _truth_identity(truth)
         identities.append(identity)
-        track_span = (
+        track = (
             truth.site,
             truth.sequence,
             truth.track_id,
-            truth.visible_span,
         )
-        previous_class = track_span_classes.setdefault(track_span, truth.class_id)
+        previous_class = track_classes.setdefault(track, truth.class_id)
         if previous_class != truth.class_id:
-            raise ValueError("human truth track span contains class drift")
+            raise ValueError("human truth track contains class drift")
     if len(identities) != len(set(identities)):
         raise ValueError("human benchmark contains duplicate GT-frame identities")
     universe = frozenset(frame_keys)
@@ -378,6 +376,58 @@ def _segment_key(truths: tuple[HumanTruth, ...], indices: tuple[int, ...]) -> st
     )
 
 
+def _track_key(truth: HumanTruth) -> str:
+    return f"{truth.site}:{truth.sequence}:track:{truth.track_id}"
+
+
+def _miss_run_lengths(matched_states: Sequence[bool]) -> tuple[int, ...]:
+    runs: list[int] = []
+    current = 0
+    for matched in matched_states:
+        if matched:
+            if current:
+                runs.append(current)
+                current = 0
+        else:
+            current += 1
+    if current:
+        runs.append(current)
+    return tuple(runs)
+
+
+def _continuity_row(
+    indices: tuple[int, ...],
+    matched_gt: frozenset[int],
+) -> dict[str, float | int | bool | tuple[int, ...] | None]:
+    matched_states = tuple(index in matched_gt for index in indices)
+    miss_runs = _miss_run_lengths(matched_states)
+    matched_count = sum(matched_states)
+    first_detection_delay = next(
+        (
+            offset
+            for offset, matched in enumerate(matched_states)
+            if matched
+        ),
+        len(matched_states),
+    )
+    switches = sum(
+        first != second
+        for first, second in zip(matched_states, matched_states[1:])
+    )
+    return {
+        **_recall_row(indices, matched_gt),
+        "coverage": matched_count / len(indices),
+        "miss_run_lengths": miss_runs,
+        "longest_miss": max(miss_runs, default=0),
+        "average_consecutive_miss": (
+            sum(miss_runs) / len(miss_runs) if miss_runs else 0.0
+        ),
+        "first_detection_delay": first_detection_delay,
+        "tp_fn_switches": switches,
+        "completely_undetected": matched_count == 0,
+    }
+
+
 def evaluate_human_predictions(
     predictions: Sequence[Detection],
     benchmark: HumanBenchmark,
@@ -439,28 +489,73 @@ def evaluate_human_predictions(
         if short_side <= 24:
             small_indices.append(index)
 
-    per_visible_span: dict[str, dict[str, float | int | None]] = {}
-    per_track: dict[str, dict[str, float | int | str | None]] = {}
-    longest_misses: list[int] = []
+    per_visible_span: dict[str, dict[str, object]] = {}
+    segments_by_track: dict[
+        tuple[str, str, int],
+        list[tuple[tuple[int, ...], dict[str, object]]],
+    ] = defaultdict(list)
     for indices in _continuity_segments(truth_rows):
         key = _segment_key(truth_rows, indices)
         truth = truth_rows[indices[0]]
-        matched_states = [index in matched.matched_gt for index in indices]
-        longest_miss = longest_consecutive_miss(matched_states)
-        longest_misses.append(longest_miss)
-        span_row = _recall_row(indices, matched.matched_gt)
-        span_row["longest_miss"] = longest_miss
+        span_row = _continuity_row(indices, matched.matched_gt)
         per_visible_span[key] = span_row
-        per_track[key] = {
-            **span_row,
+        segments_by_track[
+            (truth.site, truth.sequence, truth.track_id)
+        ].append((indices, span_row))
+
+    per_track: dict[str, dict[str, object]] = {}
+    for track_identity, segments in sorted(segments_by_track.items()):
+        all_indices = tuple(
+            index
+            for indices, _ in segments
+            for index in indices
+        )
+        truth = truth_rows[all_indices[0]]
+        gt_count_for_track = len(all_indices)
+        matched_for_track = sum(
+            index in matched.matched_gt for index in all_indices
+        )
+        miss_runs = tuple(
+            length
+            for _, row in segments
+            for length in row["miss_run_lengths"]
+        )
+        delays = tuple(
+            int(row["first_detection_delay"])
+            for _, row in segments
+        )
+        per_track[_track_key(truth)] = {
             "site": truth.site,
             "sequence": truth.sequence,
             "track_id": truth.track_id,
-            "visible_span": truth.visible_span,
-            "first_frame": truth_rows[indices[0]].frame,
-            "last_frame": truth_rows[indices[-1]].frame,
             "class_id": truth.class_id,
+            "first_frame": min(truth_rows[index].frame for index in all_indices),
+            "last_frame": max(truth_rows[index].frame for index in all_indices),
+            "continuity_segment_count": len(segments),
+            "gt_count": gt_count_for_track,
+            "matched_count": matched_for_track,
+            "recall_riou_025": matched_for_track / gt_count_for_track,
+            "coverage": matched_for_track / gt_count_for_track,
+            "miss_run_lengths": miss_runs,
+            "longest_miss": max(
+                (int(row["longest_miss"]) for _, row in segments),
+                default=0,
+            ),
+            "average_consecutive_miss": (
+                sum(miss_runs) / len(miss_runs) if miss_runs else 0.0
+            ),
+            "mean_first_detection_delay": sum(delays) / len(delays),
+            "tp_fn_switches": sum(
+                int(row["tp_fn_switches"])
+                for _, row in segments
+            ),
+            "completely_undetected": matched_for_track == 0,
         }
+
+    longest_misses = [
+        int(row["longest_miss"])
+        for row in per_track.values()
+    ]
 
     false_positive_count = prediction_count - matched_count
     return {
@@ -513,6 +608,25 @@ def _validated_human_predictions(
     rows = tuple(predictions)
     if not all(isinstance(row, Detection) for row in rows):
         raise ValueError(f"{label} predictions must contain Detection records")
+    canonical_keys = [
+        (
+            row.site,
+            row.sequence,
+            row.frame,
+            row.class_id,
+            row.confidence,
+            row.obb.cx,
+            row.obb.cy,
+            row.obb.width,
+            row.obb.height,
+            normalize_theta(row.obb.theta),
+        )
+        for row in rows
+    ]
+    if len(canonical_keys) != len(set(canonical_keys)):
+        raise ValueError(
+            f"{label} predictions contain a canonical duplicate Detection"
+        )
     if any(row.frame_key not in frame_universe for row in rows):
         raise ValueError(f"{label} prediction lies outside benchmark frames")
     return rows

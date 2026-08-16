@@ -217,6 +217,64 @@ def test_human_ap_uses_full_ranking_after_ignore_but_fixed_metrics_use_threshold
     assert metrics["audit"]["suppressed_prediction_count"] == 1
 
 
+def test_single_model_rejects_canonical_duplicate_before_ignore_suppression():
+    truth = _truth(1, cx=100.0)
+    ignored = HumanIgnore(
+        site=truth.site,
+        sequence=truth.sequence,
+        frame=truth.frame,
+        class_id=truth.class_id,
+        track_id=94,
+        points=((0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)),
+    )
+    duplicate = _pred(1, cx=5.0, confidence=0.9)
+
+    with pytest.raises(ValueError, match="human predictions.*duplicate"):
+        evaluate_human_predictions(
+            (duplicate, duplicate),
+            _benchmark(truth, ignores=(ignored,)),
+            {"threshold": 0.5},
+        )
+
+
+@pytest.mark.parametrize("duplicate_side", ["baseline", "candidate"])
+def test_paired_models_each_reject_canonical_duplicate_predictions(
+    duplicate_side,
+):
+    truth = _truth(1)
+    duplicate = _matching_prediction(truth)
+    baseline = (duplicate, duplicate) if duplicate_side == "baseline" else ()
+    candidate = (duplicate, duplicate) if duplicate_side == "candidate" else ()
+
+    with pytest.raises(ValueError, match=rf"{duplicate_side} predictions.*duplicate"):
+        paired_human_transitions(
+            baseline,
+            candidate,
+            _benchmark(truth),
+            baseline_threshold=0.5,
+            candidate_threshold=0.5,
+        )
+
+
+def test_same_frame_predictions_with_different_score_or_geometry_are_legal():
+    truth = _truth(1)
+    predictions = (
+        _matching_prediction(truth, confidence=0.9),
+        _matching_prediction(truth, confidence=0.8),
+        _pred(1, cx=200.0, cy=100.0, confidence=0.9),
+    )
+
+    metrics = evaluate_human_predictions(
+        predictions,
+        _benchmark(truth),
+        {"threshold": 0.5},
+    )
+
+    assert metrics["prediction_count"] == 3
+    assert metrics["matched_count_riou_025"] == 1
+    assert metrics["false_positive_count_riou_025"] == 2
+
+
 @pytest.mark.parametrize(
     ("short_side", "expected_bin"),
     [
@@ -320,11 +378,79 @@ def test_human_continuity_never_crosses_visible_span_or_ground_truth_gap():
     )
 
     assert len(metrics["per_visible_span"]) == 4
-    assert len(metrics["per_track"]) == 4
+    assert len(metrics["per_track"]) == 2
     assert {
         row["longest_miss"] for row in metrics["per_track"].values()
     } == {1}
     assert metrics["median_longest_miss"] == 1.0
+
+
+def test_track_aggregation_weights_each_track_once_across_visible_spans():
+    truths = (
+        _truth(1, track=1, visible_span=0),
+        _truth(2, track=1, visible_span=0),
+        _truth(10, track=1, visible_span=1),
+        _truth(11, track=1, visible_span=1),
+        _truth(20, track=2, visible_span=0),
+        _truth(21, track=2, visible_span=0),
+    )
+    predictions = tuple(_matching_prediction(row) for row in truths[-2:])
+
+    metrics = evaluate_human_predictions(
+        predictions,
+        _benchmark(*truths),
+        {"threshold": 0.5},
+    )
+    tracks = {row["track_id"]: row for row in metrics["per_track"].values()}
+
+    assert len(metrics["per_visible_span"]) == 3
+    assert len(tracks) == 2
+    assert tracks[1]["gt_count"] == 4
+    assert tracks[1]["matched_count"] == 0
+    assert tracks[1]["coverage"] == 0.0
+    assert tracks[1]["longest_miss"] == 2
+    assert tracks[1]["average_consecutive_miss"] == 2.0
+    assert tracks[1]["mean_first_detection_delay"] == 2.0
+    assert tracks[1]["tp_fn_switches"] == 0
+    assert tracks[1]["completely_undetected"] is True
+    assert tracks[2]["longest_miss"] == 0
+    assert tracks[2]["completely_undetected"] is False
+    assert metrics["median_longest_miss"] == 1.0
+
+
+def test_gap_boundaries_never_create_false_miss_runs_delays_or_switches():
+    truths = (
+        _truth(30, track=3, visible_span=0),
+        _truth(31, track=3, visible_span=0),
+        _truth(40, track=3, visible_span=0),
+        _truth(41, track=3, visible_span=0),
+        _truth(50, track=3, visible_span=0),
+        _truth(51, track=3, visible_span=0),
+    )
+    predictions = tuple(
+        _matching_prediction(row)
+        for row in (truths[1], truths[5])
+    )
+
+    metrics = evaluate_human_predictions(
+        predictions,
+        _benchmark(*truths),
+        {"threshold": 0.5},
+    )
+    track = next(iter(metrics["per_track"].values()))
+
+    assert len(metrics["per_visible_span"]) == 3
+    assert [
+        row["miss_run_lengths"]
+        for row in metrics["per_visible_span"].values()
+    ] == [(1,), (2,), (1,)]
+    assert track["coverage"] == pytest.approx(1 / 3)
+    assert track["longest_miss"] == 2
+    assert track["miss_run_lengths"] == (1, 2, 1)
+    assert track["average_consecutive_miss"] == pytest.approx(4 / 3)
+    assert track["mean_first_detection_delay"] == pytest.approx(4 / 3)
+    assert track["tp_fn_switches"] == 2
+    assert track["completely_undetected"] is False
 
 
 def test_paired_human_transitions_use_exact_identity_and_each_frozen_threshold():
