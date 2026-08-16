@@ -48,6 +48,7 @@ from moving_det.temporal_config import TemporalOBBConfig
 
 _DEFAULT_LOADER_WORKERS = 4
 _DEFAULT_PREFETCH_FACTOR = 2
+_MAX_BASELINE_INITIALIZATION_STATE_ENTRIES = 65_536
 _MANIFEST_ARTIFACTS = (
     "train.jsonl",
     "validation.jsonl",
@@ -652,6 +653,11 @@ def _materialize_baseline_initialization_state(
         raise ValueError(
             "baseline initialization model state length must be a "
             "non-negative integer"
+        )
+    if declared_length > _MAX_BASELINE_INITIALIZATION_STATE_ENTRIES:
+        raise ValueError(
+            "baseline initialization model state length exceeds the maximum "
+            f"of {_MAX_BASELINE_INITIALIZATION_STATE_ENTRIES} entries"
         )
 
     try:

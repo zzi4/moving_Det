@@ -111,6 +111,9 @@ class _DeclaredModelStateKeys:
         type(owner).access_log.append("keys_iter")
         if owner.defect == "iteration":
             raise RuntimeError("injected key iteration failure")
+        if owner.defect == "next_forbidden":
+            type(owner).access_log.append("next_forbidden")
+            raise RuntimeError("keys iterator must not be consumed")
         if owner.defect == "overflow_guard":
             yielded = 0
             while True:
@@ -380,6 +383,42 @@ def test_baseline_init_state_materialization_bounds_hostile_key_stream():
     assert _DeclaredModelState.access_log.count("yield:2") == 1
     assert _DeclaredModelState.access_log.count("yield:3") == 1
     assert "yield:4" not in _DeclaredModelState.access_log
+
+
+@pytest.mark.parametrize(
+    "declared_length",
+    [65_537, 10**100],
+    ids=["cap-plus-one", "huge-integer"],
+)
+def test_baseline_init_state_materialization_rejects_oversize_before_keys(
+    declared_length,
+):
+    source = _DeclaredModelState(
+        (),
+        {},
+        declared_length=declared_length,
+        defect="next_forbidden",
+    )
+    _DeclaredModelState.access_log.clear()
+
+    with pytest.raises(ValueError, match="maximum|limit|too many"):
+        training_module._materialize_baseline_initialization_state(source)
+
+    assert _DeclaredModelState.access_log == ["len"]
+
+
+def test_baseline_init_state_materialization_accepts_cap_before_key_mismatch():
+    source = _DeclaredModelState(
+        (),
+        {},
+        declared_length=65_536,
+    )
+    _DeclaredModelState.access_log.clear()
+
+    with pytest.raises(ValueError, match="state.*length"):
+        training_module._materialize_baseline_initialization_state(source)
+
+    assert _DeclaredModelState.access_log == ["len", "keys", "keys_iter"]
 
 
 def test_baseline_init_state_materialization_reads_each_unique_value_once():
@@ -2353,6 +2392,131 @@ def test_formal_baseline_duplicate_state_keys_are_rejected_before_mutation(
     assert optimizer_factory_calls == []
     assert caught is not None
     assert "duplicate" in str(caught).lower()
+    after = target.state_dict()
+    assert set(after) == set(before)
+    for name, value in after.items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        assert (
+            value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            == before_bytes[name]
+        )
+
+
+def test_formal_baseline_oversize_state_is_rejected_before_keys_or_mutation(
+    tmp_path,
+    temporal_config,
+    monkeypatch,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    _fixture_checkpoint, p2_init, _universal_sha256 = (
+        _formal_baseline_checkpoint(
+            tmp_path / "frozen-source",
+            monkeypatch,
+            manifest,
+        )
+    )
+
+    def baseline_factory(_name, requested, _cfg):
+        state, _provenance = (
+            transfer_module.load_frozen_p2_initialization(Path(requested))
+        )
+        return TinyOBB(initial=float(state["model.000.weight"][0]))
+
+    published = train_model(
+        "baseline",
+        replace(
+            temporal_config,
+            pilot_epochs=1,
+            learning_rate=0.0,
+            pretrained_weights=str(p2_init),
+        ),
+        manifest,
+        tmp_path / "formal-baseline",
+        hooks=replace(
+            _tiny_hooks(TinyOBB(), map50_values=[0.2]),
+            model_factory=baseline_factory,
+        ),
+    )
+    payload = torch.load(
+        published.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    payload["model"] = _DeclaredModelState(
+        (),
+        {},
+        declared_length=10**100,
+        defect="next_forbidden",
+    )
+    torch.save(payload, published.best_checkpoint)
+    run_path = published.output_dir / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["checkpoint_artifacts"]["best"]["sha256"] = hashlib.sha256(
+        published.best_checkpoint.read_bytes()
+    ).hexdigest()
+    _write_canonical_json(run_path, run)
+    _DeclaredModelState.access_log.clear()
+
+    class MutationObservingTemporal(TinyTemporalOBB):
+        def __init__(self):
+            super().__init__()
+            self.to_calls = 0
+
+        def to(self, *args, **kwargs):
+            self.to_calls += 1
+            return super().to(*args, **kwargs)
+
+    target = MutationObservingTemporal()
+    before = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+    }
+    before_bytes = {
+        name: value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        for name, value in before.items()
+    }
+    model_factory_calls = []
+    hooks = replace(
+        _tiny_hooks(target, map50_values=[0.3]),
+        model_factory=lambda name, weights, cfg: (
+            model_factory_calls.append((name, weights, cfg)) or target
+        ),
+    )
+    real_build_optimizer = training_module.build_optimizer
+    optimizer_factory_calls = []
+
+    def observing_optimizer_factory(model, cfg):
+        optimizer_factory_calls.append((model, cfg))
+        return real_build_optimizer(model, cfg)
+
+    monkeypatch.setattr(
+        training_module,
+        "build_optimizer",
+        observing_optimizer_factory,
+    )
+    caught = None
+
+    try:
+        train_model(
+            "mg_vtod",
+            replace(temporal_config, pilot_epochs=1, learning_rate=0.0),
+            manifest,
+            tmp_path / "reject-oversize-state",
+            init_checkpoint=published.best_checkpoint,
+            hooks=hooks,
+        )
+    except ValueError as exc:
+        caught = exc
+
+    assert _DeclaredModelState.access_log == ["len"]
+    assert model_factory_calls == []
+    assert target.to_calls == 0
+    assert optimizer_factory_calls == []
+    assert caught is not None
+    assert any(
+        word in str(caught).lower()
+        for word in ("maximum", "limit", "too many")
+    )
     after = target.state_dict()
     assert set(after) == set(before)
     for name, value in after.items():
