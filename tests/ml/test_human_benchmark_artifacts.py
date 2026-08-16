@@ -5,10 +5,12 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import warnings
 import zipfile
 
 import pytest
 
+import moving_det.ml.human_benchmark_artifacts as artifact_module
 from moving_det.geometry.obb import obb_to_points, points_to_obb
 from moving_det.ml.human_benchmark import (
     HumanBenchmark,
@@ -364,6 +366,144 @@ def _rewrite_jsonl(output: Path, name: str, update) -> None:
 
 
 @pytest.mark.parametrize(
+    ("operation", "hash_read", "target"),
+    [
+        ("freeze", 1, "source ZIP"),
+        ("freeze", 2, "benchmark image"),
+        ("load", 1, "source ZIP"),
+        ("load", 2, "benchmark image"),
+    ],
+)
+def test_freeze_and_load_reject_path_replacement_during_file_snapshot(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    hash_read: int,
+    target: str,
+) -> None:
+    output = tmp_path / "benchmark"
+    if operation == "load":
+        freeze_human_benchmark(synthetic_benchmark, output)
+    target_path = (
+        synthetic_benchmark.source_zip
+        if target == "source ZIP"
+        else synthetic_benchmark.frames[0].image_path
+    )
+    clone = tmp_path / f"replacement-{target_path.name}"
+    if target == "source ZIP":
+        with (
+            zipfile.ZipFile(target_path) as source,
+            zipfile.ZipFile(clone, "w") as replacement,
+        ):
+            for info in source.infolist():
+                replacement.writestr(info, source.read(info))
+            replacement.writestr("snapshot-switch.txt", b"different archive bytes")
+    else:
+        clone.write_bytes(target_path.read_bytes())
+    original_sha256_stream = artifact_module._sha256_stream
+    read_count = 0
+    switched = False
+
+    def replace_path_after_hash(stream) -> str:
+        nonlocal read_count, switched
+        digest = original_sha256_stream(stream)
+        read_count += 1
+        if read_count == hash_read:
+            clone.replace(target_path)
+            switched = True
+        return digest
+
+    monkeypatch.setattr(
+        artifact_module,
+        "_sha256_stream",
+        replace_path_after_hash,
+    )
+
+    with pytest.raises(ValueError, match=f"{target} changed while reading"):
+        if operation == "freeze":
+            freeze_human_benchmark(synthetic_benchmark, output)
+        else:
+            load_human_benchmark(output)
+
+    assert switched
+    if operation == "freeze":
+        assert not output.exists()
+
+
+def _append_source_zip_member(
+    source_zip: Path,
+    *,
+    member: str,
+    content: bytes,
+) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(source_zip, "a") as archive:
+            archive.writestr(member, content)
+
+
+@pytest.mark.parametrize("operation", ["freeze", "load"])
+@pytest.mark.parametrize(
+    ("member", "content", "error"),
+    [
+        (
+            "synthetic/site19_sequence/sequence_a/000010.json",
+            b"{}",
+            "duplicate source ZIP member",
+        ),
+        (
+            "synthetic/site19_sequence/sequence_a/10.JSON",
+            b"{}",
+            "duplicate source ZIP numeric frame",
+        ),
+        (
+            "synthetic/site19_sequence/sequence_a/10.JPG",
+            b"first synthetic image",
+            "duplicate source ZIP numeric frame",
+        ),
+    ],
+)
+def test_freeze_and_load_reject_source_zip_numeric_aliases(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    operation: str,
+    member: str,
+    content: bytes,
+    error: str,
+) -> None:
+    output = tmp_path / "benchmark"
+    if operation == "load":
+        freeze_human_benchmark(synthetic_benchmark, output)
+    _append_source_zip_member(
+        synthetic_benchmark.source_zip,
+        member=member,
+        content=content,
+    )
+    source_sha256 = hashlib.sha256(
+        synthetic_benchmark.source_zip.read_bytes()
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match=error):
+        if operation == "freeze":
+            freeze_human_benchmark(
+                replace(
+                    synthetic_benchmark,
+                    source_zip_sha256=source_sha256,
+                ),
+                output,
+            )
+        else:
+            _rewrite_manifest(
+                output,
+                lambda manifest: manifest.update(
+                    source_zip_sha256=source_sha256
+                ),
+            )
+            load_human_benchmark(output)
+
+
+@pytest.mark.parametrize(
     "annotation_member",
     [
         "missing/site19_sequence/sequence_a/000010.json",
@@ -523,31 +663,68 @@ def test_load_rederives_truth_motion_instead_of_trusting_rehashed_values(
         load_human_benchmark(output)
 
 
-def test_load_uses_small_explicit_speed_tolerance(
+def test_load_accepts_a_few_speed_ulps_and_keeps_zero_stable(
     tmp_path: Path,
     synthetic_benchmark: HumanBenchmark,
 ) -> None:
-    near = tmp_path / "near"
-    freeze_human_benchmark(synthetic_benchmark, near)
+    one_ulp = math.nextafter(2.0, math.inf)
+    four_ulps = 2.0
+    for _ in range(4):
+        four_ulps = math.nextafter(four_ulps, math.inf)
+    for index, stored_speed in enumerate((one_ulp, four_ulps)):
+        output = tmp_path / f"accepted-{index}"
+        freeze_human_benchmark(synthetic_benchmark, output)
+        _rewrite_jsonl(
+            output,
+            "ground-truth.jsonl",
+            lambda rows, value=stored_speed: rows[0].update(pixel_speed=value),
+        )
+
+        loaded = load_human_benchmark(output)
+
+        assert loaded.truths[0].pixel_speed == stored_speed
+
+    zero_truth = replace(synthetic_benchmark.truths[0], pixel_speed=0.0)
+    zero_benchmark = replace(
+        synthetic_benchmark,
+        annotation_count=4,
+        truths=(zero_truth,),
+    )
+    zero = tmp_path / "zero"
+    freeze_human_benchmark(zero_benchmark, zero)
+
+    assert load_human_benchmark(zero) == zero_benchmark
+
+    zero_ulp = tmp_path / "zero-ulp"
+    freeze_human_benchmark(zero_benchmark, zero_ulp)
     _rewrite_jsonl(
-        near,
+        zero_ulp,
+        "ground-truth.jsonl",
+        lambda rows: rows[0].update(
+            pixel_speed=math.nextafter(0.0, math.inf)
+        ),
+    )
+
+    assert load_human_benchmark(zero_ulp).truths[0].pixel_speed == math.nextafter(
+        0.0,
+        math.inf,
+    )
+
+
+def test_load_rejects_speed_difference_of_five_e_minus_ten(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+) -> None:
+    output = tmp_path / "material"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    _rewrite_jsonl(
+        output,
         "ground-truth.jsonl",
         lambda rows: rows[0].update(pixel_speed=2.0 + 5e-10),
     )
 
-    loaded = load_human_benchmark(near)
-
-    assert loaded.truths[0].pixel_speed == pytest.approx(2.0 + 5e-10)
-
-    material = tmp_path / "material"
-    freeze_human_benchmark(synthetic_benchmark, material)
-    _rewrite_jsonl(
-        material,
-        "ground-truth.jsonl",
-        lambda rows: rows[0].update(pixel_speed=2.0 + 1e-6),
-    )
     with pytest.raises(ValueError, match="derived motion mismatch"):
-        load_human_benchmark(material)
+        load_human_benchmark(output)
 
 
 @pytest.mark.parametrize(

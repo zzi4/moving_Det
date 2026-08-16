@@ -5,7 +5,9 @@ import json
 import math
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 import shutil
 import tempfile
@@ -80,8 +82,8 @@ _IGNORE_FIELDS = frozenset(
 )
 _SHA256_HEX_LENGTH = 64
 _TRUTH_BOUNDARY_TOLERANCE = 1e-12
-_SPEED_ABSOLUTE_TOLERANCE = 1e-9
-_SPEED_RELATIVE_TOLERANCE = 1e-12
+_SPEED_ULP_TOLERANCE = 4
+_STREAM_CHUNK_SIZE = 1024 * 1024
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -104,13 +106,67 @@ def _canonical_jsonl_bytes(rows: list[dict[str, object]]) -> bytes:
 
 def _sha256_stream(stream: BinaryIO) -> str:
     digest = hashlib.sha256()
-    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+    for chunk in iter(lambda: stream.read(_STREAM_CHUNK_SIZE), b""):
         digest.update(chunk)
     return digest.hexdigest()
 
 
 def _sha256_bytes(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
+
+
+def _stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+@dataclass(frozen=True)
+class _RegularFileSnapshot:
+    path: Path
+    label: str
+    stream: BinaryIO
+    opened_stat: os.stat_result
+    sha256: str
+
+    def rewind(self) -> None:
+        self.stream.seek(0)
+
+    def assert_stable(self) -> None:
+        try:
+            descriptor_stat = os.fstat(self.stream.fileno())
+            _reject_symlink_components(self.path)
+            path_stat = os.stat(self.path, follow_symlinks=False)
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"{self.label} changed while reading: {self.path}"
+            ) from exc
+        if (
+            _stat_signature(descriptor_stat) != _stat_signature(self.opened_stat)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (self.opened_stat.st_dev, self.opened_stat.st_ino)
+        ):
+            raise ValueError(f"{self.label} changed while reading: {self.path}")
+
+
+@dataclass(frozen=True)
+class _BenchmarkSnapshots:
+    source: _RegularFileSnapshot
+    images: Mapping[Path, _RegularFileSnapshot]
+
+    def image_for(self, row: HumanFrame) -> _RegularFileSnapshot:
+        return self.images[Path(row.image_path)]
+
+    def assert_stable(self) -> None:
+        self.source.assert_stable()
+        for image in self.images.values():
+            image.assert_stable()
 
 
 def _reject_symlink_components(path: Path) -> None:
@@ -123,18 +179,107 @@ def _reject_symlink_components(path: Path) -> None:
         current = current.parent
 
 
+@contextmanager
+def _open_regular_snapshot(
+    path: Path,
+    *,
+    label: str,
+    require_canonical: bool,
+) -> Iterator[_RegularFileSnapshot]:
+    requested = Path(path)
+    _reject_symlink_components(requested)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(requested, flags)
+    except OSError as exc:
+        if requested.is_symlink():
+            raise ValueError(f"path contains a symlink: {requested}") from exc
+        raise ValueError(f"{label} must be a regular file: {requested}") from exc
+    stream: BinaryIO | None = None
+    try:
+        opened_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ValueError(f"{label} must be a regular file: {requested}")
+        try:
+            resolved = requested.resolve(strict=True)
+            _reject_symlink_components(requested)
+            path_stat = os.stat(requested, follow_symlinks=False)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{label} changed while opening: {requested}") from exc
+        if (
+            not stat.S_ISREG(path_stat.st_mode)
+            or (path_stat.st_dev, path_stat.st_ino)
+            != (opened_stat.st_dev, opened_stat.st_ino)
+        ):
+            raise ValueError(f"{label} changed while opening: {requested}")
+        if require_canonical and str(resolved) != str(requested):
+            raise ValueError(f"{label} must be a canonical absolute path")
+        stream = os.fdopen(descriptor, "rb", closefd=True)
+        descriptor = -1
+        sha256 = _sha256_stream(stream)
+        stream.seek(0)
+        yield _RegularFileSnapshot(
+            path=resolved,
+            label=label,
+            stream=stream,
+            opened_stat=opened_stat,
+            sha256=sha256,
+        )
+    finally:
+        if stream is not None:
+            stream.close()
+        elif descriptor >= 0:
+            os.close(descriptor)
+
+
+@contextmanager
+def _open_benchmark_snapshots(
+    benchmark: HumanBenchmark,
+    *,
+    require_canonical: bool,
+) -> Iterator[_BenchmarkSnapshots]:
+    if not isinstance(benchmark, HumanBenchmark):
+        raise ValueError("benchmark must be a HumanBenchmark")
+    if not isinstance(benchmark.source_zip, Path):
+        raise ValueError("source ZIP path must be a Path")
+    if not isinstance(benchmark.frames, tuple):
+        raise ValueError("benchmark frames must be a tuple")
+    with ExitStack() as stack:
+        source = stack.enter_context(
+            _open_regular_snapshot(
+                benchmark.source_zip,
+                label="source ZIP",
+                require_canonical=require_canonical,
+            )
+        )
+        images: dict[Path, _RegularFileSnapshot] = {}
+        for row in benchmark.frames:
+            if not isinstance(row, HumanFrame):
+                raise ValueError("benchmark frame rows must be HumanFrame values")
+            if not isinstance(row.image_path, Path):
+                raise ValueError("image path must be a Path")
+            image_path = Path(row.image_path)
+            if image_path not in images:
+                images[image_path] = stack.enter_context(
+                    _open_regular_snapshot(
+                        image_path,
+                        label="benchmark image",
+                        require_canonical=require_canonical,
+                    )
+                )
+        yield _BenchmarkSnapshots(source=source, images=images)
+
+
 def _regular_file(path: Path, *, label: str) -> Path:
     source = Path(path)
     _reject_symlink_components(source)
     if not source.is_file():
         raise ValueError(f"{label} must be a regular file: {source}")
     return source.resolve(strict=True)
-
-
-def _sha256_regular_file(path: Path, *, label: str) -> tuple[Path, str]:
-    source = _regular_file(path, label=label)
-    with source.open("rb") as stream:
-        return source, _sha256_stream(stream)
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -207,13 +352,10 @@ def _truth_payload(row: HumanTruth) -> dict[str, object]:
 
 def _record_payloads(
     benchmark: HumanBenchmark,
+    snapshots: _BenchmarkSnapshots,
 ) -> tuple[dict[str, bytes], tuple[Path, ...], Path, str]:
-    source_zip, source_zip_sha256 = _sha256_regular_file(
-        benchmark.source_zip,
-        label="source ZIP",
-    )
-    if benchmark.source_zip_sha256 != source_zip_sha256:
-        raise ValueError("source ZIP SHA-256 mismatch")
+    source_zip = snapshots.source.path
+    source_zip_sha256 = snapshots.source.sha256
 
     frame_rows: list[dict[str, object]] = []
     input_paths = [source_zip]
@@ -221,12 +363,8 @@ def _record_payloads(
         benchmark.frames,
         key=lambda value: (value.site, value.sequence, value.frame),
     ):
-        image_path, image_sha256 = _sha256_regular_file(
-            row.image_path,
-            label="benchmark image",
-        )
-        if row.image_sha256 != image_sha256:
-            raise ValueError("benchmark image SHA-256 mismatch")
+        image = snapshots.image_for(row)
+        image_path = image.path
         member = PurePosixPath(row.annotation_member)
         if member.is_absolute() or ".." in member.parts:
             raise ValueError("annotation member path traversal is forbidden")
@@ -236,7 +374,7 @@ def _record_payloads(
                 "annotation_member": row.annotation_member,
                 "frame": row.frame,
                 "image_path": str(image_path),
-                "image_sha256": row.image_sha256,
+                "image_sha256": image.sha256,
                 "sequence": row.sequence,
                 "site": row.site,
             }
@@ -325,27 +463,38 @@ def _fsync_directory(path: Path) -> None:
 
 
 def freeze_human_benchmark(benchmark: HumanBenchmark, output: Path) -> Path:
-    image_root = _validate_benchmark_semantics(benchmark)
-    children, inputs, _, _ = _record_payloads(benchmark)
-    destination = _validate_output(
-        Path(output),
-        inputs=(*inputs, image_root),
-    )
-    staging = Path(
-        tempfile.mkdtemp(
-            prefix=f".{destination.name}.staging-",
-            dir=destination.parent,
+    with _open_benchmark_snapshots(
+        benchmark,
+        require_canonical=False,
+    ) as snapshots:
+        _sha256_value(
+            benchmark.source_zip_sha256,
+            field="source ZIP fingerprint",
         )
-    )
-    try:
-        for name in (*_CHILD_NAMES, "benchmark.json"):
-            _write_bytes(staging / name, children[name])
-        _fsync_directory(staging)
-        os.replace(staging, destination)
-        _fsync_directory(destination.parent)
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
+        if snapshots.source.sha256 != benchmark.source_zip_sha256:
+            raise ValueError("source ZIP SHA-256 mismatch")
+        image_root = _validate_benchmark_semantics(benchmark, snapshots)
+        children, inputs, _, _ = _record_payloads(benchmark, snapshots)
+        destination = _validate_output(
+            Path(output),
+            inputs=(*inputs, image_root),
+        )
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{destination.name}.staging-",
+                dir=destination.parent,
+            )
+        )
+        try:
+            for name in (*_CHILD_NAMES, "benchmark.json"):
+                _write_bytes(staging / name, children[name])
+            _fsync_directory(staging)
+            snapshots.assert_stable()
+            os.replace(staging, destination)
+            _fsync_directory(destination.parent)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
     return destination / "benchmark.json"
 
 
@@ -443,12 +592,13 @@ def _class_id(value: object, *, allow_none: bool = False) -> int | None:
 def _canonical_source_path(value: object, *, field: str) -> Path:
     stored = _string(value, field=field)
     path = Path(stored)
-    if not path.is_absolute() or ".." in path.parts:
+    if (
+        not path.is_absolute()
+        or ".." in path.parts
+        or str(path) != stored
+    ):
         raise ValueError(f"{field} must be a canonical absolute path")
-    resolved = _regular_file(path, label=field)
-    if str(resolved) != stored:
-        raise ValueError(f"{field} must be a canonical absolute path")
-    return resolved
+    return path
 
 
 def _benchmark_root(output: Path) -> Path:
@@ -539,12 +689,6 @@ def _load_frames(content: bytes) -> tuple[HumanFrame, ...]:
             row["image_sha256"],
             field="image SHA-256",
         )
-        _, current_image_sha256 = _sha256_regular_file(
-            image_path,
-            label="benchmark image",
-        )
-        if current_image_sha256 != image_sha256:
-            raise ValueError(f"benchmark image SHA-256 mismatch: {image_path}")
         annotation_member = _string(
             row["annotation_member"],
             field="annotation member",
@@ -568,14 +712,18 @@ def _load_frames(content: bytes) -> tuple[HumanFrame, ...]:
     return tuple(frames)
 
 
-def _validate_frame_sources(frames: tuple[HumanFrame, ...]) -> Path:
+def _validate_frame_sources(
+    frames: tuple[HumanFrame, ...],
+    snapshots: _BenchmarkSnapshots,
+) -> Path:
     if not frames:
         raise ValueError("human benchmark must contain at least one frame")
     image_roots: set[Path] = set()
     for row in frames:
+        image_path = snapshots.image_for(row).path
         image_directory = (
-            row.image_path.parent.parent.name,
-            row.image_path.parent.name,
+            image_path.parent.parent.name,
+            image_path.parent.name,
         )
         member = PurePosixPath(row.annotation_member)
         expected_directory = (
@@ -585,8 +733,8 @@ def _validate_frame_sources(frames: tuple[HumanFrame, ...]) -> Path:
         try:
             sources_match = (
                 image_directory == expected_directory
-                and row.image_path.suffix.lower() == ".jpg"
-                and _archive_frame(row.image_path.name) == row.frame
+                and image_path.suffix.lower() == ".jpg"
+                and _archive_frame(image_path.name) == row.frame
                 and len(member.parts) >= 3
                 and tuple(member.parent.parts[-2:]) == expected_directory
                 and member.suffix.lower() == ".json"
@@ -599,7 +747,7 @@ def _validate_frame_sources(frames: tuple[HumanFrame, ...]) -> Path:
                 "frame identity does not match its image/annotation source: "
                 f"{(row.site, row.sequence, row.frame)}"
             )
-        image_roots.add(row.image_path.parents[2])
+        image_roots.add(image_path.parents[2])
     if len(image_roots) != 1:
         raise ValueError("frame identity sources do not share one image root")
     return image_roots.pop()
@@ -622,17 +770,44 @@ def _unsafe_zip_member(info: zipfile.ZipInfo) -> bool:
     )
 
 
-def _validate_source_archive(benchmark: HumanBenchmark) -> None:
+def _index_source_archive(
+    infos: list[zipfile.ZipInfo],
+) -> tuple[
+    dict[str, zipfile.ZipInfo],
+    dict[tuple[str, str, int], zipfile.ZipInfo],
+]:
+    by_name: dict[str, zipfile.ZipInfo] = {}
+    by_numeric_frame: dict[tuple[str, str, int], zipfile.ZipInfo] = {}
+    for info in infos:
+        if info.filename in by_name:
+            raise ValueError(f"duplicate source ZIP member: {info.filename}")
+        by_name[info.filename] = info
+        if info.is_dir() or _unsafe_zip_member(info):
+            continue
+        member = PurePosixPath(info.filename)
+        suffix = member.suffix.lower()
+        if suffix not in {".jpg", ".json"}:
+            continue
+        frame = _archive_frame(info.filename)
+        key = (str(member.parent), suffix, frame)
+        if key in by_numeric_frame:
+            raise ValueError(
+                "duplicate source ZIP numeric frame: "
+                f"{member.parent} frame {frame} {suffix}"
+            )
+        by_numeric_frame[key] = info
+    return by_name, by_numeric_frame
+
+
+def _validate_source_archive(
+    benchmark: HumanBenchmark,
+    snapshots: _BenchmarkSnapshots,
+) -> None:
     try:
-        with zipfile.ZipFile(benchmark.source_zip) as archive:
+        snapshots.source.rewind()
+        with zipfile.ZipFile(snapshots.source.stream) as archive:
             infos = archive.infolist()
-            by_name: dict[str, zipfile.ZipInfo] = {}
-            for info in infos:
-                if info.filename in by_name:
-                    raise ValueError(
-                        f"duplicate source ZIP member: {info.filename}"
-                    )
-                by_name[info.filename] = info
+            by_name, by_numeric_frame = _index_source_archive(infos)
 
             for row in benchmark.frames:
                 annotation = by_name.get(row.annotation_member)
@@ -649,51 +824,48 @@ def _validate_source_archive(benchmark: HumanBenchmark) -> None:
                     raise ValueError(
                         f"source ZIP member does not match frame: {annotation.filename}"
                     )
-                jpeg_members = [
-                    info
-                    for info in infos
-                    if not _unsafe_zip_member(info)
-                    and PurePosixPath(info.filename).parent
-                    == annotation_path.parent
-                    and PurePosixPath(info.filename).suffix.lower() == ".jpg"
-                    and _archive_frame(info.filename) == row.frame
-                ]
-                if len(jpeg_members) != 1:
+                annotation_key = (
+                    str(annotation_path.parent),
+                    ".json",
+                    row.frame,
+                )
+                if by_numeric_frame.get(annotation_key) is not annotation:
                     raise ValueError(
-                        "source ZIP member has no unique paired JPEG: "
+                        "source ZIP annotation is not its unique numeric member: "
+                        f"{row.annotation_member}"
+                    )
+                jpeg_member = by_numeric_frame.get(
+                    (str(annotation_path.parent), ".jpg", row.frame)
+                )
+                if jpeg_member is None:
+                    raise ValueError(
+                        "source ZIP member has no paired JPEG: "
                         f"{row.annotation_member}"
                     )
                 if (
-                    PurePosixPath(jpeg_members[0].filename).name
-                    != row.image_path.name
+                    PurePosixPath(jpeg_member.filename).name
+                    != snapshots.image_for(row).path.name
                 ):
                     raise ValueError(
                         "source ZIP paired JPEG does not match image path name: "
-                        f"{row.image_path.name}"
+                        f"{snapshots.image_for(row).path.name}"
                     )
-                digest = hashlib.sha256()
-                with (
-                    archive.open(jpeg_members[0]) as zip_stream,
-                    row.image_path.open("rb") as image_stream,
-                ):
+                image = snapshots.image_for(row)
+                image.rewind()
+                with archive.open(jpeg_member) as zip_stream:
                     while True:
-                        zip_chunk = zip_stream.read(1024 * 1024)
-                        image_chunk = image_stream.read(1024 * 1024)
+                        zip_chunk = zip_stream.read(_STREAM_CHUNK_SIZE)
+                        image_chunk = image.stream.read(_STREAM_CHUNK_SIZE)
                         if zip_chunk != image_chunk:
                             raise ValueError(
                                 "image bytes differ from source ZIP: "
-                                f"{row.image_path}"
+                                f"{image.path}"
                             )
                         if not image_chunk:
                             break
-                        digest.update(image_chunk)
-                if digest.hexdigest() != row.image_sha256:
-                    raise ValueError(
-                        f"benchmark image SHA-256 mismatch: {row.image_path}"
-                    )
     except zipfile.BadZipFile as exc:
         raise ValueError(
-            f"invalid human benchmark source ZIP: {benchmark.source_zip}"
+            f"invalid human benchmark source ZIP: {snapshots.source.path}"
         ) from exc
 
 
@@ -817,13 +989,12 @@ def _validate_truth_motion(truths: tuple[HumanTruth, ...]) -> None:
     if len(derived) != len(truths):
         raise ValueError("truth derived motion row count mismatch")
     for stored, expected in zip(truths, derived, strict=True):
+        speed_tolerance = _SPEED_ULP_TOLERANCE * max(
+            math.ulp(stored.pixel_speed),
+            math.ulp(expected.pixel_speed),
+        )
         if (
-            not math.isclose(
-                stored.pixel_speed,
-                expected.pixel_speed,
-                abs_tol=_SPEED_ABSOLUTE_TOLERANCE,
-                rel_tol=_SPEED_RELATIVE_TOLERANCE,
-            )
+            abs(stored.pixel_speed - expected.pixel_speed) > speed_tolerance
             or stored.visible_span != expected.visible_span
         ):
             raise ValueError(
@@ -952,12 +1123,14 @@ def _validate_track_identities(
             raise ValueError(f"class drift for benchmark track: {key}")
 
 
-def _validate_benchmark_semantics(benchmark: HumanBenchmark) -> Path:
+def _validate_benchmark_semantics(
+    benchmark: HumanBenchmark,
+    snapshots: _BenchmarkSnapshots,
+) -> Path:
     if not isinstance(benchmark, HumanBenchmark):
         raise ValueError("benchmark must be a HumanBenchmark")
     if not isinstance(benchmark.source_zip, Path):
         raise ValueError("source ZIP path must be a Path")
-    _regular_file(benchmark.source_zip, label="source ZIP")
     _sha256_value(
         benchmark.source_zip_sha256,
         field="source ZIP fingerprint",
@@ -979,8 +1152,11 @@ def _validate_benchmark_semantics(benchmark: HumanBenchmark) -> Path:
         frame = _integer(row.frame, field="frame number", minimum=0)
         if not isinstance(row.image_path, Path):
             raise ValueError("image path must be a Path")
-        _regular_file(row.image_path, label="benchmark image")
         _sha256_value(row.image_sha256, field="image SHA-256")
+        if snapshots.image_for(row).sha256 != row.image_sha256:
+            raise ValueError(
+                f"benchmark image SHA-256 mismatch: {row.image_path}"
+            )
         _string(row.annotation_member, field="annotation member")
         frame_identities.append((site, sequence, frame))
     if (
@@ -988,8 +1164,8 @@ def _validate_benchmark_semantics(benchmark: HumanBenchmark) -> Path:
         or len(frame_identities) != len(set(frame_identities))
     ):
         raise ValueError("frame records must have sorted unique identities")
-    image_root = _validate_frame_sources(benchmark.frames)
-    _validate_source_archive(benchmark)
+    image_root = _validate_frame_sources(benchmark.frames, snapshots)
+    _validate_source_archive(benchmark, snapshots)
     frame_identity_set = frozenset(frame_identities)
 
     if not isinstance(benchmark.truths, tuple):
@@ -1089,12 +1265,6 @@ def load_human_benchmark(output: Path) -> HumanBenchmark:
         manifest["source_zip"],
         field="source ZIP path",
     )
-    _, current_source_sha256 = _sha256_regular_file(
-        source_zip,
-        label="source ZIP",
-    )
-    if current_source_sha256 != source_zip_sha256:
-        raise ValueError("source ZIP fingerprint mismatch")
 
     annotation_count = _integer(
         manifest["annotation_count"],
@@ -1145,7 +1315,14 @@ def load_human_benchmark(output: Path) -> HumanBenchmark:
         ignores=ignores,
         vehicle_counts=vehicle_counts,
     )
-    _validate_benchmark_semantics(benchmark)
+    with _open_benchmark_snapshots(
+        benchmark,
+        require_canonical=True,
+    ) as snapshots:
+        if snapshots.source.sha256 != source_zip_sha256:
+            raise ValueError("source ZIP fingerprint mismatch")
+        _validate_benchmark_semantics(benchmark, snapshots)
+        snapshots.assert_stable()
     return benchmark
 
 
