@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,19 @@ _EVALUATION_TABLES = (
     "per_speed",
     "per_track",
 )
+_HUMAN_EVALUATION_TABLES = (
+    "per_class",
+    "per_size",
+    "per_pixel_speed",
+    "per_track",
+)
+_HUMAN_METRIC_SECTIONS = (
+    "per_class",
+    "per_size",
+    "per_pixel_speed",
+    "per_visible_span",
+    "per_track",
+)
 _EVALUATION_ARTIFACT_VERSIONS = {
     "metrics.json": 1,
     "predictions.jsonl": 1,
@@ -57,6 +71,10 @@ _EVALUATION_ARTIFACT_VERSIONS = {
     "threshold.json": 1,
     "diagnostics.jsonl": 1,
 }
+_HUMAN_EVALUATION_ARTIFACT_VERSIONS = {
+    **_EVALUATION_ARTIFACT_VERSIONS,
+    "per_pixel_speed.csv": 1,
+}
 _EVALUATION_REQUIRED_ARTIFACTS = frozenset(
     {
         "metrics.json",
@@ -65,6 +83,17 @@ _EVALUATION_REQUIRED_ARTIFACTS = frozenset(
         "per_class.csv",
         "per_size.csv",
         "per_speed.csv",
+        "per_track.csv",
+    }
+)
+_HUMAN_EVALUATION_REQUIRED_ARTIFACTS = frozenset(
+    {
+        "metrics.json",
+        "predictions.jsonl",
+        "ground-truth.jsonl",
+        "per_class.csv",
+        "per_size.csv",
+        "per_pixel_speed.csv",
         "per_track.csv",
     }
 )
@@ -133,6 +162,8 @@ _HUMAN_AUDIT_FIELDS = frozenset(
 )
 _DIAGNOSTIC_MAP_SHAPE = (180, 320)
 _LSTFE_LONG_SLOTS = (0, 1, 5, 6)
+_MAX_FULL_FRAME_IMAGE_BYTES = 128 * 1024 * 1024
+_FULL_FRAME_READ_CHUNK_BYTES = 1024 * 1024
 _EVALUATION_RUN_FIELDS = frozenset(
     {
         "schema_version",
@@ -163,6 +194,7 @@ _EVALUATION_RUN_FIELDS = frozenset(
     }
 )
 _HUMAN_EVALUATION_RUN_FIELDS = _EVALUATION_RUN_FIELDS | {
+    "human_benchmark_source",
     "human_benchmark_sha256",
     "motion_off",
 }
@@ -2185,22 +2217,25 @@ def _validate_ground_truth_rows(
     return tuple(normalized)
 
 
-def _fixed_human_frame_universe(benchmark: object) -> frozenset[tuple[str, str, int]]:
+def _fixed_human_frame_universe(
+    benchmark: object,
+) -> tuple[tuple[str, str, int], ...]:
     from moving_det.ml.human_benchmark import APPROVED_SEQUENCES
 
     frames = tuple(getattr(benchmark, "frames", ()))
-    expected = frozenset(
+    expected = tuple(
         (spec.site, spec.sequence, frame)
         for spec in APPROVED_SEQUENCES.values()
         for frame in range(spec.first_frame, spec.last_frame + 1)
     )
-    actual = frozenset(
+    actual = tuple(
         (str(frame.site), str(frame.sequence), int(frame.frame))
         for frame in frames
     )
-    if len(frames) != 873 or len(actual) != 873 or actual != expected:
+    if len(frames) != 873 or len(set(actual)) != 873 or actual != expected:
         raise WorkflowError(
-            "human benchmark must contain exactly 873 approved frame identities"
+            "human benchmark must contain exactly 873 approved frame identities "
+            "in canonical benchmark order"
         )
     ignores = tuple(getattr(benchmark, "ignores", ()))
     if len(ignores) != 334:
@@ -2208,8 +2243,9 @@ def _fixed_human_frame_universe(benchmark: object) -> frozenset[tuple[str, str, 
     truths = tuple(getattr(benchmark, "truths", ()))
     if {getattr(truth, "class_id", None) for truth in truths} != {0, 1, 2, 3}:
         raise WorkflowError("human benchmark must contain manual classes 0..3")
+    expected_set = set(expected)
     if any(
-        (str(row.site), str(row.sequence), int(row.frame)) not in expected
+        (str(row.site), str(row.sequence), int(row.frame)) not in expected_set
         for row in (*truths, *ignores)
     ):
         raise WorkflowError("human benchmark annotation escapes its frame universe")
@@ -2223,7 +2259,7 @@ def _validate_human_ground_truth_rows(
     benchmark: object | None,
 ) -> tuple[dict[str, object], ...]:
     normalized = []
-    actual: dict[tuple[str, str, int, int, int], dict[str, object]] = {}
+    identities: set[tuple[str, str, int, int, int]] = set()
     for raw in rows:
         if "pixel_speed_per_frame" not in raw:
             raise WorkflowError(
@@ -2258,46 +2294,70 @@ def _validate_human_ground_truth_rows(
             or not math.isfinite(float(speed))
             or float(speed) < 0
             or type(visible_span) is not int
-            or visible_span <= 0
+            or visible_span < 0
         ):
             raise WorkflowError("human ground-truth row values are invalid")
         _validate_canonical_obb(raw["obb"], artifact="human ground-truth")
         identity = (site, sequence, frame, class_id, track_id)
-        if identity in actual:
+        if identity in identities:
             raise WorkflowError("duplicate human ground-truth state")
+        identities.add(identity)
         row = dict(raw)
-        actual[identity] = row
         normalized.append(row)
 
     if benchmark is not None:
-        expected = {}
-        for truth in getattr(benchmark, "truths", ()):
-            row = _serialize_human_truth(truth)
-            identity = (
-                str(truth.site),
-                str(truth.sequence),
-                int(truth.frame),
-                int(truth.class_id),
-                int(truth.track_id),
+        expected = tuple(
+            _serialize_human_truth(truth)
+            for truth in getattr(benchmark, "truths", ())
+        )
+        actual_canonical = tuple(
+            json.dumps(
+                row,
+                allow_nan=False,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
             )
-            expected[identity] = row
-        if actual != expected:
+            for row in normalized
+        )
+        expected_canonical = tuple(
+            json.dumps(
+                row,
+                allow_nan=False,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            for row in expected
+        )
+        if actual_canonical != expected_canonical:
             raise WorkflowError(
-                "human ground-truth contains a truth not declared by the human benchmark"
+                "human ground-truth does not match canonical benchmark order and values"
             )
     return tuple(normalized)
 
 
-def _validate_saved_human_ground_truth_rows(
-    rows: Sequence[Mapping[str, object]],
-    *,
-    universe: frozenset[tuple[str, str, int]],
-) -> tuple[dict[str, object], ...]:
-    return _validate_human_ground_truth_rows(
-        rows,
-        universe=universe,
-        benchmark=None,
+def _load_human_benchmark_from_run(run: Mapping[str, object]) -> object:
+    from moving_det.ml.human_benchmark_artifacts import (
+        human_benchmark_fingerprint,
+        load_human_benchmark,
     )
+
+    source = _absolute_resolved_path(
+        run.get("human_benchmark_source"),
+        field="human benchmark source",
+    )
+    try:
+        benchmark = load_human_benchmark(source)
+        fingerprint = human_benchmark_fingerprint(source)
+    except (OSError, ValueError) as exc:
+        raise WorkflowError(
+            "human benchmark provenance cannot be strictly loaded"
+        ) from exc
+    if fingerprint != run.get("human_benchmark_sha256"):
+        raise WorkflowError("human benchmark provenance fingerprint is mismatched")
+    _fixed_human_frame_universe(benchmark)
+    return benchmark
 
 
 def _validate_human_audit(value: object, benchmark: object) -> dict[str, int]:
@@ -2525,7 +2585,7 @@ def _validate_evaluation_artifacts(
             "Motion-Off is only valid for MG-VTOD human benchmark evaluation"
         )
     benchmark = None
-    expected_human_frames: frozenset[tuple[str, str, int]] | None = None
+    expected_human_frames: tuple[tuple[str, str, int], ...] | None = None
     if human:
         from moving_det.ml.human_benchmark_artifacts import load_human_benchmark
 
@@ -2553,8 +2613,22 @@ def _validate_evaluation_artifacts(
         raise WorkflowError("test continuity frame universe must be non-empty")
     if human:
         assert expected_human_frames is not None
-        detection_identities = _frame_universe(detection_frames, ())
-        continuity_identities = _frame_universe(continuity_frames, ())
+        detection_identities = tuple(
+            (
+                str(row["site"]),
+                str(row["sequence"]),
+                int(row["frame"]),
+            )
+            for row in value.detection_frame_keys
+        )
+        continuity_identities = tuple(
+            (
+                str(row["site"]),
+                str(row["sequence"]),
+                int(row["frame"]),
+            )
+            for row in value.continuity_frame_keys
+        )
         if (
             len(detection_frames) != 873
             or len(continuity_frames) != 873
@@ -2562,21 +2636,16 @@ def _validate_evaluation_artifacts(
             or continuity_identities != expected_human_frames
         ):
             raise WorkflowError(
-                "human detection and continuity universes must contain exactly 873 benchmark frames"
+                "human detection and continuity universes must contain exactly 873 "
+                "frames in canonical benchmark order"
             )
     if not isinstance(value.metrics, Mapping):
         raise WorkflowError("evaluation metrics must be a mapping")
-    metric_sections = (
-        (
-            "per_class",
-            "per_size",
-            "per_pixel_speed",
-            "per_visible_span",
-            "per_track",
+    if human and "per_speed" in value.metrics:
+        raise WorkflowError(
+            "human evaluation metrics must not publish per_speed in m/s units"
         )
-        if human
-        else _EVALUATION_TABLES
-    )
+    metric_sections = _HUMAN_METRIC_SECTIONS if human else _EVALUATION_TABLES
     for section in metric_sections:
         if not isinstance(value.metrics.get(section), Mapping):
             raise WorkflowError(f"evaluation metrics are missing {section}")
@@ -2931,7 +3000,12 @@ def run_evaluate(
             "predictions.jsonl": _jsonl_bytes(artifacts.predictions),
             "ground-truth.jsonl": _jsonl_bytes(artifacts.ground_truth),
         }
-        for section in _EVALUATION_TABLES:
+        table_sections = (
+            _HUMAN_EVALUATION_TABLES
+            if human_benchmark is not None
+            else _EVALUATION_TABLES
+        )
+        for section in table_sections:
             artifact_bytes[f"{section}.csv"] = _metric_table_bytes(
                 section,
                 artifacts.metrics,
@@ -2946,12 +3020,17 @@ def run_evaluate(
             )
         for name, content in artifact_bytes.items():
             _write_bytes(stage / name, content)
+        artifact_versions = (
+            _HUMAN_EVALUATION_ARTIFACT_VERSIONS
+            if human_benchmark is not None
+            else _EVALUATION_ARTIFACT_VERSIONS
+        )
         artifact_schema = {
             name: (
                 3
                 if human_benchmark is not None
                 and name == "ground-truth.jsonl"
-                else _EVALUATION_ARTIFACT_VERSIONS[name]
+                else artifact_versions[name]
             )
             for name in artifact_bytes
         }
@@ -3000,6 +3079,9 @@ def run_evaluate(
         if human_benchmark is not None:
             run.update(
                 {
+                    "human_benchmark_source": str(
+                        human_benchmark.resolve(strict=True)
+                    ),
                     "human_benchmark_sha256": human_benchmark_sha256,
                     "motion_off": request.motion_off,
                 }
@@ -3166,9 +3248,23 @@ def _validate_artifact_declarations(
     if set(schema) != set(digests):
         raise WorkflowError("evaluation artifact schema and hash sets differ")
     names = set(schema)
-    if not _EVALUATION_REQUIRED_ARTIFACTS.issubset(names):
+    required = (
+        _HUMAN_EVALUATION_REQUIRED_ARTIFACTS
+        if human_benchmark
+        else _EVALUATION_REQUIRED_ARTIFACTS
+    )
+    supported = (
+        _HUMAN_EVALUATION_ARTIFACT_VERSIONS
+        if human_benchmark
+        else _EVALUATION_ARTIFACT_VERSIONS
+    )
+    if not required.issubset(names):
         raise WorkflowError("evaluation required artifact declarations are missing")
-    if not names.issubset(_EVALUATION_ARTIFACT_VERSIONS):
+    if human_benchmark and "per_speed.csv" in names:
+        raise WorkflowError(
+            "human evaluation must not declare per_speed.csv in m/s units"
+        )
+    if not names.issubset(supported):
         raise WorkflowError("evaluation artifact declaration is unknown")
     if split == "validation":
         if "threshold.json" not in names:
@@ -3183,7 +3279,7 @@ def _validate_artifact_declarations(
         expected_version = (
             3
             if human_benchmark and name == "ground-truth.jsonl"
-            else _EVALUATION_ARTIFACT_VERSIONS[name]
+            else supported[name]
         )
         if (
             isinstance(version, bool)
@@ -3243,21 +3339,32 @@ def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
     else:
         raise WorkflowError("evaluation run split is unsupported")
     if human:
-        detection_identities = _frame_universe(
-            normalized["detection_frame_keys"],
-            (),
+        benchmark = _load_human_benchmark_from_run(run)
+        expected_identities = _fixed_human_frame_universe(benchmark)
+        detection_identities = tuple(
+            (
+                str(row["site"]),
+                str(row["sequence"]),
+                int(row["frame"]),
+            )
+            for row in normalized["detection_frame_keys"]
         )
-        continuity_identities = _frame_universe(
-            normalized["continuity_frame_keys"],
-            (),
+        continuity_identities = tuple(
+            (
+                str(row["site"]),
+                str(row["sequence"]),
+                int(row["frame"]),
+            )
+            for row in normalized["continuity_frame_keys"]
         )
         if (
             split != "test"
-            or len(detection_identities) != 873
+            or detection_identities != expected_identities
             or detection_identities != continuity_identities
         ):
             raise WorkflowError(
-                "human run must record the same exact 873 detection and continuity frames"
+                "human run must record the same exact 873 detection and continuity "
+                "frames in canonical benchmark order"
             )
         if not _is_sha256(run.get("human_benchmark_sha256")):
             raise WorkflowError("human benchmark fingerprint is invalid")
@@ -3381,6 +3488,16 @@ def _load_verified_evaluation_run(
     metrics = _read_json(root / "metrics.json")
     if not isinstance(metrics, dict):
         raise WorkflowError("evaluation metrics must be an object")
+    if "human_benchmark_sha256" in run:
+        if "per_speed" in metrics:
+            raise WorkflowError(
+                "human evaluation metrics must not publish per_speed in m/s units"
+            )
+        for section in _HUMAN_METRIC_SECTIONS:
+            if not isinstance(metrics.get(section), Mapping):
+                raise WorkflowError(
+                    f"human evaluation metrics are missing {section}"
+                )
     detection_frames = _normalize_frame_keys(run["detection_frame_keys"])
     continuity_frames = _normalize_frame_keys(run["continuity_frame_keys"])
     universe = _frame_universe(detection_frames, continuity_frames)
@@ -3389,9 +3506,11 @@ def _load_verified_evaluation_run(
         universe=universe,
     )
     if "human_benchmark_sha256" in run:
-        _validate_saved_human_ground_truth_rows(
+        benchmark = _load_human_benchmark_from_run(run)
+        _validate_human_ground_truth_rows(
             _read_jsonl(root / "ground-truth.jsonl"),
             universe=universe,
+            benchmark=benchmark,
         )
     else:
         _validate_ground_truth_rows(
@@ -5378,6 +5497,93 @@ def _load_full_rgb(path: Path) -> Any:
         raise WorkflowError(f"failed to read full-frame image: {source}") from exc
 
 
+def _stable_file_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _load_stable_human_rgb(
+    path: Path,
+    *,
+    label: str,
+    expected_sha256: str | None,
+) -> Any:
+    import numpy as np
+    from PIL import Image
+
+    source = Path(path)
+    descriptor = -1
+    try:
+        _reject_symlink_components(source)
+        descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        path_stat = os.stat(source, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(path_stat.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (path_stat.st_dev, path_stat.st_ino)
+            or opened.st_size <= 0
+            or opened.st_size > _MAX_FULL_FRAME_IMAGE_BYTES
+        ):
+            raise WorkflowError(
+                f"{label} is missing, unsafe, or too large: {source}"
+            )
+        chunks = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(
+                descriptor,
+                min(_FULL_FRAME_READ_CHUNK_BYTES, remaining),
+            )
+            if not chunk:
+                raise WorkflowError(f"{label} changed while reading: {source}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise WorkflowError(f"{label} changed while reading: {source}")
+        finished = os.fstat(descriptor)
+        final_path_stat = os.stat(source, follow_symlinks=False)
+        _reject_symlink_components(source)
+        if (
+            _stable_file_signature(finished) != _stable_file_signature(opened)
+            or not stat.S_ISREG(final_path_stat.st_mode)
+            or (final_path_stat.st_dev, final_path_stat.st_ino)
+            != (opened.st_dev, opened.st_ino)
+        ):
+            raise WorkflowError(f"{label} changed while reading: {source}")
+        content = b"".join(chunks)
+    except WorkflowError:
+        raise
+    except OSError as exc:
+        raise WorkflowError(f"{label} is missing or unsafe: {source}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    digest = hashlib.sha256(content).hexdigest()
+    if expected_sha256 is not None:
+        if not _is_sha256(expected_sha256) or digest != expected_sha256:
+            raise WorkflowError(
+                f"{label} SHA-256 does not match its benchmark row"
+            )
+    try:
+        with Image.open(io.BytesIO(content)) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+    except OSError as exc:
+        raise WorkflowError(f"{label} is undecodable: {source}") from exc
+
+
 def _load_full_frame_clip(
     cfg: object,
     record: Mapping[str, object],
@@ -5402,7 +5608,17 @@ def _load_full_frame_clip(
         center_path = human_image_path
         if center_path.stem != f"{center:06d}":
             raise WorkflowError("human frame image_path does not match its identity")
-    center_array = _load_full_rgb(center_path)
+    if human_image_path is None:
+        center_array = _load_full_rgb(center_path)
+    else:
+        center_sha256 = record.get("image_sha256")
+        if not _is_sha256(center_sha256):
+            raise WorkflowError("human frame image_sha256 is invalid")
+        center_array = _load_stable_human_rgb(
+            center_path,
+            label="human center frame",
+            expected_sha256=str(center_sha256),
+        )
     height, width = center_array.shape[:2]
     frames = []
     valid = []
@@ -5415,11 +5631,26 @@ def _load_full_frame_clip(
             if human_image_path is not None
             else _full_frame_path(cfg, site, sequence, frame_number)
         )
-        is_valid = frame_number > 0 and path.is_file() and not path.is_symlink()
+        is_valid = (
+            True
+            if human_image_path is not None
+            else frame_number > 0 and path.is_file() and not path.is_symlink()
+        )
         valid.append(is_valid)
         support_paths.append(str(path) if is_valid else None)
         if is_valid:
-            array = _load_full_rgb(path)
+            if human_image_path is not None:
+                array = (
+                    center_array
+                    if offset == 0
+                    else _load_stable_human_rgb(
+                        path,
+                        label="human support frame",
+                        expected_sha256=None,
+                    )
+                )
+            else:
+                array = _load_full_rgb(path)
             if array.shape != center_array.shape:
                 raise WorkflowError("temporal full frames have inconsistent shapes")
         else:
@@ -5827,8 +6058,10 @@ def _representative_human_diagnostic_tile(
     benchmark: object,
     cfg: object,
 ) -> object:
-    from moving_det.geometry.obb import points_to_obb
+    from shapely.geometry import box
+
     from moving_det.ml.human_benchmark import IMAGE_HEIGHT, IMAGE_WIDTH
+    from moving_det.ml.human_evaluation import _clipped_ignore_polygon
     from moving_det.vrud.tiling import assign_target_tile, full_frame_tiles
 
     identity = (
@@ -5836,7 +6069,7 @@ def _representative_human_diagnostic_tile(
         str(getattr(frame, "sequence")),
         int(getattr(frame, "frame")),
     )
-    candidates = [
+    truths = [
         (
             int(getattr(truth, "track_id")),
             int(getattr(truth, "class_id")),
@@ -5850,50 +6083,88 @@ def _representative_human_diagnostic_tile(
         )
         == identity
     ]
-    candidates.extend(
-        (
-            int(getattr(ignored, "track_id")),
-            (
-                int(getattr(ignored, "class_id"))
-                if getattr(ignored, "class_id") is not None
-                else 4
-            ),
-            points_to_obb(getattr(ignored, "points")),
-        )
-        for ignored in getattr(benchmark, "ignores")
-        if (
-            str(getattr(ignored, "site")),
-            str(getattr(ignored, "sequence")),
-            int(getattr(ignored, "frame")),
-        )
-        == identity
-    )
     tiles = full_frame_tiles(
         IMAGE_WIDTH,
         IMAGE_HEIGHT,
         int(getattr(cfg, "tile_size")),
         int(getattr(cfg, "tile_overlap")),
     )
-    if not candidates:
+    if truths:
+        _, _, obb = min(
+            truths,
+            key=lambda item: (
+                item[0],
+                item[1],
+                float(item[2].cx),
+                float(item[2].cy),
+                float(item[2].width),
+                float(item[2].height),
+                float(item[2].theta),
+            ),
+        )
+        try:
+            return assign_target_tile(obb, tiles)
+        except ValueError as exc:
+            raise WorkflowError(
+                "representative human truth OBB does not fit an approved tile"
+            ) from exc
+
+    clipped_ignores = []
+    for ignored in getattr(benchmark, "ignores"):
+        if (
+            str(getattr(ignored, "site")),
+            str(getattr(ignored, "sequence")),
+            int(getattr(ignored, "frame")),
+        ) != identity:
+            continue
+        try:
+            polygon = _clipped_ignore_polygon(
+                ignored,
+                width=IMAGE_WIDTH,
+                height=IMAGE_HEIGHT,
+            )
+        except ValueError as exc:
+            raise WorkflowError(
+                "representative clipped ignore polygon is invalid or empty"
+            ) from exc
+        clipped_ignores.append(
+            (
+                int(getattr(ignored, "track_id")),
+                (
+                    int(getattr(ignored, "class_id"))
+                    if getattr(ignored, "class_id") is not None
+                    else 4
+                ),
+                polygon,
+            )
+        )
+    if not clipped_ignores:
         return tiles[0]
-    _, _, obb = min(
-        candidates,
+    _, _, polygon = min(
+        clipped_ignores,
         key=lambda item: (
             item[0],
             item[1],
-            float(item[2].cx),
-            float(item[2].cy),
-            float(item[2].width),
-            float(item[2].height),
-            float(item[2].theta),
+            float(item[2].centroid.x),
+            float(item[2].centroid.y),
+            tuple(float(value) for value in item[2].bounds),
         ),
     )
-    try:
-        return assign_target_tile(obb, tiles)
-    except ValueError as exc:
-        raise WorkflowError(
-            "representative human OBB does not fit an approved tile"
-        ) from exc
+    center_x = float(polygon.centroid.x)
+    center_y = float(polygon.centroid.y)
+    ranked_tiles = []
+    for tile in tiles:
+        intersection_area = polygon.intersection(
+            box(tile.x, tile.y, tile.x + tile.width, tile.y + tile.height)
+        ).area
+        distance = (
+            (center_x - (tile.x + tile.width / 2)) ** 2
+            + (center_y - (tile.y + tile.height / 2)) ** 2
+        )
+        ranked_tiles.append(
+            (-float(intersection_area), distance, tile.y, tile.x, tile)
+        )
+    return min(ranked_tiles, key=lambda item: item[:4])[-1]
 
 
 def _load_compatible_run_records(
@@ -6853,6 +7124,7 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
                 "sequence": frame.sequence,
                 "center_frame": frame.frame,
                 "image_path": frame.image_path,
+                "image_sha256": frame.image_sha256,
             }
             for frame in human_benchmark.frames
         )
@@ -7038,7 +7310,6 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
                 {"threshold": threshold_payload["threshold"]},
             )
         )
-        metrics["per_speed"] = metrics["per_pixel_speed"]
     elif request.split == "validation":
         evidence = select_validation_threshold(
             tuple(predictions),

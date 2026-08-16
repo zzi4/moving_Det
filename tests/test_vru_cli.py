@@ -2609,6 +2609,7 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
             "sequence": "sequence_a",
             "center_frame": 31,
             "image_path": image_path,
+            "image_sha256": "d" * 64,
         }
     ]
     assert evaluated[0][1].truths[0].class_id == 3
@@ -2627,6 +2628,7 @@ def test_full_frame_clip_uses_human_frame_image_path(tmp_path):
     )
     image_path.parent.mkdir(parents=True)
     Image.new("RGB", (8, 8), color=(10, 20, 30)).save(image_path)
+    image_sha256 = hashlib.sha256(image_path.read_bytes()).hexdigest()
     cfg = replace(
         load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
         image_root=tmp_path / "legacy-images",
@@ -2639,6 +2641,7 @@ def test_full_frame_clip_uses_human_frame_image_path(tmp_path):
             "sequence": "sequence_a",
             "center_frame": 31,
             "image_path": image_path,
+            "image_sha256": image_sha256,
         },
         offsets=(0,),
         cache=None,
@@ -2646,6 +2649,321 @@ def test_full_frame_clip_uses_human_frame_image_path(tmp_path):
 
     assert clip["metadata"]["support_paths"] == (str(image_path),)
     assert clip["metadata"]["frame_shape"] == (8, 8)
+
+
+@REQUIRES_TORCH
+@pytest.mark.parametrize("center", (2926, 3216), ids=("first", "last"))
+def test_human_full_frame_clip_requires_nas_neighbors_outside_annotation_interval(
+    tmp_path,
+    center,
+):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    offsets = (-4, -2, 0, 2, 4)
+    paths = {}
+    for index, offset in enumerate(offsets):
+        path = image_dir / f"{center + offset:06d}.jpg"
+        Image.new("RGB", (8, 8), color=(10 + index, 20, 30)).save(path)
+        paths[offset] = path
+    center_sha256 = hashlib.sha256(paths[0].read_bytes()).hexdigest()
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+    cache = SimpleNamespace(
+        get=lambda key: SimpleNamespace(matrix=np.eye(2, 3, dtype=np.float32))
+    )
+
+    clip = vru_cli_module._load_full_frame_clip(
+        cfg,
+        {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "center_frame": center,
+            "image_path": paths[0],
+            "image_sha256": center_sha256,
+        },
+        offsets=offsets,
+        cache=cache,
+    )
+
+    assert clip["valid"].tolist() == [True] * len(offsets)
+    assert clip["metadata"]["support_paths"] == tuple(
+        str(paths[offset]) for offset in offsets
+    )
+
+
+@REQUIRES_TORCH
+@pytest.mark.parametrize("defect", ("missing", "directory", "undecodable"))
+def test_human_full_frame_clip_rejects_unreadable_support(
+    tmp_path,
+    defect,
+):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center_path = image_dir / "000031.jpg"
+    support_path = image_dir / "000033.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center_path)
+    if defect == "directory":
+        support_path.mkdir()
+    elif defect == "undecodable":
+        support_path.write_bytes(b"not a JPEG")
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    with pytest.raises(WorkflowError, match="human support frame"):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "image_path": center_path,
+                "image_sha256": hashlib.sha256(
+                    center_path.read_bytes()
+                ).hexdigest(),
+            },
+            offsets=(0, 2),
+            cache=SimpleNamespace(get=lambda key: None),
+        )
+
+
+@REQUIRES_TORCH
+def test_human_center_read_rejects_replacement_and_restore_race(
+    tmp_path,
+    monkeypatch,
+):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center_path = image_dir / "000031.bmp"
+    replacement_path = image_dir / "replacement.bmp"
+    backup_path = image_dir / "original.bmp"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center_path)
+    Image.new("RGB", (8, 8), color=(200, 210, 220)).save(replacement_path)
+    expected_sha256 = hashlib.sha256(center_path.read_bytes()).hexdigest()
+    real_read = vru_cli_module.os.read
+    reads = 0
+
+    def replace_during_read(descriptor, count):
+        nonlocal reads
+        content = real_read(descriptor, min(count, 8))
+        reads += 1
+        if reads == 1:
+            center_path.rename(backup_path)
+            replacement_path.rename(center_path)
+        elif reads == 2:
+            center_path.rename(replacement_path)
+            backup_path.rename(center_path)
+        return content
+
+    monkeypatch.setattr(vru_cli_module.os, "read", replace_during_read)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    with pytest.raises(WorkflowError, match="changed while reading"):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "image_path": center_path,
+                "image_sha256": expected_sha256,
+            },
+            offsets=(0,),
+            cache=None,
+        )
+
+    assert reads > 2
+    assert hashlib.sha256(center_path.read_bytes()).hexdigest() == expected_sha256
+
+
+@REQUIRES_TORCH
+def test_human_center_frame_rejects_benchmark_image_hash_mismatch(tmp_path):
+    image_path = (
+        tmp_path / "nas" / "site19_sequence" / "sequence_a" / "000031.jpg"
+    )
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(image_path)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    with pytest.raises(WorkflowError, match="SHA-256"):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "image_path": image_path,
+                "image_sha256": "f" * 64,
+            },
+            offsets=(0,),
+            cache=None,
+        )
+
+
+@REQUIRES_TORCH
+def test_nonhuman_full_frame_clip_keeps_boundary_zero_fill(tmp_path):
+    image_path = (
+        tmp_path / "images" / "site19_sequence" / "sequence_a" / "000002.jpg"
+    )
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(image_path)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+    )
+
+    clip = vru_cli_module._load_full_frame_clip(
+        cfg,
+        {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "center_frame": 2,
+        },
+        offsets=(-4, 0),
+        cache=None,
+    )
+
+    assert clip["valid"].tolist() == [False, True]
+    assert clip["metadata"]["support_paths"] == (None, str(image_path))
+    assert np.count_nonzero(clip["frames"][0].numpy()) == 0
+
+
+def test_human_diagnostic_tile_prioritizes_truth_over_edge_ignore(tmp_path):
+    from moving_det.ml.human_benchmark import HumanFrame, HumanIgnore, HumanTruth
+    from moving_det.models import OBB
+    from moving_det.vrud.tiling import assign_target_tile, full_frame_tiles
+
+    frame = HumanFrame(
+        site="site19",
+        sequence="sequence_a",
+        frame=31,
+        image_path=tmp_path / "000031.jpg",
+        annotation_member="manual/000031.json",
+        image_sha256="a" * 64,
+    )
+    truth = HumanTruth(
+        site=frame.site,
+        sequence=frame.sequence,
+        frame=frame.frame,
+        class_id=3,
+        track_id=9,
+        obb=OBB(1500.0, 1000.0, 100.0, 40.0, 0.0),
+        pixel_speed=1.0,
+        visible_span=0,
+    )
+    edge_ignore = HumanIgnore(
+        site=frame.site,
+        sequence=frame.sequence,
+        frame=frame.frame,
+        class_id=0,
+        track_id=1,
+        points=((-20.0, 100.0), (20.0, 100.0), (20.0, 200.0), (-20.0, 200.0)),
+    )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        tile_size=1024,
+        tile_overlap=128,
+    )
+    benchmark = SimpleNamespace(truths=(truth,), ignores=(edge_ignore,))
+    expected = assign_target_tile(
+        truth.obb,
+        full_frame_tiles(3840, 2160, cfg.tile_size, cfg.tile_overlap),
+    )
+
+    actual = vru_cli_module._representative_human_diagnostic_tile(
+        frame,
+        benchmark,
+        cfg,
+    )
+
+    assert actual == expected
+
+
+def test_human_diagnostic_tile_clips_only_edge_ignore_to_image(tmp_path):
+    from moving_det.ml.human_benchmark import HumanFrame, HumanIgnore
+    from moving_det.vrud.tiling import Tile
+
+    frame = HumanFrame(
+        site="site19",
+        sequence="sequence_a",
+        frame=31,
+        image_path=tmp_path / "000031.jpg",
+        annotation_member="manual/000031.json",
+        image_sha256="a" * 64,
+    )
+    edge_ignore = HumanIgnore(
+        site=frame.site,
+        sequence=frame.sequence,
+        frame=frame.frame,
+        class_id=None,
+        track_id=1,
+        points=((-20.0, 100.0), (20.0, 100.0), (20.0, 200.0), (-20.0, 200.0)),
+    )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        tile_size=1024,
+        tile_overlap=128,
+    )
+
+    actual = vru_cli_module._representative_human_diagnostic_tile(
+        frame,
+        SimpleNamespace(truths=(), ignores=(edge_ignore,)),
+        cfg,
+    )
+
+    assert actual == Tile(0, 0, 1024, 1024)
+
+
+@pytest.mark.parametrize(
+    "points",
+    (
+        ((-20.0, 100.0), (-10.0, 100.0), (-10.0, 200.0), (-20.0, 200.0)),
+        ((0.0, 0.0), (10.0, 10.0), (0.0, 10.0), (10.0, 0.0)),
+    ),
+)
+def test_human_diagnostic_tile_rejects_empty_or_invalid_clipped_ignore(
+    tmp_path,
+    points,
+):
+    from moving_det.ml.human_benchmark import HumanFrame, HumanIgnore
+
+    frame = HumanFrame(
+        site="site19",
+        sequence="sequence_a",
+        frame=31,
+        image_path=tmp_path / "000031.jpg",
+        annotation_member="manual/000031.json",
+        image_sha256="a" * 64,
+    )
+    ignored = HumanIgnore(
+        site=frame.site,
+        sequence=frame.sequence,
+        frame=frame.frame,
+        class_id=0,
+        track_id=1,
+        points=points,
+    )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        tile_size=1024,
+        tile_overlap=128,
+    )
+
+    with pytest.raises(WorkflowError, match="clipped ignore polygon"):
+        vru_cli_module._representative_human_diagnostic_tile(
+            frame,
+            SimpleNamespace(truths=(), ignores=(ignored,)),
+            cfg,
+        )
 
 
 @REQUIRES_TORCH
@@ -4375,7 +4693,6 @@ def _human_evaluation_request_and_bundle(tmp_path: Path):
         metrics={
             "per_class": {},
             "per_size": {},
-            "per_speed": {},
             "per_pixel_speed": {},
             "per_visible_span": {},
             "per_track": {},
@@ -4400,7 +4717,13 @@ def _human_evaluation_request_and_bundle(tmp_path: Path):
     (
         ("872-frames", "exactly 873"),
         ("missing-speed", "pixel_speed_per_frame"),
-        ("extra-truth", "declared by the human benchmark"),
+        ("extra-truth", "canonical benchmark"),
+        ("missing-truth", "canonical benchmark"),
+        ("empty-truth", "canonical benchmark"),
+        ("duplicate-truth", "duplicate human"),
+        ("altered-class", "canonical benchmark"),
+        ("altered-obb", "canonical benchmark"),
+        ("altered-span", "canonical benchmark"),
     ),
 )
 def test_human_artifacts_reject_inexact_universe_and_truth(
@@ -4430,8 +4753,65 @@ def test_human_artifacts_reject_inexact_universe_and_truth(
     elif defect == "extra-truth":
         extra = {**dict(bundle.ground_truth[0]), "track_id": 99999}
         bundle = replace(bundle, ground_truth=(*bundle.ground_truth, extra))
+    elif defect == "missing-truth":
+        bundle = replace(bundle, ground_truth=bundle.ground_truth[1:])
+    elif defect == "empty-truth":
+        bundle = replace(bundle, ground_truth=())
+    elif defect == "duplicate-truth":
+        bundle = replace(
+            bundle,
+            ground_truth=(bundle.ground_truth[0], *bundle.ground_truth),
+        )
+    elif defect == "altered-class":
+        altered = {**dict(bundle.ground_truth[0]), "class_id": 1}
+        bundle = replace(
+            bundle,
+            ground_truth=(altered, *bundle.ground_truth[1:]),
+        )
+    elif defect == "altered-obb":
+        altered = {
+            **dict(bundle.ground_truth[0]),
+            "obb": [65.0, 48.0, 20.0, 8.0, 0.2],
+        }
+        bundle = replace(
+            bundle,
+            ground_truth=(altered, *bundle.ground_truth[1:]),
+        )
+    elif defect == "altered-span":
+        altered = {**dict(bundle.ground_truth[0]), "visible_span": 99}
+        bundle = replace(
+            bundle,
+            ground_truth=(altered, *bundle.ground_truth[1:]),
+        )
 
     with pytest.raises(WorkflowError, match=message):
+        _validate_evaluation_artifacts(bundle, request)
+
+
+@pytest.mark.parametrize("defect", ("frame-order", "truth-order"))
+def test_human_artifacts_reject_reordered_canonical_evidence(
+    tmp_path,
+    monkeypatch,
+    defect,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    if defect == "frame-order":
+        frames = list(bundle.detection_frame_keys)
+        frames[0], frames[1] = frames[1], frames[0]
+        bundle = replace(bundle, detection_frame_keys=tuple(frames))
+    else:
+        truths = list(bundle.ground_truth)
+        truths[0], truths[1] = truths[1], truths[0]
+        bundle = replace(bundle, ground_truth=tuple(truths))
+
+    with pytest.raises(WorkflowError, match="canonical benchmark order"):
         _validate_evaluation_artifacts(bundle, request)
 
 
@@ -4500,6 +4880,127 @@ def test_human_artifacts_accept_exact_fixed_benchmark_evidence(
     assert validated.detection_frame_keys == validated.continuity_frame_keys
     assert validated.ground_truth == bundle.ground_truth
     assert validated.audit["edge_ignore_count"] == 334
+
+
+def test_human_artifacts_reject_legacy_per_speed_metric_disguise(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+
+    with pytest.raises(WorkflowError, match="must not publish per_speed"):
+        _validate_evaluation_artifacts(
+            replace(
+                bundle,
+                metrics={**dict(bundle.metrics), "per_speed": {}},
+            ),
+            request,
+        )
+
+
+def test_human_artifacts_require_per_pixel_speed_metrics(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    metrics = dict(bundle.metrics)
+    metrics.pop("per_pixel_speed")
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+
+    with pytest.raises(WorkflowError, match="missing per_pixel_speed"):
+        _validate_evaluation_artifacts(
+            replace(bundle, metrics=metrics),
+            request,
+        )
+
+
+@pytest.mark.parametrize("defect", ("missing", "legacy-disguise"))
+def test_human_artifact_declarations_require_pixel_speed_table(defect):
+    names = {
+        "metrics.json": 1,
+        "predictions.jsonl": 1,
+        "ground-truth.jsonl": 3,
+        "per_class.csv": 1,
+        "per_size.csv": 1,
+        "per_pixel_speed.csv": 1,
+        "per_track.csv": 1,
+    }
+    names.pop("per_pixel_speed.csv")
+    if defect == "legacy-disguise":
+        names["per_speed.csv"] = 1
+    digests = {name: "a" * 64 for name in names}
+
+    with pytest.raises(WorkflowError, match="required artifact|per_speed"):
+        vru_cli_module._validate_artifact_declarations(
+            names,
+            digests,
+            split="test",
+            human_benchmark=True,
+        )
+
+
+def test_human_artifacts_accept_visible_span_zero(tmp_path, monkeypatch):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    zero_truth = replace(benchmark.truths[0], visible_span=0)
+    benchmark = replace(
+        benchmark,
+        truths=(zero_truth, *benchmark.truths[1:]),
+    )
+    zero_row = {**dict(bundle.ground_truth[0]), "visible_span": 0}
+    bundle = replace(
+        bundle,
+        ground_truth=(zero_row, *bundle.ground_truth[1:]),
+    )
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+
+    validated = _validate_evaluation_artifacts(bundle, request)
+
+    assert validated.ground_truth[0]["visible_span"] == 0
+
+
+@pytest.mark.parametrize("visible_span", (-1, True))
+def test_human_artifacts_reject_invalid_visible_span(
+    tmp_path,
+    monkeypatch,
+    visible_span,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    malformed = {**dict(bundle.ground_truth[0]), "visible_span": visible_span}
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+
+    with pytest.raises(WorkflowError, match="row values"):
+        _validate_evaluation_artifacts(
+            replace(
+                bundle,
+                ground_truth=(malformed, *bundle.ground_truth[1:]),
+            ),
+            request,
+        )
 
 
 def test_human_artifacts_bind_run_image_root_to_human_frames(
@@ -5355,8 +5856,13 @@ def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
     run = json.loads((output / "run.json").read_text(encoding="utf-8"))
     truth = json.loads((output / "ground-truth.jsonl").read_text().splitlines()[0])
     assert run["human_benchmark_sha256"] == "f" * 64
+    assert run["human_benchmark_source"] == str(human_root.resolve())
     assert run["motion_off"] is True
     assert run["artifact_schema"]["ground-truth.jsonl"] == 3
+    assert run["artifact_schema"]["per_pixel_speed.csv"] == 1
+    assert "per_speed.csv" not in run["artifact_schema"]
+    assert (output / "per_pixel_speed.csv").is_file()
+    assert not (output / "per_speed.csv").exists()
     assert truth["schema_version"] == 3
     assert truth["pixel_speed_per_frame"] == 0.5
     assert truth["visible_span"] == 4
@@ -5371,6 +5877,23 @@ def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
     )
     assert loaded_run == run
     assert loaded_root == output
+
+    truth_rows = [
+        json.loads(line)
+        for line in (output / "ground-truth.jsonl").read_text().splitlines()
+    ]
+    truth_rows[0]["pixel_speed_per_frame"] = 999.0
+    (output / "ground-truth.jsonl").write_text(
+        "".join(
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+            for row in truth_rows
+        ),
+        encoding="utf-8",
+    )
+    _refresh_declared_artifact_hash(output, "ground-truth.jsonl")
+
+    with pytest.raises(WorkflowError, match="canonical benchmark"):
+        vru_cli_module._load_verified_evaluation_run(output)
 
 
 def test_human_evaluate_rejects_fingerprint_change_before_atomic_publication(
