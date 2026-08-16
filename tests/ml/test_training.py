@@ -100,6 +100,78 @@ class _ExplodingModelState(Mapping[str, Tensor]):
         return torch.ones(1, 1)
 
 
+class _DeclaredModelStateKeys:
+    """A pickle-safe hostile keys view for state materialization tests."""
+
+    def __init__(self, owner: "_DeclaredModelState") -> None:
+        self._owner = owner
+
+    def __iter__(self):
+        owner = self._owner
+        type(owner).access_log.append("keys_iter")
+        if owner.defect == "iteration":
+            raise RuntimeError("injected key iteration failure")
+        if owner.defect == "overflow_guard":
+            yielded = 0
+            while True:
+                yielded += 1
+                type(owner).access_log.append(f"yield:{yielded}")
+                if yielded > owner.declared_length + 1:
+                    raise RuntimeError("keys iterator consumed past len + 1")
+                yield f"hostile.key.{yielded}"
+        else:
+            yield from owner.declared_keys
+
+
+class _DeclaredModelState(Mapping[str, Tensor]):
+    """Expose an independently declared length, key stream, and values."""
+
+    access_log: list[str] = []
+
+    def __init__(
+        self,
+        declared_keys: tuple[object, ...],
+        values: Mapping[str, tuple[Tensor, ...]],
+        *,
+        declared_length: object | None = None,
+        defect: str | None = None,
+    ) -> None:
+        self.declared_keys = declared_keys
+        self.values = dict(values)
+        self.declared_length = (
+            len(declared_keys)
+            if declared_length is None
+            else declared_length
+        )
+        self.defect = defect
+        self._value_offsets: dict[str, int] = {}
+
+    def __len__(self):
+        type(self).access_log.append("len")
+        if self.defect == "len":
+            raise RuntimeError("injected length failure")
+        return self.declared_length
+
+    def __iter__(self):
+        type(self).access_log.append("mapping_iter")
+        return iter(self.declared_keys)
+
+    def keys(self):
+        type(self).access_log.append("keys")
+        if self.defect == "keys":
+            raise RuntimeError("injected keys failure")
+        return _DeclaredModelStateKeys(self)
+
+    def __getitem__(self, key: str) -> Tensor:
+        type(self).access_log.append(f"getitem:{key}")
+        if self.defect == "getitem":
+            raise RuntimeError("injected getitem failure")
+        candidates = self.values[key]
+        offset = self._value_offsets.get(key, 0)
+        self._value_offsets[key] = offset + 1
+        return candidates[min(offset, len(candidates) - 1)]
+
+
 @pytest.fixture
 def temporal_config():
     return replace(
@@ -248,6 +320,116 @@ def test_baseline_init_state_materialization_rejects_invalid_keys(invalid_key):
         training_module._materialize_baseline_initialization_state(
             {invalid_key: torch.ones(1)}
         )
+
+
+@pytest.mark.parametrize(
+    ("declared_length", "declared_keys", "defect"),
+    [
+        (1, ("detector.weight", "temporal.weight"), None),
+        (3, ("detector.weight", "temporal.weight"), None),
+        (-1, ("detector.weight",), None),
+        (True, ("detector.weight",), None),
+        (1, ("detector.weight",), "len"),
+        (1, ("detector.weight",), "keys"),
+        (1, ("detector.weight",), "iteration"),
+        (1, ("detector.weight",), "getitem"),
+    ],
+    ids=[
+        "length-understates-keys",
+        "length-overstates-keys",
+        "negative-length",
+        "boolean-length",
+        "length-error",
+        "keys-error",
+        "iteration-error",
+        "getitem-error",
+    ],
+)
+def test_baseline_init_state_materialization_rejects_ambiguous_protocols(
+    declared_length,
+    declared_keys,
+    defect,
+):
+    source = _DeclaredModelState(
+        declared_keys,
+        {
+            "detector.weight": (torch.ones(1),),
+            "temporal.weight": (torch.ones(1),),
+        },
+        declared_length=declared_length,
+        defect=defect,
+    )
+
+    with pytest.raises(ValueError, match="materialize.*model state|state.*length"):
+        training_module._materialize_baseline_initialization_state(source)
+
+
+def test_baseline_init_state_materialization_bounds_hostile_key_stream():
+    source = _DeclaredModelState(
+        ("detector.weight",),
+        {"detector.weight": (torch.ones(1),)},
+        declared_length=2,
+        defect="overflow_guard",
+    )
+    _DeclaredModelState.access_log.clear()
+
+    with pytest.raises(ValueError, match="materialize.*model state|state.*length"):
+        training_module._materialize_baseline_initialization_state(source)
+
+    assert _DeclaredModelState.access_log.count("yield:1") == 1
+    assert _DeclaredModelState.access_log.count("yield:2") == 1
+    assert _DeclaredModelState.access_log.count("yield:3") == 1
+    assert "yield:4" not in _DeclaredModelState.access_log
+
+
+def test_baseline_init_state_materialization_reads_each_unique_value_once():
+    detector = torch.ones(1)
+    temporal = torch.full((1,), 2.0)
+    source = _DeclaredModelState(
+        ("detector.weight", "temporal.weight"),
+        {
+            "detector.weight": (detector, torch.full((1,), float("nan"))),
+            "temporal.weight": (temporal, torch.full((1,), float("nan"))),
+        },
+    )
+    _DeclaredModelState.access_log.clear()
+
+    fixed = training_module._materialize_baseline_initialization_state(source)
+    training_module._validate_finite_baseline_initialization_state(fixed)
+
+    assert fixed == {
+        "detector.weight": detector,
+        "temporal.weight": temporal,
+    }
+    assert _DeclaredModelState.access_log == [
+        "len",
+        "keys",
+        "keys_iter",
+        "getitem:detector.weight",
+        "getitem:temporal.weight",
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        OrderedDict(
+            [
+                ("detector.weight", torch.ones(1)),
+                ("counter", torch.tensor(2, dtype=torch.int64)),
+            ]
+        ),
+        nn.Linear(1, 1, bias=False).state_dict(),
+    ],
+    ids=["ordered-dict", "module-state-dict"],
+)
+def test_baseline_init_state_materialization_accepts_ordinary_state(source):
+    fixed = training_module._materialize_baseline_initialization_state(source)
+
+    assert type(fixed) is dict
+    assert tuple(fixed) == tuple(source)
+    for key, value in source.items():
+        assert fixed[key] is value
 
 
 def test_default_loader_factory_preserves_contract_with_synchronous_override(
@@ -2050,6 +2232,127 @@ def test_formal_baseline_state_mapping_is_materialized_once_before_mutation(
     assert model_factory_calls == []
     assert target.to_calls == 0
     assert optimizer_factory_calls == []
+    after = target.state_dict()
+    assert set(after) == set(before)
+    for name, value in after.items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        assert (
+            value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            == before_bytes[name]
+        )
+
+
+def test_formal_baseline_duplicate_state_keys_are_rejected_before_mutation(
+    tmp_path,
+    temporal_config,
+    monkeypatch,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    _fixture_checkpoint, p2_init, _universal_sha256 = (
+        _formal_baseline_checkpoint(
+            tmp_path / "frozen-source",
+            monkeypatch,
+            manifest,
+        )
+    )
+
+    def baseline_factory(_name, requested, _cfg):
+        state, _provenance = (
+            transfer_module.load_frozen_p2_initialization(Path(requested))
+        )
+        return TinyOBB(initial=float(state["model.000.weight"][0]))
+
+    published = train_model(
+        "baseline",
+        replace(
+            temporal_config,
+            pilot_epochs=1,
+            learning_rate=0.0,
+            pretrained_weights=str(p2_init),
+        ),
+        manifest,
+        tmp_path / "formal-baseline",
+        hooks=replace(
+            _tiny_hooks(TinyOBB(), map50_values=[0.2]),
+            model_factory=baseline_factory,
+        ),
+    )
+    payload = torch.load(
+        published.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    detector = payload["model"]["detector.weight"].detach().clone()
+    payload["model"] = _DeclaredModelState(
+        ("detector.weight", "detector.weight"),
+        {"detector.weight": (detector, detector.detach().clone())},
+        declared_length=2,
+    )
+    torch.save(payload, published.best_checkpoint)
+    run_path = published.output_dir / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["checkpoint_artifacts"]["best"]["sha256"] = hashlib.sha256(
+        published.best_checkpoint.read_bytes()
+    ).hexdigest()
+    _write_canonical_json(run_path, run)
+    _DeclaredModelState.access_log.clear()
+
+    class MutationObservingTemporal(TinyTemporalOBB):
+        def __init__(self):
+            super().__init__()
+            self.to_calls = 0
+
+        def to(self, *args, **kwargs):
+            self.to_calls += 1
+            return super().to(*args, **kwargs)
+
+    target = MutationObservingTemporal()
+    before = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+    }
+    before_bytes = {
+        name: value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        for name, value in before.items()
+    }
+    model_factory_calls = []
+    hooks = replace(
+        _tiny_hooks(target, map50_values=[0.3]),
+        model_factory=lambda name, weights, cfg: (
+            model_factory_calls.append((name, weights, cfg)) or target
+        ),
+    )
+    real_build_optimizer = training_module.build_optimizer
+    optimizer_factory_calls = []
+
+    def observing_optimizer_factory(model, cfg):
+        optimizer_factory_calls.append((model, cfg))
+        return real_build_optimizer(model, cfg)
+
+    monkeypatch.setattr(
+        training_module,
+        "build_optimizer",
+        observing_optimizer_factory,
+    )
+    caught = None
+
+    try:
+        train_model(
+            "mg_vtod",
+            replace(temporal_config, pilot_epochs=1, learning_rate=0.0),
+            manifest,
+            tmp_path / "reject-duplicate-state-keys",
+            init_checkpoint=published.best_checkpoint,
+            hooks=hooks,
+        )
+    except ValueError as exc:
+        caught = exc
+
+    assert model_factory_calls == []
+    assert target.to_calls == 0
+    assert optimizer_factory_calls == []
+    assert caught is not None
+    assert "duplicate" in str(caught).lower()
     after = target.state_dict()
     assert set(after) == set(before)
     for name, value in after.items():

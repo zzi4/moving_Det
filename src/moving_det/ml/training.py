@@ -642,20 +642,67 @@ def _materialize_baseline_initialization_state(
 ) -> dict[str, Any]:
     """Consume an untrusted state mapping once into an ordinary fixed dict."""
     try:
-        fixed_state = dict(source_state)
+        declared_length = source_state.__len__()
     except Exception as exc:
         raise ValueError(
-            "failed to materialize baseline initialization model state"
+            "failed to materialize baseline initialization model state "
+            "length"
         ) from exc
-    invalid_keys = [
-        key
-        for key in fixed_state
-        if type(key) is not str or not key
-    ]
-    if invalid_keys:
+    if type(declared_length) is not int or declared_length < 0:
         raise ValueError(
-            "baseline initialization model state contains an invalid key"
+            "baseline initialization model state length must be a "
+            "non-negative integer"
         )
+
+    try:
+        key_iterator = iter(source_state.keys())
+    except Exception as exc:
+        raise ValueError(
+            "failed to materialize baseline initialization model state keys"
+        ) from exc
+
+    declared_keys: list[str] = []
+    seen_keys: set[str] = set()
+    for position in range(declared_length + 1):
+        try:
+            key = next(key_iterator)
+        except StopIteration:
+            break
+        except Exception as exc:
+            raise ValueError(
+                "failed to materialize baseline initialization model state "
+                "keys"
+            ) from exc
+        if position == declared_length:
+            raise ValueError(
+                "baseline initialization model state length does not match "
+                "its keys"
+            )
+        if type(key) is not str or not key:
+            raise ValueError(
+                "baseline initialization model state contains an invalid key"
+            )
+        if key in seen_keys:
+            raise ValueError(
+                "baseline initialization model state contains a duplicate key"
+            )
+        seen_keys.add(key)
+        declared_keys.append(key)
+    if len(declared_keys) != declared_length:
+        raise ValueError(
+            "baseline initialization model state length does not match its "
+            "keys"
+        )
+
+    fixed_state: dict[str, Any] = {}
+    for key in declared_keys:
+        try:
+            fixed_state[key] = source_state[key]
+        except Exception as exc:
+            raise ValueError(
+                "failed to materialize baseline initialization model state "
+                f"value for key {key!r}"
+            ) from exc
     return fixed_state
 
 
