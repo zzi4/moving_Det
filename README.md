@@ -46,6 +46,64 @@ conda run -n moving-det-vru python -c \
 源 JPG/JSON 和 CSV 永远只读；manifest、缓存、checkpoint、预测、指标和面板均写到
 `runs/`。
 
+### 人工视频 benchmark 与 Universal-P2 初始参数
+
+正式实验固定使用同一份人工校核 benchmark 和同一份 Universal→P2 初始参数。
+先从原始标注 ZIP 与 NAS 图像冻结 873 帧 benchmark：
+
+```bash
+conda run -n moving-det-vru moving-det-vru build-human-benchmark \
+  --zip /home/stu1/Projects/moving_Det/label_data/videolabel_annotated_291frames_20260816.zip \
+  --image-root /mnt/nas/Processing_data/site19_22_sequence_7class \
+  --output runs/vrud-pilot/human-benchmark-20260816
+```
+
+再把已批准的 Universal 权重一次性转换并冻结为四类、P2–P5 的初始化文件：
+
+```bash
+conda run -n moving-det-vru moving-det-vru freeze-p2-init \
+  --weights /home/stu1/Projects/moving_Det/models/best_vru_universal.pt \
+  --output runs/vrud-pilot/universal-p2-init-20260816
+```
+
+正式 Baseline 从该冻结文件开始训练，不再直接读取原始 Universal checkpoint：
+
+```bash
+conda run -n moving-det-vru moving-det-vru train \
+  --model baseline \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/baseline \
+  --weights runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt
+```
+
+人工 benchmark 只能用于 `test`。置信度阈值必须先在原 validation 集冻结，然后原样
+用于人工 test；禁止在这 873 帧上选择或调整阈值：
+
+```bash
+conda run -n moving-det-vru moving-det-vru evaluate \
+  --model baseline \
+  --checkpoint runs/vrud-pilot/baseline/checkpoints/best.pt \
+  --manifest runs/vrud-pilot/manifest \
+  --split test \
+  --threshold runs/vrud-pilot/baseline-validation/threshold.json \
+  --human-benchmark runs/vrud-pilot/human-benchmark-20260816 \
+  --output runs/vrud-pilot/baseline-human-test
+```
+
+在正式训练前，可用真实冻结输入执行一次 GPU 前向自检：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run -n moving-det-vru python \
+  scripts/smoke_human_foundation.py \
+  --benchmark runs/vrud-pilot/human-benchmark-20260816 \
+  --p2-init runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt
+```
+
+这批人工序列大部分来自 Universal 模型曾用于生成伪标注的目标视频，因此并非与
+Universal 完全独立的数据。即使后续 MG 优于同初始化的 Baseline，可信结论也只能是
+“在当前目标域和固定人工 test 上的增量改进”，不能表述为对未见场景的通用泛化提升。
+
 先冻结 6/3/3 序列 manifest：
 
 ```bash
