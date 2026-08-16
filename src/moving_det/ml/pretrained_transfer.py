@@ -346,7 +346,7 @@ def _tensor_bytes(value: Tensor) -> bytes:
     tensor = value.detach().cpu().contiguous()
     if tensor.numel() == 0:
         return b""
-    return tensor.view(torch.uint8).numpy().tobytes()
+    return tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
 
 
 def _state_sha256(state: Mapping[str, Tensor]) -> str:

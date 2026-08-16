@@ -230,6 +230,45 @@ def test_fake_freeze_is_deterministic_scoped_and_strictly_loadable(
         provenance["loaded"][0]["name"] = "changed"
 
 
+def test_freeze_and_strict_load_support_transferred_scalar_int64(
+    tmp_path,
+    monkeypatch,
+):
+    source_weights = tmp_path / "universal.pt"
+    source_weights.write_bytes(b"approved synthetic Universal checkpoint")
+    _install_fake_models(monkeypatch, source_weights)
+    scalar_name = "model.000.weight"
+
+    def scalar_source_state(_stream):
+        state = _fake_source_state()
+        state[scalar_name] = torch.tensor(17, dtype=torch.int64)
+        return state
+
+    class ScalarP2Target(_FakeP2Target):
+        def __init__(self, nc: int) -> None:
+            super().__init__(nc)
+            self._state[scalar_name] = torch.tensor(0, dtype=torch.int64)
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_load_universal_state",
+        scalar_source_state,
+    )
+    monkeypatch.setattr(transfer_module, "_build_p2_target", ScalarP2Target)
+
+    artifact = freeze_p2_initialization(source_weights, tmp_path / "frozen")
+    frozen_state, provenance = load_frozen_p2_initialization(artifact)
+    strict_target = ScalarP2Target(4)
+    strict_target.load_state_dict(frozen_state, strict=True)
+
+    scalar = strict_target.state_dict()[scalar_name]
+    assert scalar.shape == torch.Size([])
+    assert scalar.dtype == torch.int64
+    assert scalar.item() == 17
+    assert provenance["transferred_tensors"] == 427
+    assert provenance["target_tensors"] == 859
+
+
 def test_freeze_source_loader_consumes_verified_snapshot_during_replacement(
     tmp_path,
     monkeypatch,
