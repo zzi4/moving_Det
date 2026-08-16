@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,9 @@ def synthetic_benchmark(tmp_path: Path) -> HumanBenchmark:
             sequence="sequence_a",
             frame=10,
             image_path=first_image,
-            annotation_member="synthetic/sequence_a/000010.json",
+            annotation_member=(
+                "synthetic/site19_sequence/sequence_a/000010.json"
+            ),
             image_sha256=hashlib.sha256(first_image.read_bytes()).hexdigest(),
         ),
         HumanFrame(
@@ -55,7 +58,9 @@ def synthetic_benchmark(tmp_path: Path) -> HumanBenchmark:
             sequence="sequence_a",
             frame=11,
             image_path=second_image,
-            annotation_member="synthetic/sequence_a/000011.json",
+            annotation_member=(
+                "synthetic/site19_sequence/sequence_a/000011.json"
+            ),
             image_sha256=hashlib.sha256(second_image.read_bytes()).hexdigest(),
         ),
     )
@@ -170,6 +175,12 @@ def test_freeze_rejects_unsafe_inputs_without_changing_existing_output(
             synthetic_benchmark.frames[0].image_path.parent,
         )
 
+    image_root = synthetic_benchmark.frames[0].image_path.parents[2]
+    root_child_output = image_root / "benchmark-artifacts"
+    with pytest.raises(ValueError, match="overlaps"):
+        freeze_human_benchmark(synthetic_benchmark, root_child_output)
+    assert not root_child_output.exists()
+
     non_empty = tmp_path / "non-empty"
     non_empty.mkdir()
     sentinel = non_empty / "sentinel.txt"
@@ -231,6 +242,80 @@ def test_freeze_rejects_truth_that_strict_loader_could_not_load(
     assert not (tmp_path / "invalid").exists()
 
 
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda value: replace(
+                value,
+                truths=(
+                    replace(
+                        value.truths[0],
+                        obb=OBB(100.0, 101.0, 4.0, 8.0, 0.25),
+                    ),
+                    value.truths[1],
+                ),
+            ),
+            "truth OBB.*canonical",
+        ),
+        (
+            lambda value: replace(
+                value,
+                truths=(
+                    replace(value.truths[0], pixel_speed=3.0),
+                    value.truths[1],
+                ),
+            ),
+            "derived motion mismatch",
+        ),
+        (
+            lambda value: replace(
+                value,
+                ignores=(replace(value.ignores[0], class_id=4),),
+            ),
+            "class ID",
+        ),
+        (
+            lambda value: replace(
+                value,
+                truths=(value.truths[0], replace(value.truths[1], frame=10)),
+            ),
+            "sorted unique identities",
+        ),
+        (
+            lambda value: replace(value, vehicle_counts={"car": True}),
+            "vehicle count.*integer",
+        ),
+        (
+            lambda value: replace(value, annotation_count=4),
+            "exact annotation count",
+        ),
+        (
+            lambda value: replace(
+                value,
+                annotation_count=2,
+                ignores=(replace(value.ignores[0], class_id=None),),
+                vehicle_counts={},
+            ),
+            "vehicle audit.*edge ignore",
+        ),
+    ],
+)
+def test_freeze_validates_complete_benchmark_before_staging(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    mutation,
+    error: str,
+) -> None:
+    output = tmp_path / "invalid"
+
+    with pytest.raises(ValueError, match=error):
+        freeze_human_benchmark(mutation(synthetic_benchmark), output)
+
+    assert not output.exists()
+    assert list(tmp_path.glob(".invalid.staging-*")) == []
+
+
 def _canonical_bytes(value: object) -> bytes:
     return (
         json.dumps(
@@ -262,6 +347,148 @@ def _rewrite_jsonl(output: Path, name: str, update) -> None:
         manifest["files"][name]["sha256"] = hashlib.sha256(content).hexdigest()
 
     _rewrite_manifest(output, refresh)
+
+
+@pytest.mark.parametrize("field", ["image", "annotation"])
+def test_load_rejects_frame_sources_bound_to_another_identity(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    field: str,
+) -> None:
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(synthetic_benchmark, output)
+
+    def swap_sources(rows):
+        if field == "image":
+            first = (rows[0]["image_path"], rows[0]["image_sha256"])
+            rows[0]["image_path"], rows[0]["image_sha256"] = (
+                rows[1]["image_path"],
+                rows[1]["image_sha256"],
+            )
+            rows[1]["image_path"], rows[1]["image_sha256"] = first
+        else:
+            rows[0]["annotation_member"], rows[1]["annotation_member"] = (
+                rows[1]["annotation_member"],
+                rows[0]["annotation_member"],
+            )
+
+    _rewrite_jsonl(output, "frames.jsonl", swap_sources)
+
+    with pytest.raises(ValueError, match="frame identity.*source"):
+        load_human_benchmark(output)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("pixel_speed", 999.0), ("visible_span", 1)],
+)
+def test_load_rederives_truth_motion_instead_of_trusting_rehashed_values(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    field: str,
+    value: object,
+) -> None:
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    _rewrite_jsonl(
+        output,
+        "ground-truth.jsonl",
+        lambda rows: rows[0].update({field: value}),
+    )
+
+    with pytest.raises(ValueError, match="derived motion mismatch"):
+        load_human_benchmark(output)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        (
+            lambda rows: rows[0].update(obb=[100.0, 101.0, 4.0, 8.0, 0.25]),
+            "truth OBB.*canonical",
+        ),
+        (
+            lambda rows: rows[0].update(
+                obb=[100.0, 101.0, 8.0, 4.0, math.pi]
+            ),
+            "truth OBB.*canonical",
+        ),
+        (
+            lambda rows: [
+                row.update(obb=[row["obb"][0] - 99.0, *row["obb"][1:]])
+                for row in rows
+            ],
+            "truth OBB.*inside",
+        ),
+    ],
+)
+def test_load_rejects_truth_geometry_outside_task1_semantics(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    mutation,
+    error: str,
+) -> None:
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    _rewrite_jsonl(output, "ground-truth.jsonl", mutation)
+
+    with pytest.raises(ValueError, match=error):
+        load_human_benchmark(output)
+
+
+@pytest.mark.parametrize(
+    ("points", "error"),
+    [
+        (
+            [[-1.0, 50.0], [3.0, 50.0], [4.0, 54.0], [-1.0, 54.0]],
+            "ignore.*rectangle",
+        ),
+        (
+            [[1.0, 50.0], [3.0, 50.0], [3.0, 54.0], [1.0, 54.0]],
+            "ignore.*outside",
+        ),
+    ],
+)
+def test_load_rejects_ignore_geometry_outside_task1_semantics(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    points: list[list[float]],
+    error: str,
+) -> None:
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    _rewrite_jsonl(
+        output,
+        "ignore.jsonl",
+        lambda rows: rows[0].update(points=points),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        load_human_benchmark(output)
+
+
+def test_load_enforces_exact_annotation_count_relation(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+) -> None:
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    audit_path = output / "vehicle-audit.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["annotation_count"] = 4
+    audit_content = _canonical_bytes(audit)
+    audit_path.write_bytes(audit_content)
+
+    def change_manifest(manifest):
+        manifest["annotation_count"] = 4
+        manifest["files"]["vehicle-audit.json"]["sha256"] = hashlib.sha256(
+            audit_content
+        ).hexdigest()
+
+    _rewrite_manifest(output, change_manifest)
+
+    with pytest.raises(ValueError, match="exact annotation count"):
+        load_human_benchmark(output)
 
 
 def test_load_round_trips_the_frozen_benchmark(

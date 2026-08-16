@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 import shutil
 import tempfile
@@ -11,12 +12,17 @@ from types import MappingProxyType
 from typing import Any, BinaryIO
 
 from moving_det.ml.human_benchmark import (
+    IMAGE_HEIGHT,
+    IMAGE_WIDTH,
     VEHICLE_LABELS,
     HumanBenchmark,
     HumanFrame,
     HumanIgnore,
     HumanTruth,
+    _derive_truth_motion,
+    _validated_points,
 )
+from moving_det.geometry.obb import obb_to_points, points_to_obb
 from moving_det.models import OBB
 
 
@@ -314,8 +320,12 @@ def _fsync_directory(path: Path) -> None:
 
 
 def freeze_human_benchmark(benchmark: HumanBenchmark, output: Path) -> Path:
+    image_root = _validate_benchmark_semantics(benchmark)
     children, inputs, _, _ = _record_payloads(benchmark)
-    destination = _validate_output(Path(output), inputs=inputs)
+    destination = _validate_output(
+        Path(output),
+        inputs=(*inputs, image_root),
+    )
     staging = Path(
         tempfile.mkdtemp(
             prefix=f".{destination.name}.staging-",
@@ -553,6 +563,43 @@ def _load_frames(content: bytes) -> tuple[HumanFrame, ...]:
     return tuple(frames)
 
 
+def _validate_frame_sources(frames: tuple[HumanFrame, ...]) -> Path:
+    if not frames:
+        raise ValueError("human benchmark must contain at least one frame")
+    image_roots: set[Path] = set()
+    for row in frames:
+        frame_stem = f"{row.frame:06d}"
+        expected_tail = (
+            f"{row.site}_sequence",
+            row.sequence,
+            f"{frame_stem}.jpg",
+        )
+        image_tail = (
+            row.image_path.parent.parent.name,
+            row.image_path.parent.name,
+            row.image_path.name,
+        )
+        member = PurePosixPath(row.annotation_member)
+        expected_member_tail = (
+            f"{row.site}_sequence",
+            row.sequence,
+            f"{frame_stem}.json",
+        )
+        if (
+            image_tail != expected_tail
+            or len(member.parts) < 3
+            or tuple(member.parts[-3:]) != expected_member_tail
+        ):
+            raise ValueError(
+                "frame identity does not match its image/annotation source: "
+                f"{(row.site, row.sequence, row.frame)}"
+            )
+        image_roots.add(row.image_path.parents[2])
+    if len(image_roots) != 1:
+        raise ValueError("frame identity sources do not share one image root")
+    return image_roots.pop()
+
+
 def _load_truths(
     content: bytes,
     *,
@@ -668,6 +715,86 @@ def _load_ignores(
     return tuple(ignores)
 
 
+def _validate_truth_motion(truths: tuple[HumanTruth, ...]) -> None:
+    derived = tuple(_derive_truth_motion(list(truths)))
+    if len(derived) != len(truths):
+        raise ValueError("truth derived motion row count mismatch")
+    for stored, expected in zip(truths, derived, strict=True):
+        if (
+            stored.pixel_speed != expected.pixel_speed
+            or stored.visible_span != expected.visible_span
+        ):
+            raise ValueError(
+                "truth derived motion mismatch: "
+                f"{(stored.site, stored.sequence, stored.frame, stored.track_id)}"
+            )
+
+
+def _validate_truth_geometry(truths: tuple[HumanTruth, ...]) -> None:
+    for row in truths:
+        points = obb_to_points(row.obb)
+        try:
+            validated_points = _validated_points(points.tolist())
+            canonical = points_to_obb(validated_points)
+        except ValueError as exc:
+            raise ValueError("truth OBB must be a non-degenerate rectangle") from exc
+        stored_values = (
+            row.obb.cx,
+            row.obb.cy,
+            row.obb.width,
+            row.obb.height,
+            row.obb.theta,
+        )
+        canonical_values = (
+            canonical.cx,
+            canonical.cy,
+            canonical.width,
+            canonical.height,
+            canonical.theta,
+        )
+        if (
+            row.obb.width < row.obb.height
+            or not -math.pi / 2 <= row.obb.theta < math.pi / 2
+            or any(
+                not math.isclose(
+                    stored,
+                    expected,
+                    rel_tol=1e-12,
+                    abs_tol=1e-9,
+                )
+                for stored, expected in zip(
+                    stored_values,
+                    canonical_values,
+                    strict=True,
+                )
+            )
+        ):
+            raise ValueError("truth OBB width/theta must use canonical form")
+        if any(
+            x < 0 or x >= IMAGE_WIDTH or y < 0 or y >= IMAGE_HEIGHT
+            for x, y in validated_points
+        ):
+            raise ValueError("truth OBB points must all remain inside the image")
+
+
+def _validate_ignore_geometry(ignores: tuple[HumanIgnore, ...]) -> None:
+    for row in ignores:
+        try:
+            points = _validated_points(
+                [[x, y] for x, y in row.points]
+            )
+            points_to_obb(points)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "ignore geometry must be a finite strictly convex rectangle"
+            ) from exc
+        if not any(
+            x < 0 or x >= IMAGE_WIDTH or y < 0 or y >= IMAGE_HEIGHT
+            for x, y in points
+        ):
+            raise ValueError("ignore rectangle must contain an outside-image point")
+
+
 def _load_vehicle_audit(
     content: bytes,
     *,
@@ -720,6 +847,131 @@ def _validate_track_identities(
         previous = track_classes.setdefault(key, row.class_id)
         if previous != row.class_id:
             raise ValueError(f"class drift for benchmark track: {key}")
+
+
+def _validate_benchmark_semantics(benchmark: HumanBenchmark) -> Path:
+    if not isinstance(benchmark, HumanBenchmark):
+        raise ValueError("benchmark must be a HumanBenchmark")
+    if not isinstance(benchmark.source_zip, Path):
+        raise ValueError("source ZIP path must be a Path")
+    _regular_file(benchmark.source_zip, label="source ZIP")
+    _sha256_value(
+        benchmark.source_zip_sha256,
+        field="source ZIP fingerprint",
+    )
+    annotation_count = _integer(
+        benchmark.annotation_count,
+        field="annotation_count",
+        minimum=0,
+    )
+
+    if not isinstance(benchmark.frames, tuple):
+        raise ValueError("benchmark frames must be a tuple")
+    frame_identities: list[tuple[str, str, int]] = []
+    for row in benchmark.frames:
+        if not isinstance(row, HumanFrame):
+            raise ValueError("benchmark frame rows must be HumanFrame values")
+        site = _string(row.site, field="frame site")
+        sequence = _string(row.sequence, field="frame sequence")
+        frame = _integer(row.frame, field="frame number", minimum=0)
+        if not isinstance(row.image_path, Path):
+            raise ValueError("image path must be a Path")
+        _regular_file(row.image_path, label="benchmark image")
+        _sha256_value(row.image_sha256, field="image SHA-256")
+        _string(row.annotation_member, field="annotation member")
+        frame_identities.append((site, sequence, frame))
+    if (
+        frame_identities != sorted(frame_identities)
+        or len(frame_identities) != len(set(frame_identities))
+    ):
+        raise ValueError("frame records must have sorted unique identities")
+    image_root = _validate_frame_sources(benchmark.frames)
+    frame_identity_set = frozenset(frame_identities)
+
+    if not isinstance(benchmark.truths, tuple):
+        raise ValueError("benchmark truths must be a tuple")
+    truth_identities: list[tuple[str, str, int, int]] = []
+    for row in benchmark.truths:
+        if not isinstance(row, HumanTruth):
+            raise ValueError("benchmark truth rows must be HumanTruth values")
+        site = _string(row.site, field="truth site")
+        sequence = _string(row.sequence, field="truth sequence")
+        frame = _integer(row.frame, field="truth frame", minimum=0)
+        if (site, sequence, frame) not in frame_identity_set:
+            raise ValueError("truth does not reference a benchmark frame")
+        track_id = _integer(row.track_id, field="truth track_id")
+        if not isinstance(row.obb, OBB):
+            raise ValueError("truth obb must be an OBB")
+        _truth_payload(row)
+        truth_identities.append((site, sequence, frame, track_id))
+    if (
+        truth_identities != sorted(truth_identities)
+        or len(truth_identities) != len(set(truth_identities))
+    ):
+        raise ValueError("truth records must have sorted unique identities")
+    _validate_truth_geometry(benchmark.truths)
+    _validate_truth_motion(benchmark.truths)
+
+    if not isinstance(benchmark.ignores, tuple):
+        raise ValueError("benchmark ignores must be a tuple")
+    ignore_identities: list[tuple[str, str, int, int]] = []
+    for row in benchmark.ignores:
+        if not isinstance(row, HumanIgnore):
+            raise ValueError("benchmark ignore rows must be HumanIgnore values")
+        site = _string(row.site, field="ignore site")
+        sequence = _string(row.sequence, field="ignore sequence")
+        frame = _integer(row.frame, field="ignore frame", minimum=0)
+        if (site, sequence, frame) not in frame_identity_set:
+            raise ValueError("ignore does not reference a benchmark frame")
+        track_id = _integer(row.track_id, field="ignore track_id")
+        _class_id(row.class_id, allow_none=True)
+        if (
+            not isinstance(row.points, tuple)
+            or len(row.points) != 4
+            or any(
+                not isinstance(point, tuple) or len(point) != 2
+                for point in row.points
+            )
+        ):
+            raise ValueError("ignore points must be four coordinate tuples")
+        ignore_identities.append((site, sequence, frame, track_id))
+    if (
+        ignore_identities != sorted(ignore_identities)
+        or len(ignore_identities) != len(set(ignore_identities))
+    ):
+        raise ValueError("ignore records must have sorted unique identities")
+    _validate_ignore_geometry(benchmark.ignores)
+    _validate_track_identities(benchmark.truths, benchmark.ignores)
+
+    if not isinstance(benchmark.vehicle_counts, Mapping):
+        raise ValueError("vehicle_counts must be a mapping")
+    vehicle_total = 0
+    for label, count in benchmark.vehicle_counts.items():
+        if label not in VEHICLE_LABELS:
+            raise ValueError(f"unsupported vehicle audit label: {label!r}")
+        vehicle_total += _integer(
+            count,
+            field=f"vehicle count for {label}",
+            minimum=0,
+        )
+    vehicle_ignore_count = sum(
+        row.class_id is None for row in benchmark.ignores
+    )
+    if vehicle_ignore_count > vehicle_total:
+        raise ValueError(
+            "vehicle audit cannot contain fewer vehicles than edge ignores"
+        )
+    expected_annotation_count = (
+        len(benchmark.truths)
+        + len(benchmark.ignores)
+        + vehicle_total
+        - vehicle_ignore_count
+    )
+    if annotation_count != expected_annotation_count:
+        raise ValueError(
+            "exact annotation count relation is inconsistent with benchmark rows"
+        )
+    return image_root
 
 
 def load_human_benchmark(output: Path) -> HumanBenchmark:
@@ -780,14 +1032,7 @@ def load_human_benchmark(output: Path) -> HumanBenchmark:
         contents["vehicle-audit.json"],
         annotation_count=annotation_count,
     )
-    _validate_track_identities(truths, ignores)
-
-    vehicle_total = sum(vehicle_counts.values())
-    minimum_annotations = len(truths) + max(len(ignores), vehicle_total)
-    maximum_annotations = len(truths) + len(ignores) + vehicle_total
-    if not minimum_annotations <= annotation_count <= maximum_annotations:
-        raise ValueError("annotation count total is inconsistent with benchmark rows")
-    return HumanBenchmark(
+    benchmark = HumanBenchmark(
         source_zip=source_zip,
         source_zip_sha256=source_zip_sha256,
         annotation_count=annotation_count,
@@ -796,6 +1041,8 @@ def load_human_benchmark(output: Path) -> HumanBenchmark:
         ignores=ignores,
         vehicle_counts=vehicle_counts,
     )
+    _validate_benchmark_semantics(benchmark)
+    return benchmark
 
 
 def human_benchmark_fingerprint(output: Path) -> str:
