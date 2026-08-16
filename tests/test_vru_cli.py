@@ -1008,6 +1008,110 @@ def test_main_rejects_unpaired_overfit_threshold_and_baseline_cache_arguments():
     assert baseline_train_cache.value.code == 2
 
 
+def test_human_evaluation_arguments_enforce_test_mg_and_frozen_threshold(capsys):
+    common = (
+        "evaluate --checkpoint best.pt --manifest manifest "
+        "--output evaluation"
+    )
+
+    with pytest.raises(SystemExit) as validation:
+        main(
+            f"{common} --model mg_vtod --split validation "
+            "--human-benchmark human".split(),
+            handlers={"evaluate": lambda args: 0},
+        )
+    assert "--human-benchmark is only valid for test evaluation" in (
+        capsys.readouterr().err
+    )
+
+    with pytest.raises(SystemExit) as baseline:
+        main(
+            f"{common} --model baseline --split test --threshold threshold.json "
+            "--human-benchmark human --motion-off".split(),
+            handlers={"evaluate": lambda args: 0},
+        )
+    assert "--motion-off requires --model mg_vtod" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as threshold:
+        main(
+            f"{common} --model mg_vtod --split test "
+            "--human-benchmark human".split(),
+            handlers={"evaluate": lambda args: 0},
+        )
+    assert "--threshold is required for test evaluation" in capsys.readouterr().err
+
+    assert (validation.value.code, baseline.value.code, threshold.value.code) == (
+        2,
+        2,
+        2,
+    )
+
+
+def test_human_benchmark_path_and_motion_flag_reach_evaluator_request(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"synthetic checkpoint")
+    threshold = tmp_path / "threshold.json"
+    threshold.write_bytes(b"{}\n")
+    benchmark = tmp_path / "human-benchmark"
+    benchmark.mkdir()
+    output = tmp_path / "human-evaluation"
+    args = build_parser().parse_args(
+        [
+            "evaluate",
+            "--model",
+            "mg_vtod",
+            "--checkpoint",
+            str(checkpoint),
+            "--manifest",
+            str(manifest),
+            "--split",
+            "test",
+            "--threshold",
+            str(threshold),
+            "--human-benchmark",
+            str(benchmark),
+            "--motion-off",
+            "--output",
+            str(output),
+        ]
+    )
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "human_benchmark_fingerprint",
+        lambda path: "d" * 64,
+    )
+    requests = []
+
+    def stop_after_request(request):
+        requests.append(request)
+        raise RuntimeError("stop after request capture")
+
+    with pytest.raises(RuntimeError, match="stop after request capture"):
+        run_evaluate(
+            args,
+            config_loader=lambda path: replace(
+                load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+                output_root=tmp_path / "runs",
+            ),
+            evaluator=stop_after_request,
+        )
+
+    assert requests[0].human_benchmark == benchmark
+    assert requests[0].motion_off is True
+
+
 def test_main_dispatches_only_the_selected_handler(capsys):
     calls = []
 
@@ -2019,6 +2123,61 @@ def test_cli_lstfe_alignment_map_consumes_only_learned_offset_diagnostic(
 
 
 @REQUIRES_TORCH
+def test_motion_off_human_diagnostic_skips_motion_strength(tmp_path, monkeypatch):
+    import torch
+
+    import moving_det.ml.motion_strength as motion_strength
+    from moving_det.vrud.tiling import Tile
+
+    class DiagnosticModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+            self._motion_enabled = False
+
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        tile_size=8,
+        tile_overlap=0,
+    )
+    offsets = (-4, -2, 0, 2, 4)
+    clip = {
+        "frames": torch.ones((5, 3, 8, 8), dtype=torch.float32),
+        "valid": torch.ones((5,), dtype=torch.bool),
+        "transforms": torch.eye(2, 3).repeat(5, 1, 1),
+        "zero_index": 2,
+        "frame": 31,
+        "metadata": {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "frame_shape": (8, 8),
+            "offsets": offsets,
+            "support_paths": tuple(f"/source/{offset}.jpg" for offset in offsets),
+        },
+    }
+    monkeypatch.setattr(
+        motion_strength,
+        "compute_motion_strength",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("Motion-Off diagnostic computed motion strength")
+        ),
+    )
+
+    diagnostic = _extract_model_diagnostic(
+        DiagnosticModel(),
+        clip,
+        "mg_vtod",
+        cfg,
+        diagnostic_tile=Tile(0, 0, 8, 8),
+        include_motion_enabled=True,
+    )
+
+    assert diagnostic["motion_enabled"] is False
+    assert np.count_nonzero(diagnostic["motion_map"]) == 0
+
+
+@REQUIRES_TORCH
 @pytest.mark.parametrize(
     "defect",
     ("missing", "wrong-shape", "nonfinite", "negative"),
@@ -2251,6 +2410,242 @@ def test_real_evaluation_audit_detects_manifest_gt_missing_from_corrected_frame(
         _evaluate_real(request)
 
     assert not model.training
+
+
+@REQUIRES_TORCH
+def test_human_evaluation_routes_manual_truth_and_nas_image_only(
+    tmp_path,
+    monkeypatch,
+):
+    import torch
+
+    import moving_det.ml.factory as factory
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+    import moving_det.ml.human_evaluation as human_evaluation
+    import moving_det.ml.inference as inference
+    import moving_det.ml.training as training
+    import moving_det.vru_cli as vru_cli
+    import moving_det.vrud.alignment as alignment
+    import moving_det.vrud.index as index
+    from moving_det.ml.human_benchmark import HumanBenchmark, HumanFrame, HumanTruth
+    from moving_det.models import OBB
+
+    image_path = (
+        tmp_path / "images" / "site19_sequence" / "sequence_a" / "000031.jpg"
+    )
+    benchmark = HumanBenchmark(
+        source_zip=tmp_path / "manual.zip",
+        source_zip_sha256="c" * 64,
+        annotation_count=1,
+        frames=(
+            HumanFrame(
+                site="site19",
+                sequence="sequence_a",
+                frame=31,
+                image_path=image_path,
+                annotation_member="manual/000031.json",
+                image_sha256="d" * 64,
+            ),
+        ),
+        truths=(
+            HumanTruth(
+                site="site19",
+                sequence="sequence_a",
+                frame=31,
+                class_id=3,
+                track_id=7,
+                obb=OBB(4.0, 4.0, 4.0, 2.0, 0.0),
+                pixel_speed=2.5,
+                visible_span=6,
+            ),
+        ),
+        ignores=(),
+        vehicle_counts={},
+    )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        metadata_root=tmp_path / "metadata",
+        tile_size=1024,
+        tile_overlap=128,
+    )
+    threshold = tmp_path / "threshold.json"
+    threshold.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model_name": "mg_vtod",
+                "split": "validation",
+                "manifest_sha256": "a" * 64,
+                "checkpoint_sha256": "b" * 64,
+                "threshold": 0.5,
+                "f1_riou_025": 0.0,
+                "false_detections_per_frame": 0.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    request = EvaluationRequest(
+        cfg=cfg,
+        model_name="mg_vtod",
+        checkpoint=tmp_path / "best.pt",
+        manifest_dir=tmp_path / "manifest",
+        split="test",
+        threshold_path=threshold,
+        alignment_cache=tmp_path / "alignment-cache",
+        manifest_sha256="a" * 64,
+        checkpoint_sha256="b" * 64,
+        human_benchmark=tmp_path / "human-benchmark",
+    )
+
+    class HumanModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+            self.motion_enabled = None
+
+        def set_motion_enabled(self, enabled):
+            self.motion_enabled = enabled
+
+    model = HumanModel()
+    snapshot = SimpleNamespace(fingerprint="e" * 64)
+    loaded_records = []
+    evaluated = []
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    monkeypatch.setattr(factory, "create_model", lambda *values: model)
+    monkeypatch.setattr(
+        training,
+        "load_experiment_checkpoint",
+        lambda *values: {"model_name": "mg_vtod"},
+    )
+    monkeypatch.setattr(
+        alignment,
+        "AlignmentCache",
+        lambda path: SimpleNamespace(snapshot=lambda: snapshot),
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_verify_alignment_cache_summary",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_verify_checkpoint_alignment_provenance",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        vru_cli,
+        "_evaluation_frame_records",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("human evaluation must not use manifest frame selection")
+        ),
+    )
+
+    def load_clip(_cfg, record, **_kwargs):
+        loaded_records.append(dict(record))
+        return {
+            "frames": torch.zeros((5, 3, 8, 8)),
+            "valid": torch.ones((5,), dtype=torch.bool),
+            "transforms": torch.eye(2, 3).repeat(5, 1, 1),
+            "zero_index": 2,
+            "frame": 31,
+            "metadata": {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "offsets": tuple(cfg.mg_offsets),
+                "support_paths": (None, None, str(image_path), None, None),
+                "frame_shape": (8, 8),
+            },
+        }
+
+    monkeypatch.setattr(vru_cli, "_load_full_frame_clip", load_clip)
+    monkeypatch.setattr(inference, "infer_full_frame", lambda *values: ())
+    monkeypatch.setattr(
+        human_evaluation,
+        "evaluate_human_predictions",
+        lambda predictions, received, received_cfg: evaluated.append(
+            (predictions, received, received_cfg)
+        )
+        or {
+            "per_class": {},
+            "per_size": {},
+            "per_pixel_speed": {},
+            "per_visible_span": {},
+            "per_track": {},
+            "audit": {
+                "edge_ignore_count": 0,
+                "suppressed_prediction_count": 0,
+                "metadata_error_count": 0,
+                "geometry_error_count": 0,
+            },
+        },
+    )
+    for old_loader in (
+        (index, "load_track_index"),
+        (index, "load_corrected_frame"),
+        (vru_cli, "_load_frame_velocities"),
+    ):
+        monkeypatch.setattr(
+            *old_loader,
+            lambda *args: (_ for _ in ()).throw(
+                AssertionError("human evaluation touched old GT data")
+            ),
+        )
+    monkeypatch.setattr(
+        vru_cli,
+        "_extract_model_diagnostic",
+        lambda *args, **kwargs: {},
+    )
+
+    artifacts = _evaluate_real(request)
+
+    assert loaded_records == [
+        {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "center_frame": 31,
+            "image_path": image_path,
+        }
+    ]
+    assert evaluated[0][1].truths[0].class_id == 3
+    assert evaluated[0][2]["threshold"] == 0.5
+    assert artifacts.ground_truth[0]["class_id"] == 3
+    assert artifacts.ground_truth[0]["pixel_speed_per_frame"] == 2.5
+    assert artifacts.ground_truth[0]["visible_span"] == 6
+    assert artifacts.detection_frame_keys == artifacts.continuity_frame_keys
+    assert model.motion_enabled is True
+
+
+@REQUIRES_TORCH
+def test_full_frame_clip_uses_human_frame_image_path(tmp_path):
+    image_path = (
+        tmp_path / "nas" / "site19_sequence" / "sequence_a" / "000031.jpg"
+    )
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(image_path)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    clip = vru_cli_module._load_full_frame_clip(
+        cfg,
+        {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "center_frame": 31,
+            "image_path": image_path,
+        },
+        offsets=(0,),
+        cache=None,
+    )
+
+    assert clip["metadata"]["support_paths"] == (str(image_path),)
+    assert clip["metadata"]["frame_shape"] == (8, 8)
 
 
 @REQUIRES_TORCH
@@ -3870,6 +4265,264 @@ def _evaluation_request(tmp_path: Path) -> EvaluationRequest:
     )
 
 
+def _fixed_human_benchmark(tmp_path: Path):
+    from moving_det.ml.human_benchmark import (
+        HumanBenchmark,
+        HumanFrame,
+        HumanIgnore,
+        HumanTruth,
+    )
+    from moving_det.models import OBB
+
+    specifications = (
+        ("site19", "DJI_20240919093341_0002_V", 2926, 3216),
+        ("site22", "DJI_20240719183036_0006_V", 3331, 3621),
+        ("site22", "DJI_20240719224127_0006_V", 1865, 2155),
+    )
+    frames = tuple(
+        HumanFrame(
+            site=site,
+            sequence=sequence,
+            frame=frame,
+            image_path=(
+                tmp_path
+                / "images"
+                / f"{site}_sequence"
+                / sequence
+                / f"{frame:06d}.jpg"
+            ),
+            annotation_member=f"manual/{site}/{sequence}/{frame:06d}.json",
+            image_sha256=hashlib.sha256(
+                f"{site}:{sequence}:{frame}".encode()
+            ).hexdigest(),
+        )
+        for site, sequence, first, last in specifications
+        for frame in range(first, last + 1)
+    )
+    truths = tuple(
+        HumanTruth(
+            site=frame.site,
+            sequence=frame.sequence,
+            frame=frame.frame,
+            class_id=class_id,
+            track_id=class_id + 1,
+            obb=OBB(64.0 + class_id, 48.0, 20.0, 8.0, 0.2),
+            pixel_speed=0.5 + class_id,
+            visible_span=4 + class_id,
+        )
+        for class_id, frame in enumerate((frames[0], frames[1], frames[291], frames[582]))
+    )
+    ignores = tuple(
+        HumanIgnore(
+            site=frame.site,
+            sequence=frame.sequence,
+            frame=frame.frame,
+            class_id=index % 4,
+            track_id=1000 + index,
+            points=((0.0, 0.0), (16.0, 0.0), (16.0, 16.0), (0.0, 16.0)),
+        )
+        for index, frame in enumerate(frames[:334])
+    )
+    return HumanBenchmark(
+        source_zip=tmp_path / "manual.zip",
+        source_zip_sha256="c" * 64,
+        annotation_count=len(truths) + len(ignores),
+        frames=frames,
+        truths=truths,
+        ignores=ignores,
+        vehicle_counts={},
+    )
+
+
+def _human_evaluation_request_and_bundle(tmp_path: Path):
+    benchmark = _fixed_human_benchmark(tmp_path)
+    base = _evaluation_request(tmp_path)
+    request = replace(
+        base,
+        model_name="mg_vtod",
+        split="test",
+        threshold_path=tmp_path / "threshold.json",
+        alignment_cache=tmp_path / "alignment-cache",
+        human_benchmark=tmp_path / "human-benchmark",
+    )
+    frame_keys = tuple(
+        {"site": row.site, "sequence": row.sequence, "frame": row.frame}
+        for row in benchmark.frames
+    )
+    truth_rows = tuple(
+        {
+            "schema_version": 3,
+            "site": row.site,
+            "sequence": row.sequence,
+            "frame": row.frame,
+            "class_id": row.class_id,
+            "track_id": row.track_id,
+            "pixel_speed_per_frame": row.pixel_speed,
+            "visible_span": row.visible_span,
+            "obb": [
+                row.obb.cx,
+                row.obb.cy,
+                row.obb.width,
+                row.obb.height,
+                row.obb.theta,
+            ],
+        }
+        for row in benchmark.truths
+    )
+    bundle = EvaluationArtifacts(
+        detection_frame_keys=frame_keys,
+        continuity_frame_keys=frame_keys,
+        metrics={
+            "per_class": {},
+            "per_size": {},
+            "per_speed": {},
+            "per_pixel_speed": {},
+            "per_visible_span": {},
+            "per_track": {},
+        },
+        predictions=(),
+        ground_truth=truth_rows,
+        audit={
+            "edge_ignore_count": 334,
+            "suppressed_prediction_count": 0,
+            "metadata_error_count": 0,
+            "geometry_error_count": 0,
+        },
+        threshold_evidence=None,
+        diagnostics=(),
+        alignment_cache_sha256="d" * 64,
+    )
+    return benchmark, request, bundle
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    (
+        ("872-frames", "exactly 873"),
+        ("missing-speed", "pixel_speed_per_frame"),
+        ("extra-truth", "declared by the human benchmark"),
+    ),
+)
+def test_human_artifacts_reject_inexact_universe_and_truth(
+    tmp_path,
+    monkeypatch,
+    defect,
+    message,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    if defect == "872-frames":
+        bundle = replace(
+            bundle,
+            detection_frame_keys=bundle.detection_frame_keys[:-1],
+            continuity_frame_keys=bundle.continuity_frame_keys[:-1],
+        )
+    elif defect == "missing-speed":
+        row = dict(bundle.ground_truth[0])
+        row.pop("pixel_speed_per_frame")
+        bundle = replace(bundle, ground_truth=(row, *bundle.ground_truth[1:]))
+    elif defect == "extra-truth":
+        extra = {**dict(bundle.ground_truth[0]), "track_id": 99999}
+        bundle = replace(bundle, ground_truth=(*bundle.ground_truth, extra))
+
+    with pytest.raises(WorkflowError, match=message):
+        _validate_evaluation_artifacts(bundle, request)
+
+
+def test_human_artifacts_reject_motion_diagnostic_provenance_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    request = replace(request, motion_off=True)
+    frame = benchmark.frames[0]
+    offsets = tuple(request.cfg.mg_offsets)
+    diagnostic = {
+        "schema_version": 1,
+        "site": frame.site,
+        "sequence": frame.sequence,
+        "frame": frame.frame,
+        "frame_shape": [2160, 3840],
+        "image_root": str(Path(request.cfg.image_root).resolve()),
+        "offsets": list(offsets),
+        "support_paths": [
+            str(
+                Path(request.cfg.image_root).resolve()
+                / f"{frame.site}_sequence"
+                / frame.sequence
+                / f"{frame.frame + offset:06d}.jpg"
+            )
+            for offset in offsets
+        ],
+        "motion_map": [[0.0] * 320 for _ in range(180)],
+        "selected_long_index": -1,
+        "short_alignment_magnitude": [[0.0] * 320 for _ in range(180)],
+        "diagnostic_tile_xywh": [0, 0, 1024, 1024],
+        "motion_enabled": True,
+    }
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+
+    with pytest.raises(WorkflowError, match="motion provenance"):
+        _validate_evaluation_artifacts(
+            replace(bundle, diagnostics=(diagnostic,)),
+            request,
+        )
+
+
+def test_human_artifacts_accept_exact_fixed_benchmark_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+
+    validated = _validate_evaluation_artifacts(bundle, request)
+
+    assert len(validated.detection_frame_keys) == 873
+    assert validated.detection_frame_keys == validated.continuity_frame_keys
+    assert validated.ground_truth == bundle.ground_truth
+    assert validated.audit["edge_ignore_count"] == 334
+
+
+def test_human_artifacts_bind_run_image_root_to_human_frames(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    request = replace(
+        request,
+        cfg=replace(request.cfg, image_root=tmp_path / "different-images"),
+    )
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+
+    with pytest.raises(WorkflowError, match="image root provenance"):
+        _validate_evaluation_artifacts(bundle, request)
+
+
 def _valid_diagnostic(tmp_path: Path) -> dict[str, object]:
     image_root = (tmp_path / "images").resolve()
     center = image_root / "site19_sequence" / "sequence_a" / "000031.jpg"
@@ -4615,6 +5268,203 @@ def test_evaluate_test_records_frozen_threshold_source_and_never_reselects(
     assert not (output / "threshold.json").exists()
 
 
+def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, _, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"synthetic MG checkpoint")
+    threshold = tmp_path / "threshold.json"
+    threshold.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model_name": "mg_vtod",
+                "split": "validation",
+                "manifest_sha256": _manifest_fingerprint(manifest),
+                "checkpoint_sha256": hashlib.sha256(
+                    checkpoint.read_bytes()
+                ).hexdigest(),
+                "threshold": 0.42,
+                "f1_riou_025": 0.75,
+                "false_detections_per_frame": 0.5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    human_root = tmp_path / "human-benchmark"
+    human_root.mkdir()
+    output = tmp_path / "human-run"
+    args = build_parser().parse_args(
+        [
+            "evaluate",
+            "--model",
+            "mg_vtod",
+            "--checkpoint",
+            str(checkpoint),
+            "--manifest",
+            str(manifest),
+            "--split",
+            "test",
+            "--threshold",
+            str(threshold),
+            "--alignment-cache",
+            str(tmp_path / "alignment-cache"),
+            "--human-benchmark",
+            str(human_root),
+            "--motion-off",
+            "--output",
+            str(output),
+        ]
+    )
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "human_benchmark_fingerprint",
+        lambda path: "f" * 64,
+    )
+
+    run_evaluate(
+        args,
+        config_loader=lambda path: replace(
+            load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+            image_root=tmp_path / "images",
+            metadata_root=tmp_path / "metadata",
+            output_root=tmp_path / "runs",
+        ),
+        evaluator=lambda request: bundle,
+        provenance_collector=lambda *_: {
+            "git_commit": "f" * 40,
+            "git_dirty": False,
+            "environment": _strict_run_environment(),
+            "started_at_utc": "2026-08-07T02:00:00.000000Z",
+            "finished_at_utc": "2026-08-07T02:00:01.000000Z",
+            "duration_seconds": 1.0,
+        },
+    )
+
+    run = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    truth = json.loads((output / "ground-truth.jsonl").read_text().splitlines()[0])
+    assert run["human_benchmark_sha256"] == "f" * 64
+    assert run["motion_off"] is True
+    assert run["artifact_schema"]["ground-truth.jsonl"] == 3
+    assert truth["schema_version"] == 3
+    assert truth["pixel_speed_per_frame"] == 0.5
+    assert truth["visible_span"] == 4
+    assert run["audit"] == {
+        "edge_ignore_count": 334,
+        "suppressed_prediction_count": 0,
+        "metadata_error_count": 0,
+        "geometry_error_count": 0,
+    }
+    loaded_run, _, loaded_root = vru_cli_module._load_verified_evaluation_run(
+        output
+    )
+    assert loaded_run == run
+    assert loaded_root == output
+
+
+def test_human_evaluate_rejects_fingerprint_change_before_atomic_publication(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, _, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"synthetic MG checkpoint")
+    threshold = tmp_path / "threshold.json"
+    threshold.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "model_name": "mg_vtod",
+                "split": "validation",
+                "manifest_sha256": _manifest_fingerprint(manifest),
+                "checkpoint_sha256": hashlib.sha256(
+                    checkpoint.read_bytes()
+                ).hexdigest(),
+                "threshold": 0.42,
+                "f1_riou_025": 0.75,
+                "false_detections_per_frame": 0.5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    human_root = tmp_path / "human-benchmark"
+    human_root.mkdir()
+    output = tmp_path / "human-run"
+    output.mkdir()
+    sentinel = output / "published.txt"
+    sentinel.write_text("previous run\n", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "evaluate",
+            "--model",
+            "mg_vtod",
+            "--checkpoint",
+            str(checkpoint),
+            "--manifest",
+            str(manifest),
+            "--split",
+            "test",
+            "--threshold",
+            str(threshold),
+            "--alignment-cache",
+            str(tmp_path / "alignment-cache"),
+            "--human-benchmark",
+            str(human_root),
+            "--output",
+            str(output),
+        ]
+    )
+    fingerprints = iter(("f" * 64, "e" * 64, "e" * 64))
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "human_benchmark_fingerprint",
+        lambda path: next(fingerprints),
+    )
+
+    with pytest.raises(WorkflowError, match="fingerprint changed"):
+        run_evaluate(
+            args,
+            config_loader=lambda path: replace(
+                load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+                image_root=tmp_path / "images",
+                metadata_root=tmp_path / "metadata",
+                output_root=tmp_path / "runs",
+            ),
+            evaluator=lambda request: bundle,
+            provenance_collector=lambda *_: {
+                "git_commit": "f" * 40,
+                "git_dirty": False,
+                "environment": _strict_run_environment(),
+                "started_at_utc": "2026-08-07T02:00:00.000000Z",
+                "finished_at_utc": "2026-08-07T02:00:01.000000Z",
+                "duration_seconds": 1.0,
+            },
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "previous run\n"
+    assert not list(tmp_path.glob(".human-run.staging.*"))
+
+
 def _gate_metrics(*, improved: bool) -> dict[str, object]:
     return {
         "map50": 0.50 if not improved else 0.51,
@@ -4841,6 +5691,20 @@ def _strict_compare_args(tmp_path: Path) -> tuple[argparse.Namespace, dict[str, 
         ]
     )
     return args, roots
+
+
+def test_normal_mg_run_rejects_motion_off_provenance(tmp_path):
+    root = tmp_path / "mg_vtod"
+    _write_strict_evaluation_run(
+        root,
+        "mg_vtod",
+        source_parent=tmp_path / "sources",
+    )
+    run = _read_strict_run(root)
+    run["motion_off"] = True
+
+    with pytest.raises(WorkflowError, match="schema fields"):
+        _validate_evaluation_run_schema(run)
 
 
 @pytest.mark.parametrize(

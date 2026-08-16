@@ -420,6 +420,84 @@ def test_invalid_support_reduces_to_exact_rgb_detector_path():
         torch.testing.assert_close(actual_feature, expected_feature)
 
 
+def test_motion_off_bypasses_temporal_branch(monkeypatch):
+    import moving_det.ml.models.mg_vtod as mg_vtod_module
+
+    model = MGVTODOBB(weights=None).eval()
+    batch = _synthetic_mg_batch(moving=True)
+    original_extract = mg_vtod_module.extract_backbone_features
+    original_execute = mg_vtod_module.execute_yolo_graph
+    captured: list[tuple[Tensor, Tensor]] = []
+    rgb_features: list[Tensor] = []
+    motion_calls = 0
+    motion_stem_calls = 0
+    fusion_calls = 0
+
+    def nonzero_motion(frames, valid, transforms):
+        nonlocal motion_calls
+        motion_calls += 1
+        return torch.ones(
+            frames.shape[0],
+            1,
+            frames.shape[-2],
+            frames.shape[-1],
+            dtype=frames.dtype,
+            device=frames.device,
+        )
+
+    def capture_rgb(detector, image, indices):
+        features = original_extract(detector, image, indices)
+        rgb_features.append(features[2].detach().clone())
+        return features
+
+    def capture_replacement(detector, image, replacements=None):
+        replacement = replacements[2].detach().clone()
+        captured.append((rgb_features[-1], replacement))
+        return original_execute(detector, image, replacements)
+
+    monkeypatch.setattr(mg_vtod_module, "compute_motion_strength", nonzero_motion)
+    monkeypatch.setattr(mg_vtod_module, "extract_backbone_features", capture_rgb)
+    monkeypatch.setattr(mg_vtod_module, "execute_yolo_graph", capture_replacement)
+
+    def count_stem(*_args):
+        nonlocal motion_stem_calls
+        motion_stem_calls += 1
+
+    def count_fusion(*_args):
+        nonlocal fusion_calls
+        fusion_calls += 1
+
+    stem_handle = model.motion_stem.register_forward_pre_hook(count_stem)
+    fusion_handle = model.fusion.register_forward_pre_hook(count_fusion)
+    try:
+        with torch.no_grad():
+            model(batch)
+            model.set_motion_enabled(False)
+            model(batch)
+    finally:
+        stem_handle.remove()
+        fusion_handle.remove()
+
+    assert len(captured) == 2
+    assert not torch.equal(captured[0][0], captured[0][1])
+    assert torch.equal(captured[1][0], captured[1][1])
+    assert motion_calls == 1
+    assert motion_stem_calls == 1
+    assert fusion_calls == 1
+
+
+@pytest.mark.parametrize("invalid", [0, 1, None, "false"])
+def test_motion_switch_requires_bool_and_stays_out_of_state_dict(invalid):
+    model = MGVTODOBB(weights=None)
+    state_names = tuple(model.state_dict())
+
+    with pytest.raises(ValueError, match="boolean"):
+        model.set_motion_enabled(invalid)
+
+    assert tuple(model.state_dict()) == state_names
+    assert all("motion_enabled" not in name for name in state_names)
+
+
 def test_invalid_support_skips_motion_bn_and_fuses_exact_rgb_after_bn_drift():
     model = MGVTODOBB(weights=None).train()
     moving = _synthetic_mg_batch(moving=True)
@@ -732,12 +810,12 @@ def test_factory_registration_is_lazy_and_weights_none_is_offline(
     )
     assert probe.stdout.strip() == "False"
 
-    def reject_yolo(*_args, **_kwargs):
-        raise AssertionError("weights=None must not construct YOLO")
+    def reject_checkpoint_load(*_args, **_kwargs):
+        raise AssertionError("weights=None must not load a source checkpoint")
 
     monkeypatch.setattr(
-        "moving_det.ml.models.baseline.YOLO",
-        reject_yolo,
+        "moving_det.ml.models.baseline._load_ultralytics_state",
+        reject_checkpoint_load,
     )
     cfg = load_temporal_config(
         Path("configs/vrud-temporal-obb.yaml")

@@ -148,6 +148,12 @@ class MGVTODOBB(BaselineOBB):
         self.layer2_channels = _infer_layer2_channels(self.detector)
         self.motion_stem = MotionStem(self.layer2_channels)
         self.fusion = GatedMotionFusion(self.layer2_channels)
+        self._motion_enabled = True
+
+    def set_motion_enabled(self, enabled: bool) -> None:
+        if type(enabled) is not bool:
+            raise ValueError("motion enabled must be a boolean")
+        self._motion_enabled = enabled
 
     def _validate_batch(
         self,
@@ -254,6 +260,17 @@ class MGVTODOBB(BaselineOBB):
 
     def forward(self, batch: Mapping[str, Any]) -> Any:
         current, frames, valid, transforms = self._validate_batch(batch)
+        rgb_p2 = extract_backbone_features(
+            self.detector,
+            current,
+            (2,),
+        )[2]
+        if not self._motion_enabled:
+            return execute_yolo_graph(
+                self.detector,
+                current,
+                {2: rgb_p2},
+            )
         motion = compute_motion_strength(
             frames,
             valid,
@@ -264,11 +281,6 @@ class MGVTODOBB(BaselineOBB):
             .amax(dim=1)
             .gt(0)
         )
-        rgb_p2 = extract_backbone_features(
-            self.detector,
-            current,
-            (2,),
-        )[2]
         motion_p2 = torch.zeros_like(rgb_p2)
         active_indices = has_motion.nonzero(as_tuple=False).flatten()
         if active_indices.numel() > 0:

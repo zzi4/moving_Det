@@ -93,6 +93,19 @@ _GROUND_TRUTH_FIELDS = frozenset(
         "obb",
     }
 )
+_HUMAN_GROUND_TRUTH_FIELDS = frozenset(
+    {
+        "schema_version",
+        "site",
+        "sequence",
+        "frame",
+        "class_id",
+        "track_id",
+        "pixel_speed_per_frame",
+        "visible_span",
+        "obb",
+    }
+)
 _DIAGNOSTIC_FIELDS = frozenset(
     {
         "schema_version",
@@ -107,6 +120,15 @@ _DIAGNOSTIC_FIELDS = frozenset(
         "selected_long_index",
         "short_alignment_magnitude",
         "diagnostic_tile_xywh",
+    }
+)
+_HUMAN_DIAGNOSTIC_FIELDS = _DIAGNOSTIC_FIELDS | {"motion_enabled"}
+_HUMAN_AUDIT_FIELDS = frozenset(
+    {
+        "edge_ignore_count",
+        "suppressed_prediction_count",
+        "metadata_error_count",
+        "geometry_error_count",
     }
 )
 _DIAGNOSTIC_MAP_SHAPE = (180, 320)
@@ -140,6 +162,10 @@ _EVALUATION_RUN_FIELDS = frozenset(
         "artifact_sha256",
     }
 )
+_HUMAN_EVALUATION_RUN_FIELDS = _EVALUATION_RUN_FIELDS | {
+    "human_benchmark_sha256",
+    "motion_off",
+}
 _AUDIT_FIELDS = (
     "site",
     "sequence",
@@ -165,6 +191,8 @@ class EvaluationRequest:
     alignment_cache: Path | None
     manifest_sha256: str
     checkpoint_sha256: str
+    human_benchmark: Path | None = None
+    motion_off: bool = False
 
 
 @dataclass(frozen=True)
@@ -315,6 +343,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--threshold", type=_path_argument)
     evaluate.add_argument("--alignment-cache", type=_path_argument)
+    evaluate.add_argument("--human-benchmark", type=_path_argument)
+    evaluate.add_argument("--motion-off", action="store_true")
     evaluate.add_argument("--output", type=_path_argument, required=True)
 
     visualize = subparsers.add_parser(
@@ -387,6 +417,12 @@ def _validate_cross_arguments(
         if args.model == "baseline" and args.alignment_cache is not None:
             parser.error("--alignment-cache is only valid for temporal models")
     if args.command == "evaluate":
+        if args.human_benchmark is not None and args.split != "test":
+            parser.error("--human-benchmark is only valid for test evaluation")
+        if args.motion_off and args.model != "mg_vtod":
+            parser.error("--motion-off requires --model mg_vtod")
+        if args.motion_off and args.human_benchmark is None:
+            parser.error("--motion-off requires --human-benchmark")
         if args.split == "test" and args.threshold is None:
             parser.error("--threshold is required for test evaluation")
         if args.split == "validation" and args.threshold is not None:
@@ -2149,6 +2185,155 @@ def _validate_ground_truth_rows(
     return tuple(normalized)
 
 
+def _fixed_human_frame_universe(benchmark: object) -> frozenset[tuple[str, str, int]]:
+    from moving_det.ml.human_benchmark import APPROVED_SEQUENCES
+
+    frames = tuple(getattr(benchmark, "frames", ()))
+    expected = frozenset(
+        (spec.site, spec.sequence, frame)
+        for spec in APPROVED_SEQUENCES.values()
+        for frame in range(spec.first_frame, spec.last_frame + 1)
+    )
+    actual = frozenset(
+        (str(frame.site), str(frame.sequence), int(frame.frame))
+        for frame in frames
+    )
+    if len(frames) != 873 or len(actual) != 873 or actual != expected:
+        raise WorkflowError(
+            "human benchmark must contain exactly 873 approved frame identities"
+        )
+    ignores = tuple(getattr(benchmark, "ignores", ()))
+    if len(ignores) != 334:
+        raise WorkflowError("human benchmark must contain exactly 334 edge ignores")
+    truths = tuple(getattr(benchmark, "truths", ()))
+    if {getattr(truth, "class_id", None) for truth in truths} != {0, 1, 2, 3}:
+        raise WorkflowError("human benchmark must contain manual classes 0..3")
+    if any(
+        (str(row.site), str(row.sequence), int(row.frame)) not in expected
+        for row in (*truths, *ignores)
+    ):
+        raise WorkflowError("human benchmark annotation escapes its frame universe")
+    return expected
+
+
+def _validate_human_ground_truth_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    universe: frozenset[tuple[str, str, int]],
+    benchmark: object | None,
+) -> tuple[dict[str, object], ...]:
+    normalized = []
+    actual: dict[tuple[str, str, int, int, int], dict[str, object]] = {}
+    for raw in rows:
+        if "pixel_speed_per_frame" not in raw:
+            raise WorkflowError(
+                "human ground-truth pixel_speed_per_frame is missing"
+            )
+        version = raw.get("schema_version")
+        if (
+            set(raw) != _HUMAN_GROUND_TRUTH_FIELDS
+            or type(version) is not int
+            or version != 3
+        ):
+            raise WorkflowError("human ground-truth row schema is invalid")
+        site, sequence, frame = _evidence_frame_identity(
+            raw,
+            artifact="human ground-truth",
+        )
+        if (site, sequence, frame) not in universe:
+            raise WorkflowError(
+                "human ground-truth row escapes the benchmark frame universe"
+            )
+        class_id = raw["class_id"]
+        track_id = raw["track_id"]
+        speed = raw["pixel_speed_per_frame"]
+        visible_span = raw["visible_span"]
+        if (
+            type(class_id) is not int
+            or class_id not in {0, 1, 2, 3}
+            or type(track_id) is not int
+            or track_id < 0
+            or isinstance(speed, bool)
+            or not isinstance(speed, (int, float))
+            or not math.isfinite(float(speed))
+            or float(speed) < 0
+            or type(visible_span) is not int
+            or visible_span <= 0
+        ):
+            raise WorkflowError("human ground-truth row values are invalid")
+        _validate_canonical_obb(raw["obb"], artifact="human ground-truth")
+        identity = (site, sequence, frame, class_id, track_id)
+        if identity in actual:
+            raise WorkflowError("duplicate human ground-truth state")
+        row = dict(raw)
+        actual[identity] = row
+        normalized.append(row)
+
+    if benchmark is not None:
+        expected = {}
+        for truth in getattr(benchmark, "truths", ()):
+            row = _serialize_human_truth(truth)
+            identity = (
+                str(truth.site),
+                str(truth.sequence),
+                int(truth.frame),
+                int(truth.class_id),
+                int(truth.track_id),
+            )
+            expected[identity] = row
+        if actual != expected:
+            raise WorkflowError(
+                "human ground-truth contains a truth not declared by the human benchmark"
+            )
+    return tuple(normalized)
+
+
+def _validate_saved_human_ground_truth_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    universe: frozenset[tuple[str, str, int]],
+) -> tuple[dict[str, object], ...]:
+    return _validate_human_ground_truth_rows(
+        rows,
+        universe=universe,
+        benchmark=None,
+    )
+
+
+def _validate_human_audit(value: object, benchmark: object) -> dict[str, int]:
+    if not isinstance(value, Mapping) or set(value) != _HUMAN_AUDIT_FIELDS:
+        raise WorkflowError("human edge-ignore audit schema is invalid")
+    result = {}
+    for key in sorted(_HUMAN_AUDIT_FIELDS):
+        item = value[key]
+        if type(item) is not int or item < 0:
+            raise WorkflowError("human edge-ignore audit values are invalid")
+        result[key] = item
+    if result["edge_ignore_count"] != len(getattr(benchmark, "ignores", ())):
+        raise WorkflowError("human edge-ignore audit count is inconsistent")
+    if result["metadata_error_count"] != 0 or result["geometry_error_count"] != 0:
+        raise WorkflowError("human benchmark audit errors must be zero")
+    return result
+
+
+def _validate_human_run_audit(value: object) -> dict[str, int]:
+    if not isinstance(value, Mapping) or set(value) != _HUMAN_AUDIT_FIELDS:
+        raise WorkflowError("human edge-ignore audit schema is invalid")
+    result = {}
+    for key in sorted(_HUMAN_AUDIT_FIELDS):
+        item = value[key]
+        if type(item) is not int or item < 0:
+            raise WorkflowError("human edge-ignore audit values are invalid")
+        result[key] = item
+    if (
+        result["edge_ignore_count"] != 334
+        or result["metadata_error_count"] != 0
+        or result["geometry_error_count"] != 0
+    ):
+        raise WorkflowError("human edge-ignore audit provenance is inconsistent")
+    return result
+
+
 def _validate_diagnostic_map(value: object, *, field: str) -> None:
     if not isinstance(value, list) or len(value) != _DIAGNOSTIC_MAP_SHAPE[0]:
         raise WorkflowError(f"diagnostic {field} shape is invalid")
@@ -2183,6 +2368,8 @@ def _validate_diagnostic_rows(
     model_name: str,
     image_root: Path,
     expected_offsets: tuple[int, ...] | None,
+    human_benchmark: bool = False,
+    expected_motion_enabled: bool | None = None,
 ) -> tuple[dict[str, object], ...]:
     normalized = []
     seen: set[tuple[str, str, int]] = set()
@@ -2190,11 +2377,23 @@ def _validate_diagnostic_rows(
     for raw in rows:
         version = raw.get("schema_version")
         if (
-            set(raw) != _DIAGNOSTIC_FIELDS
+            set(raw) != (
+                _HUMAN_DIAGNOSTIC_FIELDS
+                if human_benchmark
+                else _DIAGNOSTIC_FIELDS
+            )
             or type(version) is not int
             or version != 1
         ):
             raise WorkflowError("diagnostic row schema is invalid")
+        if human_benchmark and type(raw["motion_enabled"]) is not bool:
+            raise WorkflowError("human diagnostic motion_enabled is invalid")
+        if (
+            human_benchmark
+            and expected_motion_enabled is not None
+            and raw["motion_enabled"] is not expected_motion_enabled
+        ):
+            raise WorkflowError("human diagnostic motion provenance is inconsistent")
         identity = _evidence_frame_identity(raw, artifact="diagnostic")
         if identity not in universe:
             raise WorkflowError("diagnostic row escapes the frozen frame universe")
@@ -2316,6 +2515,32 @@ def _validate_evaluation_artifacts(
 ) -> EvaluationArtifacts:
     if not isinstance(value, EvaluationArtifacts):
         raise WorkflowError("evaluation engine returned an invalid artifact bundle")
+    if type(request.motion_off) is not bool:
+        raise WorkflowError("evaluation motion_off must be boolean")
+    human = request.human_benchmark is not None
+    if human and request.split != "test":
+        raise WorkflowError("human benchmark is only valid for test evaluation")
+    if request.motion_off and (not human or request.model_name != "mg_vtod"):
+        raise WorkflowError(
+            "Motion-Off is only valid for MG-VTOD human benchmark evaluation"
+        )
+    benchmark = None
+    expected_human_frames: frozenset[tuple[str, str, int]] | None = None
+    if human:
+        from moving_det.ml.human_benchmark_artifacts import load_human_benchmark
+
+        benchmark = load_human_benchmark(request.human_benchmark)
+        expected_human_frames = _fixed_human_frame_universe(benchmark)
+        benchmark_image_roots = {
+            Path(frame.image_path).parents[2].resolve(strict=False)
+            for frame in benchmark.frames
+        }
+        if benchmark_image_roots != {
+            Path(getattr(request.cfg, "image_root")).resolve(strict=False)
+        }:
+            raise WorkflowError(
+                "human benchmark image root provenance is inconsistent"
+            )
     detection_frames = _normalize_frame_keys(value.detection_frame_keys)
     continuity_frames = _normalize_frame_keys(value.continuity_frame_keys)
     if not detection_frames:
@@ -2326,9 +2551,33 @@ def _validate_evaluation_artifacts(
         )
     if request.split == "test" and not continuity_frames:
         raise WorkflowError("test continuity frame universe must be non-empty")
+    if human:
+        assert expected_human_frames is not None
+        detection_identities = _frame_universe(detection_frames, ())
+        continuity_identities = _frame_universe(continuity_frames, ())
+        if (
+            len(detection_frames) != 873
+            or len(continuity_frames) != 873
+            or detection_identities != expected_human_frames
+            or continuity_identities != expected_human_frames
+        ):
+            raise WorkflowError(
+                "human detection and continuity universes must contain exactly 873 benchmark frames"
+            )
     if not isinstance(value.metrics, Mapping):
         raise WorkflowError("evaluation metrics must be a mapping")
-    for section in _EVALUATION_TABLES:
+    metric_sections = (
+        (
+            "per_class",
+            "per_size",
+            "per_pixel_speed",
+            "per_visible_span",
+            "per_track",
+        )
+        if human
+        else _EVALUATION_TABLES
+    )
+    for section in metric_sections:
         if not isinstance(value.metrics.get(section), Mapping):
             raise WorkflowError(f"evaluation metrics are missing {section}")
     predictions = tuple(value.predictions)
@@ -2342,11 +2591,20 @@ def _validate_evaluation_artifacts(
         predictions,
         universe=universe,
     )
-    ground_truth = _validate_ground_truth_rows(
-        ground_truth,
-        universe=universe,
-    )
-    audit = _validate_audit(value.audit)
+    if human:
+        assert benchmark is not None
+        ground_truth = _validate_human_ground_truth_rows(
+            ground_truth,
+            universe=universe,
+            benchmark=benchmark,
+        )
+        audit = _validate_human_audit(value.audit, benchmark)
+    else:
+        ground_truth = _validate_ground_truth_rows(
+            ground_truth,
+            universe=universe,
+        )
+        audit = _validate_audit(value.audit)
     threshold = value.threshold_evidence
     if request.split == "validation":
         if not isinstance(threshold, Mapping):
@@ -2363,6 +2621,8 @@ def _validate_evaluation_artifacts(
         model_name=request.model_name,
         image_root=Path(getattr(request.cfg, "image_root")),
         expected_offsets=_model_offsets(request.model_name, request.cfg),
+        human_benchmark=human,
+        expected_motion_enabled=(not request.motion_off if human else None),
     )
     cache_sha256 = value.alignment_cache_sha256
     if request.model_name == "baseline":
@@ -2560,6 +2820,22 @@ def run_evaluate(
     threshold_path = Path(args.threshold) if args.threshold is not None else None
     if threshold_path is not None:
         _sha256_file(threshold_path)
+    human_benchmark = (
+        Path(args.human_benchmark)
+        if args.human_benchmark is not None
+        else None
+    )
+    human_benchmark_sha256 = None
+    if human_benchmark is not None:
+        from moving_det.ml.human_benchmark_artifacts import (
+            human_benchmark_fingerprint,
+            load_human_benchmark,
+        )
+
+        load_human_benchmark(human_benchmark)
+        human_benchmark_sha256 = human_benchmark_fingerprint(human_benchmark)
+        if not _is_sha256(human_benchmark_sha256):
+            raise WorkflowError("human benchmark fingerprint is invalid")
     alignment_cache: Path | None = None
     if args.model == "baseline":
         if args.alignment_cache is not None:
@@ -2581,6 +2857,7 @@ def run_evaluate(
                 checkpoint,
                 threshold_path,
                 alignment_cache,
+                human_benchmark,
             )
             if path is not None
         ),
@@ -2599,10 +2876,16 @@ def run_evaluate(
         alignment_cache=alignment_cache,
         manifest_sha256=manifest_sha256,
         checkpoint_sha256=checkpoint_sha256,
+        human_benchmark=human_benchmark,
+        motion_off=args.motion_off,
     )
     if evaluator is None:
         evaluator = _evaluate_real
     artifacts = _validate_evaluation_artifacts(evaluator(request), request)
+    if human_benchmark is not None:
+        current_fingerprint = human_benchmark_fingerprint(human_benchmark)
+        if current_fingerprint != human_benchmark_sha256:
+            raise WorkflowError("human benchmark fingerprint changed during evaluation")
     if request.split == "test":
         artifacts = replace(
             artifacts,
@@ -2637,6 +2920,12 @@ def run_evaluate(
         raise WorkflowError("runtime provenance schema is invalid")
 
     def writer(stage: Path) -> Path:
+        if human_benchmark is not None:
+            load_human_benchmark(human_benchmark)
+            if human_benchmark_fingerprint(human_benchmark) != human_benchmark_sha256:
+                raise WorkflowError(
+                    "human benchmark fingerprint changed before publication"
+                )
         artifact_bytes = {
             "metrics.json": _json_bytes(dict(artifacts.metrics)),
             "predictions.jsonl": _jsonl_bytes(artifacts.predictions),
@@ -2658,7 +2947,12 @@ def run_evaluate(
         for name, content in artifact_bytes.items():
             _write_bytes(stage / name, content)
         artifact_schema = {
-            name: _EVALUATION_ARTIFACT_VERSIONS[name]
+            name: (
+                3
+                if human_benchmark is not None
+                and name == "ground-truth.jsonl"
+                else _EVALUATION_ARTIFACT_VERSIONS[name]
+            )
             for name in artifact_bytes
         }
         artifact_sha256 = {
@@ -2703,6 +2997,13 @@ def run_evaluate(
             "artifact_schema": artifact_schema,
             "artifact_sha256": artifact_sha256,
         }
+        if human_benchmark is not None:
+            run.update(
+                {
+                    "human_benchmark_sha256": human_benchmark_sha256,
+                    "motion_off": request.motion_off,
+                }
+            )
         _validate_evaluation_run_schema(run)
         _write_bytes(stage / "run.json", _json_bytes(run))
         return Path("metrics.json")
@@ -2858,6 +3159,7 @@ def _validate_artifact_declarations(
     digests: object,
     *,
     split: str,
+    human_benchmark: bool = False,
 ) -> tuple[dict[str, int], dict[str, str]]:
     if not isinstance(schema, Mapping) or not isinstance(digests, Mapping):
         raise WorkflowError("evaluation artifact declarations must be mappings")
@@ -2878,10 +3180,15 @@ def _validate_artifact_declarations(
     for name in sorted(names):
         version = schema[name]
         digest = digests[name]
+        expected_version = (
+            3
+            if human_benchmark and name == "ground-truth.jsonl"
+            else _EVALUATION_ARTIFACT_VERSIONS[name]
+        )
         if (
             isinstance(version, bool)
             or not isinstance(version, int)
-            or version != _EVALUATION_ARTIFACT_VERSIONS[name]
+            or version != expected_version
         ):
             raise WorkflowError(f"evaluation artifact schema is unsupported: {name}")
         if not _is_sha256(digest):
@@ -2892,7 +3199,8 @@ def _validate_artifact_declarations(
 
 
 def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
-    if set(run) != _EVALUATION_RUN_FIELDS:
+    human = set(run) == _HUMAN_EVALUATION_RUN_FIELDS
+    if not human and set(run) != _EVALUATION_RUN_FIELDS:
         raise WorkflowError("evaluation run schema fields are invalid")
     if (
         type(run.get("schema_version")) is not int
@@ -2934,7 +3242,32 @@ def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
             raise WorkflowError("test continuity frame universe is empty")
     else:
         raise WorkflowError("evaluation run split is unsupported")
-    _validate_audit(run.get("audit"))
+    if human:
+        detection_identities = _frame_universe(
+            normalized["detection_frame_keys"],
+            (),
+        )
+        continuity_identities = _frame_universe(
+            normalized["continuity_frame_keys"],
+            (),
+        )
+        if (
+            split != "test"
+            or len(detection_identities) != 873
+            or detection_identities != continuity_identities
+        ):
+            raise WorkflowError(
+                "human run must record the same exact 873 detection and continuity frames"
+            )
+        if not _is_sha256(run.get("human_benchmark_sha256")):
+            raise WorkflowError("human benchmark fingerprint is invalid")
+        if type(run.get("motion_off")) is not bool:
+            raise WorkflowError("human run motion_off provenance is invalid")
+        if run.get("motion_off") and model_name != "mg_vtod":
+            raise WorkflowError("Motion-Off provenance requires MG-VTOD")
+        _validate_human_run_audit(run.get("audit"))
+    else:
+        _validate_audit(run.get("audit"))
     _absolute_resolved_path(
         run.get("image_root"),
         field="evaluation image_root",
@@ -3004,6 +3337,7 @@ def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
         run.get("artifact_schema"),
         run.get("artifact_sha256"),
         split=str(split),
+        human_benchmark=human,
     )
 
 
@@ -3022,6 +3356,7 @@ def _load_verified_evaluation_run(
         run["artifact_schema"],
         run["artifact_sha256"],
         split=str(run["evaluation_split"]),
+        human_benchmark="human_benchmark_sha256" in run,
     )
     expected_names = {"run.json", *schema}
     actual_names = {path.name for path in root.iterdir()}
@@ -3053,10 +3388,16 @@ def _load_verified_evaluation_run(
         _read_jsonl(root / "predictions.jsonl"),
         universe=universe,
     )
-    _validate_ground_truth_rows(
-        _read_jsonl(root / "ground-truth.jsonl"),
-        universe=universe,
-    )
+    if "human_benchmark_sha256" in run:
+        _validate_saved_human_ground_truth_rows(
+            _read_jsonl(root / "ground-truth.jsonl"),
+            universe=universe,
+        )
+    else:
+        _validate_ground_truth_rows(
+            _read_jsonl(root / "ground-truth.jsonl"),
+            universe=universe,
+        )
     if "diagnostics.jsonl" in schema:
         _validate_diagnostic_rows(
             _read_jsonl(root / "diagnostics.jsonl"),
@@ -3064,6 +3405,12 @@ def _load_verified_evaluation_run(
             model_name=str(run["model_name"]),
             image_root=Path(str(run["image_root"])),
             expected_offsets=None,
+            human_benchmark="human_benchmark_sha256" in run,
+            expected_motion_enabled=(
+                not bool(run["motion_off"])
+                if "human_benchmark_sha256" in run
+                else None
+            ),
         )
     if "threshold.json" in schema:
         threshold = _read_json(root / "threshold.json")
@@ -5046,7 +5393,15 @@ def _load_full_frame_clip(
     site = str(record["site"])
     sequence = str(record["sequence"])
     center = int(record["center_frame"])
-    center_path = _full_frame_path(cfg, site, sequence, center)
+    human_image_path = record.get("image_path")
+    if human_image_path is None:
+        center_path = _full_frame_path(cfg, site, sequence, center)
+    elif not isinstance(human_image_path, Path):
+        raise WorkflowError("human frame image_path must be a Path")
+    else:
+        center_path = human_image_path
+        if center_path.stem != f"{center:06d}":
+            raise WorkflowError("human frame image_path does not match its identity")
     center_array = _load_full_rgb(center_path)
     height, width = center_array.shape[:2]
     frames = []
@@ -5055,7 +5410,11 @@ def _load_full_frame_clip(
     support_paths: list[str | None] = []
     for offset in offsets:
         frame_number = center + offset
-        path = _full_frame_path(cfg, site, sequence, frame_number)
+        path = (
+            center_path.with_name(f"{frame_number:06d}{center_path.suffix}")
+            if human_image_path is not None
+            else _full_frame_path(cfg, site, sequence, frame_number)
+        )
         is_valid = frame_number > 0 and path.is_file() and not path.is_symlink()
         valid.append(is_valid)
         support_paths.append(str(path) if is_valid else None)
@@ -5216,6 +5575,28 @@ def _serialize_ground_truth(value: object) -> dict[str, object]:
     }
 
 
+def _serialize_human_truth(value: object) -> dict[str, object]:
+    truth = value
+    obb = getattr(truth, "obb")
+    return {
+        "schema_version": 3,
+        "site": getattr(truth, "site"),
+        "sequence": getattr(truth, "sequence"),
+        "frame": getattr(truth, "frame"),
+        "class_id": getattr(truth, "class_id"),
+        "track_id": getattr(truth, "track_id"),
+        "pixel_speed_per_frame": getattr(truth, "pixel_speed"),
+        "visible_span": getattr(truth, "visible_span"),
+        "obb": [
+            obb.cx,
+            obb.cy,
+            obb.width,
+            obb.height,
+            obb.theta,
+        ],
+    }
+
+
 def _downsample_diagnostic(tensor: object) -> list[list[float]]:
     import torch
     import torch.nn.functional as functional
@@ -5281,6 +5662,7 @@ def _extract_model_diagnostic(
     cfg: object,
     *,
     diagnostic_tile: object | None = None,
+    include_motion_enabled: bool = False,
 ) -> dict[str, object]:
     import torch
 
@@ -5321,6 +5703,9 @@ def _extract_model_diagnostic(
         for _ in range(_DIAGNOSTIC_MAP_SHAPE[0])
     ]
     selected_long_index = -1
+    motion_enabled = getattr(model, "_motion_enabled", True)
+    if type(motion_enabled) is not bool:
+        raise WorkflowError("model motion_enabled diagnostic must be boolean")
     module_states = tuple(
         (module, module.training)
         for module in model.modules()
@@ -5328,7 +5713,7 @@ def _extract_model_diagnostic(
     try:
         model.eval()
         with torch.inference_mode():
-            if model_name == "mg_vtod":
+            if model_name == "mg_vtod" and motion_enabled:
                 motion = compute_motion_strength(
                     batch["frames"],
                     batch["valid"],
@@ -5353,7 +5738,7 @@ def _extract_model_diagnostic(
             module.training = state
     metadata = clip["metadata"]
     assert isinstance(metadata, Mapping)
-    return {
+    result = {
         "schema_version": 1,
         "site": metadata["site"],
         "sequence": metadata["sequence"],
@@ -5379,6 +5764,9 @@ def _extract_model_diagnostic(
             tile.height,
         ],
     }
+    if include_motion_enabled:
+        result["motion_enabled"] = motion_enabled
+    return result
 
 
 def _representative_diagnostic_tile(
@@ -5431,6 +5819,80 @@ def _representative_diagnostic_tile(
     except ValueError as exc:
         raise WorkflowError(
             "representative corrected OBB does not fit an approved tile"
+        ) from exc
+
+
+def _representative_human_diagnostic_tile(
+    frame: object,
+    benchmark: object,
+    cfg: object,
+) -> object:
+    from moving_det.geometry.obb import points_to_obb
+    from moving_det.ml.human_benchmark import IMAGE_HEIGHT, IMAGE_WIDTH
+    from moving_det.vrud.tiling import assign_target_tile, full_frame_tiles
+
+    identity = (
+        str(getattr(frame, "site")),
+        str(getattr(frame, "sequence")),
+        int(getattr(frame, "frame")),
+    )
+    candidates = [
+        (
+            int(getattr(truth, "track_id")),
+            int(getattr(truth, "class_id")),
+            getattr(truth, "obb"),
+        )
+        for truth in getattr(benchmark, "truths")
+        if (
+            str(getattr(truth, "site")),
+            str(getattr(truth, "sequence")),
+            int(getattr(truth, "frame")),
+        )
+        == identity
+    ]
+    candidates.extend(
+        (
+            int(getattr(ignored, "track_id")),
+            (
+                int(getattr(ignored, "class_id"))
+                if getattr(ignored, "class_id") is not None
+                else 4
+            ),
+            points_to_obb(getattr(ignored, "points")),
+        )
+        for ignored in getattr(benchmark, "ignores")
+        if (
+            str(getattr(ignored, "site")),
+            str(getattr(ignored, "sequence")),
+            int(getattr(ignored, "frame")),
+        )
+        == identity
+    )
+    tiles = full_frame_tiles(
+        IMAGE_WIDTH,
+        IMAGE_HEIGHT,
+        int(getattr(cfg, "tile_size")),
+        int(getattr(cfg, "tile_overlap")),
+    )
+    if not candidates:
+        return tiles[0]
+    _, _, obb = min(
+        candidates,
+        key=lambda item: (
+            item[0],
+            item[1],
+            float(item[2].cx),
+            float(item[2].cy),
+            float(item[2].width),
+            float(item[2].height),
+            float(item[2].theta),
+        ),
+    )
+    try:
+        return assign_target_tile(obb, tiles)
+    except ValueError as exc:
+        raise WorkflowError(
+            "representative human OBB does not fit an approved tile"
         ) from exc
 
 
@@ -6360,6 +6822,8 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         select_validation_threshold,
     )
     from moving_det.ml.factory import create_model
+    from moving_det.ml.human_benchmark_artifacts import load_human_benchmark
+    from moving_det.ml.human_evaluation import evaluate_human_predictions
     from moving_det.ml.inference import FrameKey, infer_full_frame
     from moving_det.ml.training import load_experiment_checkpoint
     from moving_det.vrud.alignment import AlignmentCache
@@ -6377,7 +6841,24 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         cache = AlignmentCache(request.alignment_cache).snapshot()
     else:
         cache = None
-    records = _evaluation_frame_records(request.manifest_dir, request.split)
+    human_benchmark = (
+        load_human_benchmark(request.human_benchmark)
+        if request.human_benchmark is not None
+        else None
+    )
+    records = (
+        tuple(
+            {
+                "site": frame.site,
+                "sequence": frame.sequence,
+                "center_frame": frame.frame,
+                "image_path": frame.image_path,
+            }
+            for frame in human_benchmark.frames
+        )
+        if human_benchmark is not None
+        else _evaluation_frame_records(request.manifest_dir, request.split)
+    )
     if not records:
         raise WorkflowError(f"{request.split} manifest has no evaluated frames")
 
@@ -6396,20 +6877,31 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
             None if cache is None else cache.fingerprint
         ),
     )
+    if human_benchmark is not None and request.model_name == "mg_vtod":
+        setter = getattr(model, "set_motion_enabled", None)
+        if not callable(setter):
+            raise WorkflowError("human MG evaluation requires a motion switch")
+        setter(not request.motion_off)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model.eval()
 
-    tracks = load_track_index(Path(getattr(cfg, "metadata_root")))
-    training_audit = _training_manifest_audit(
-        request.manifest_dir,
-        tracks,
-    )
-    expected_ground_truth = _manifest_ground_truth_expectations(
-        records,
-        tracks,
-    )
-    velocities = _load_frame_velocities(cfg, records)
+    if human_benchmark is None:
+        tracks = load_track_index(Path(getattr(cfg, "metadata_root")))
+        training_audit = _training_manifest_audit(
+            request.manifest_dir,
+            tracks,
+        )
+        expected_ground_truth = _manifest_ground_truth_expectations(
+            records,
+            tracks,
+        )
+        velocities = _load_frame_velocities(cfg, records)
+    else:
+        tracks = None
+        training_audit = None
+        expected_ground_truth = None
+        velocities = None
     predictions = []
     truth = []
     diagnostics = []
@@ -6428,15 +6920,19 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
             int(record["center_frame"]),
         )
         sources = record.get("sources")
-        if (
-            isinstance(sources, (str, bytes))
-            or not isinstance(sources, Sequence)
-        ):
-            raise WorkflowError("evaluation frame sources are malformed")
-        if "evaluation" in sources:
+        if human_benchmark is not None:
             detection_frame_keys.append(frame_key)
-        if "continuity" in sources:
             continuity_frame_keys.append(frame_key)
+        else:
+            if (
+                isinstance(sources, (str, bytes))
+                or not isinstance(sources, Sequence)
+            ):
+                raise WorkflowError("evaluation frame sources are malformed")
+            if "evaluation" in sources:
+                detection_frame_keys.append(frame_key)
+            if "continuity" in sources:
+                continuity_frame_keys.append(frame_key)
         inference_cfg = {
             "tile_size": getattr(cfg, "tile_size"),
             "tile_overlap": getattr(cfg, "tile_overlap"),
@@ -6446,62 +6942,71 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         }
         predictions.extend(infer_full_frame(model, clip, inference_cfg))
 
-        image_path = _full_frame_path(
-            cfg,
-            frame_key.site,
-            frame_key.sequence,
-            frame_key.frame,
-        )
-        corrected = load_corrected_frame(
-            image_path,
-            image_path.with_suffix(".json"),
-            frame_key.site,
-            frame_key.sequence,
-            tracks,
-        )
-        for annotation in corrected.annotations:
-            if annotation.class_id is None:
-                continue
-            velocity_key = (
+        corrected = None
+        if human_benchmark is None:
+            image_path = _full_frame_path(
+                cfg,
                 frame_key.site,
                 frame_key.sequence,
-                annotation.track_key.group_id,
                 frame_key.frame,
             )
-            if velocity_key not in velocities:
-                raise WorkflowError(
-                    "per-frame VRUD velocity is missing for eligible GT: "
-                    f"{velocity_key}"
-                )
-            metadata = tracks.get(annotation.track_key)
-            if metadata is None:
-                raise WorkflowError(
-                    "eligible corrected GT has no TrackMeta: "
-                    f"{annotation.track_key}"
-                )
-            truth.append(
-                _ground_truth_record(
-                    frame=frame_key.frame,
-                    obb=annotation.obb,
-                    class_id=annotation.class_id,
-                    track_id=annotation.track_key.group_id,
-                    site=frame_key.site,
-                    sequence=frame_key.sequence,
-                    speed_mps=getattr(metadata, "mean_velocity"),
-                    frame_speed_mps=velocities[velocity_key],
-                )
+            corrected = load_corrected_frame(
+                image_path,
+                image_path.with_suffix(".json"),
+                frame_key.site,
+                frame_key.sequence,
+                tracks,
             )
+            for annotation in corrected.annotations:
+                if annotation.class_id is None:
+                    continue
+                velocity_key = (
+                    frame_key.site,
+                    frame_key.sequence,
+                    annotation.track_key.group_id,
+                    frame_key.frame,
+                )
+                if velocity_key not in velocities:
+                    raise WorkflowError(
+                        "per-frame VRUD velocity is missing for eligible GT: "
+                        f"{velocity_key}"
+                    )
+                metadata = tracks.get(annotation.track_key)
+                if metadata is None:
+                    raise WorkflowError(
+                        "eligible corrected GT has no TrackMeta: "
+                        f"{annotation.track_key}"
+                    )
+                truth.append(
+                    _ground_truth_record(
+                        frame=frame_key.frame,
+                        obb=annotation.obb,
+                        class_id=annotation.class_id,
+                        track_id=annotation.track_key.group_id,
+                        site=frame_key.site,
+                        sequence=frame_key.sequence,
+                        speed_mps=getattr(metadata, "mean_velocity"),
+                        frame_speed_mps=velocities[velocity_key],
+                    )
+                )
         if frame_index < 3:
+            diagnostic_tile = (
+                _representative_human_diagnostic_tile(
+                    human_benchmark.frames[frame_index],
+                    human_benchmark,
+                    cfg,
+                )
+                if human_benchmark is not None
+                else _representative_diagnostic_tile(corrected, cfg)
+            )
             diagnostics.append(
                 _extract_model_diagnostic(
                     model,
                     clip,
                     request.model_name,
                     cfg,
-                    diagnostic_tile=_representative_diagnostic_tile(
-                        corrected,
-                        cfg,
-                    ),
+                    diagnostic_tile=diagnostic_tile,
+                    include_motion_enabled=human_benchmark is not None,
                 )
             )
 
@@ -6519,7 +7024,22 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         "checkpoint_sha256": request.checkpoint_sha256,
     }
     threshold_evidence = None
-    if request.split == "validation":
+    if human_benchmark is not None:
+        if request.threshold_path is None:
+            raise WorkflowError("human evaluation requires a frozen threshold")
+        frozen = _read_json(request.threshold_path)
+        if not isinstance(frozen, Mapping):
+            raise WorkflowError("frozen threshold artifact must contain an object")
+        threshold_payload = _threshold_payload(frozen, request)
+        metrics = dict(
+            evaluate_human_predictions(
+                tuple(predictions),
+                human_benchmark,
+                {"threshold": threshold_payload["threshold"]},
+            )
+        )
+        metrics["per_speed"] = metrics["per_pixel_speed"]
+    elif request.split == "validation":
         evidence = select_validation_threshold(
             tuple(predictions),
             tuple(truth),
@@ -6532,11 +7052,12 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
     else:
         assert request.threshold_path is not None
         evaluation_cfg["threshold_path"] = request.threshold_path
-    metrics = evaluate_temporal_obb(
-        tuple(predictions),
-        tuple(truth),
-        evaluation_cfg,
-    )
+    if human_benchmark is None:
+        metrics = evaluate_temporal_obb(
+            tuple(predictions),
+            tuple(truth),
+            evaluation_cfg,
+        )
     artifact_predictions = _predictions_for_artifact(
         tuple(predictions),
         request,
@@ -6550,14 +7071,22 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         _serialize_detection(item)
         for item in artifact_predictions
     )
-    truth_rows = tuple(
-        _serialize_ground_truth(item)
-        for item in truth
-    )
-    _require_ground_truth_integrity(
-        expected_ground_truth,
-        truth,
-    )
+    if human_benchmark is not None:
+        truth_rows = tuple(
+            _serialize_human_truth(item)
+            for item in human_benchmark.truths
+        )
+        evaluation_audit = metrics["audit"]
+    else:
+        truth_rows = tuple(
+            _serialize_ground_truth(item)
+            for item in truth
+        )
+        _require_ground_truth_integrity(
+            expected_ground_truth,
+            truth,
+        )
+        evaluation_audit = training_audit
     return EvaluationArtifacts(
         detection_frame_keys=tuple(
             {
@@ -6578,7 +7107,7 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
         metrics=metrics,
         predictions=prediction_rows,
         ground_truth=truth_rows,
-        audit=training_audit,
+        audit=evaluation_audit,
         threshold_evidence=threshold_evidence,
         diagnostics=tuple(diagnostics),
         alignment_cache_sha256=(
