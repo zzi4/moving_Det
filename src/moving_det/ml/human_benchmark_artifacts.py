@@ -782,7 +782,7 @@ def _index_source_archive(
         if info.filename in by_name:
             raise ValueError(f"duplicate source ZIP member: {info.filename}")
         by_name[info.filename] = info
-        if info.is_dir() or _unsafe_zip_member(info):
+        if info.is_dir():
             continue
         member = PurePosixPath(info.filename)
         suffix = member.suffix.lower()
@@ -837,9 +837,9 @@ def _validate_source_archive(
                 jpeg_member = by_numeric_frame.get(
                     (str(annotation_path.parent), ".jpg", row.frame)
                 )
-                if jpeg_member is None:
+                if jpeg_member is None or _unsafe_zip_member(jpeg_member):
                     raise ValueError(
-                        "source ZIP member has no paired JPEG: "
+                        "source ZIP member has no safe paired JPEG: "
                         f"{row.annotation_member}"
                     )
                 if (

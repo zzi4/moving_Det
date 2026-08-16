@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import stat
 import warnings
 import zipfile
 
@@ -443,6 +444,19 @@ def _append_source_zip_member(
             archive.writestr(member, content)
 
 
+def _append_source_zip_symlink(
+    source_zip: Path,
+    *,
+    member: str,
+    target: str,
+) -> None:
+    info = zipfile.ZipInfo(member)
+    info.create_system = 3
+    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with zipfile.ZipFile(source_zip, "a") as archive:
+        archive.writestr(info, target.encode("utf-8"))
+
+
 @pytest.mark.parametrize("operation", ["freeze", "load"])
 @pytest.mark.parametrize(
     ("member", "content", "error"),
@@ -485,6 +499,58 @@ def test_freeze_and_load_reject_source_zip_numeric_aliases(
     ).hexdigest()
 
     with pytest.raises(ValueError, match=error):
+        if operation == "freeze":
+            freeze_human_benchmark(
+                replace(
+                    synthetic_benchmark,
+                    source_zip_sha256=source_sha256,
+                ),
+                output,
+            )
+        else:
+            _rewrite_manifest(
+                output,
+                lambda manifest: manifest.update(
+                    source_zip_sha256=source_sha256
+                ),
+            )
+            load_human_benchmark(output)
+
+
+@pytest.mark.parametrize("operation", ["freeze", "load"])
+@pytest.mark.parametrize(
+    ("member", "target"),
+    [
+        (
+            "synthetic/site19_sequence/sequence_a/10.JSON",
+            "000010.json",
+        ),
+        (
+            "synthetic/site19_sequence/sequence_a/10.JPG",
+            "000010.jpg",
+        ),
+    ],
+)
+def test_freeze_and_load_reject_symlink_source_zip_numeric_aliases(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    operation: str,
+    member: str,
+    target: str,
+) -> None:
+    output = tmp_path / "benchmark"
+    if operation == "load":
+        freeze_human_benchmark(synthetic_benchmark, output)
+    _append_source_zip_symlink(
+        synthetic_benchmark.source_zip,
+        member=member,
+        target=target,
+    )
+    source_sha256 = hashlib.sha256(
+        synthetic_benchmark.source_zip.read_bytes()
+    ).hexdigest()
+
+    with pytest.raises(ValueError, match="duplicate source ZIP numeric frame"):
         if operation == "freeze":
             freeze_human_benchmark(
                 replace(
