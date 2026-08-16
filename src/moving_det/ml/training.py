@@ -610,6 +610,33 @@ def _allowed_temporal_parameter_names(model: nn.Module) -> set[str]:
     return set(names)
 
 
+def _validate_finite_baseline_initialization_state(
+    source_state: Mapping[str, Any],
+) -> None:
+    """Reject non-finite floating/complex init tensors before mutation."""
+    for name, value in source_state.items():
+        if not isinstance(value, Tensor):
+            continue
+        try:
+            requires_finite_check = (
+                value.is_floating_point() or value.is_complex()
+            )
+            is_finite = (
+                not requires_finite_check
+                or bool(torch.isfinite(value).all().item())
+            )
+        except Exception as exc:
+            raise ValueError(
+                "baseline initialization finite-state check failed for "
+                f"tensor {name!r}"
+            ) from exc
+        if not is_finite:
+            raise ValueError(
+                "baseline initialization contains a non-finite tensor: "
+                f"{name}"
+            )
+
+
 def _validate_model_state(
     model: nn.Module,
     source_state: Mapping[str, Any],
@@ -2319,6 +2346,9 @@ def train_model(
                         source,
                         manifest_root,
                     )
+                )
+                _validate_finite_baseline_initialization_state(
+                    init_payload["model"]
                 )
         with _materialized_public_weight(weights) as weight_snapshot:
             model = selected_hooks.model_factory(

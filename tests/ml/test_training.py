@@ -136,6 +136,49 @@ def test_batched_gradient_finite_check_rejects_one_nonfinite_tensor():
     ) is False
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        torch.tensor([complex(float("nan"), 0.0)]),
+        torch.tensor([complex(0.0, float("inf"))]),
+    ],
+    ids=["complex-nan", "complex-infinity"],
+)
+def test_baseline_init_finite_preflight_rejects_nonfinite_complex(value):
+    with pytest.raises(ValueError, match="finite|non-finite"):
+        training_module._validate_finite_baseline_initialization_state(
+            {"complex.weight": value}
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        torch.tensor([0, 1], dtype=torch.int64),
+        torch.tensor([False, True], dtype=torch.bool),
+    ],
+    ids=["integer", "boolean"],
+)
+def test_baseline_init_finite_preflight_allows_integer_and_boolean(value):
+    training_module._validate_finite_baseline_initialization_state(
+        {"discrete.state": value}
+    )
+
+
+def test_baseline_init_finite_preflight_fails_closed_on_check_error(
+    monkeypatch,
+):
+    def fail_check(_value):
+        raise RuntimeError("injected finite-check failure")
+
+    monkeypatch.setattr(training_module.torch, "isfinite", fail_check)
+
+    with pytest.raises(ValueError, match="finite.*failed|failed.*finite"):
+        training_module._validate_finite_baseline_initialization_state(
+            {"detector.weight": torch.ones(1)}
+        )
+
+
 def test_default_loader_factory_preserves_contract_with_synchronous_override(
     temporal_fixture,
 ):
@@ -1720,6 +1763,114 @@ def test_invalid_initialization_state_is_rejected_before_model_to_mutation(
         )
 
     assert target.to_calls == 0
+
+
+@pytest.mark.parametrize(
+    "nonfinite_value",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+def test_nonfinite_formal_baseline_state_is_rejected_before_any_mutation(
+    tmp_path,
+    temporal_config,
+    monkeypatch,
+    nonfinite_value,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    _fixture_checkpoint, p2_init, _universal_sha256 = (
+        _formal_baseline_checkpoint(
+            tmp_path / "frozen-source",
+            monkeypatch,
+            manifest,
+        )
+    )
+
+    def baseline_factory(_name, requested, _cfg):
+        state, _provenance = (
+            transfer_module.load_frozen_p2_initialization(Path(requested))
+        )
+        return TinyOBB(initial=float(state["model.000.weight"][0]))
+
+    published = train_model(
+        "baseline",
+        replace(
+            temporal_config,
+            pilot_epochs=1,
+            learning_rate=0.0,
+            pretrained_weights=str(p2_init),
+        ),
+        manifest,
+        tmp_path / "formal-baseline",
+        hooks=replace(
+            _tiny_hooks(TinyOBB(), map50_values=[0.2]),
+            model_factory=baseline_factory,
+        ),
+    )
+    payload = torch.load(
+        published.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    payload["model"]["detector.weight"].fill_(nonfinite_value)
+    torch.save(payload, published.best_checkpoint)
+    run_path = published.output_dir / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["checkpoint_artifacts"]["best"]["sha256"] = hashlib.sha256(
+        published.best_checkpoint.read_bytes()
+    ).hexdigest()
+    _write_canonical_json(run_path, run)
+
+    class MutationObservingTemporal(TinyTemporalOBB):
+        def __init__(self):
+            super().__init__()
+            self.to_calls = 0
+
+        def to(self, *args, **kwargs):
+            self.to_calls += 1
+            return super().to(*args, **kwargs)
+
+    target = MutationObservingTemporal()
+    before = {
+        name: value.detach().clone()
+        for name, value in target.state_dict().items()
+    }
+    before_bytes = {
+        name: value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+        for name, value in before.items()
+    }
+    real_build_optimizer = training_module.build_optimizer
+    optimizer_factory_calls = []
+
+    def observing_optimizer_factory(model, cfg):
+        optimizer_factory_calls.append((model, cfg))
+        return real_build_optimizer(model, cfg)
+
+    monkeypatch.setattr(
+        training_module,
+        "build_optimizer",
+        observing_optimizer_factory,
+    )
+
+    with pytest.raises(ValueError, match="finite|non-finite"):
+        train_model(
+            "mg_vtod",
+            replace(temporal_config, pilot_epochs=1),
+            manifest,
+            tmp_path / "reject-nonfinite-init",
+            init_checkpoint=published.best_checkpoint,
+            hooks=_tiny_hooks(target, map50_values=[0.3]),
+        )
+
+    assert target.to_calls == 0
+    assert optimizer_factory_calls == []
+    after = target.state_dict()
+    assert set(after) == set(before)
+    for name, value in after.items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        assert (
+            value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+            == before_bytes[name]
+        )
 
 
 @pytest.mark.parametrize("source_model_name", ["mg_vtod", "lstfe"])
