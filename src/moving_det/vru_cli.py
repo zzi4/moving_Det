@@ -5513,6 +5513,9 @@ def _load_stable_human_rgb(
     *,
     label: str,
     expected_sha256: str | None,
+    directory_fd: int,
+    entry_name: str,
+    expected_stat: os.stat_result,
 ) -> Any:
     import numpy as np
     from PIL import Image
@@ -5520,18 +5523,24 @@ def _load_stable_human_rgb(
     source = Path(path)
     descriptor = -1
     try:
-        _reject_symlink_components(source)
         descriptor = os.open(
-            source,
+            entry_name,
             os.O_RDONLY
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
         )
         opened = os.fstat(descriptor)
-        path_stat = os.stat(source, follow_symlinks=False)
+        path_stat = os.stat(
+            entry_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
         if (
             not stat.S_ISREG(opened.st_mode)
             or not stat.S_ISREG(path_stat.st_mode)
+            or _stable_file_signature(opened)
+            != _stable_file_signature(expected_stat)
             or (opened.st_dev, opened.st_ino)
             != (path_stat.st_dev, path_stat.st_ino)
             or opened.st_size <= 0
@@ -5554,8 +5563,11 @@ def _load_stable_human_rgb(
         if os.read(descriptor, 1):
             raise WorkflowError(f"{label} changed while reading: {source}")
         finished = os.fstat(descriptor)
-        final_path_stat = os.stat(source, follow_symlinks=False)
-        _reject_symlink_components(source)
+        final_path_stat = os.stat(
+            entry_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
         if (
             _stable_file_signature(finished) != _stable_file_signature(opened)
             or not stat.S_ISREG(final_path_stat.st_mode)
@@ -5584,6 +5596,200 @@ def _load_stable_human_rgb(
         raise WorkflowError(f"{label} is undecodable: {source}") from exc
 
 
+def _open_stable_human_image_directory(
+    center_path: Path,
+) -> tuple[int, os.stat_result]:
+    source = Path(center_path)
+    parent = source.parent
+    if not source.is_absolute() or source.resolve(strict=False) != source:
+        raise WorkflowError(
+            "human center frame must use a canonical absolute path"
+        )
+    descriptor = -1
+    try:
+        _reject_symlink_components(parent)
+        descriptor = os.open(
+            parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        opened = os.fstat(descriptor)
+        path_stat = os.stat(parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(path_stat.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (path_stat.st_dev, path_stat.st_ino)
+        ):
+            raise WorkflowError(
+                f"human image directory is missing or unsafe: {parent}"
+            )
+        return descriptor, opened
+    except WorkflowError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise WorkflowError(
+            f"human image directory is missing or unsafe: {parent}"
+        ) from exc
+
+
+def _assert_stable_human_image_directory(
+    center_path: Path,
+    descriptor: int,
+    opened: os.stat_result,
+) -> None:
+    parent = Path(center_path).parent
+    try:
+        finished = os.fstat(descriptor)
+        path_stat = os.stat(parent, follow_symlinks=False)
+        _reject_symlink_components(parent)
+    except (OSError, WorkflowError) as exc:
+        raise WorkflowError(
+            f"human image directory changed while reading: {parent}"
+        ) from exc
+    if (
+        _stable_file_signature(finished) != _stable_file_signature(opened)
+        or not stat.S_ISDIR(path_stat.st_mode)
+        or (path_stat.st_dev, path_stat.st_ino)
+        != (opened.st_dev, opened.st_ino)
+    ):
+        raise WorkflowError(
+            f"human image directory changed while reading: {parent}"
+        )
+
+
+def _resolve_human_jpeg_entries(
+    center_path: Path,
+    *,
+    center_frame: int,
+    frame_numbers: Sequence[int],
+    directory_fd: int,
+) -> dict[int, tuple[Path, os.stat_result]]:
+    source = Path(center_path)
+    if source.suffix.lower() != ".jpg":
+        raise WorkflowError("human center frame must use a JPEG suffix")
+    stem = source.stem
+    if not stem.isascii() or not stem.isdigit():
+        raise WorkflowError(
+            "human center frame stem must contain only ASCII digits"
+        )
+    if int(stem) != center_frame:
+        raise WorkflowError(
+            "human center frame numeric identity does not match its frame"
+        )
+    requested = set(frame_numbers)
+    candidates: dict[int, list[str]] = {frame: [] for frame in requested}
+    try:
+        names = os.listdir(directory_fd)
+    except OSError as exc:
+        raise WorkflowError(
+            "human image directory cannot be safely listed"
+        ) from exc
+    for name in names:
+        if not isinstance(name, str):
+            raise WorkflowError("human image directory entry name is invalid")
+        entry = Path(name)
+        entry_stem = entry.stem
+        if (
+            entry.name != name
+            or entry.suffix.lower() != ".jpg"
+            or not entry_stem.isascii()
+            or not entry_stem.isdigit()
+        ):
+            continue
+        identity = int(entry_stem)
+        if identity in requested:
+            candidates[identity].append(name)
+
+    resolved = {}
+    for frame in frame_numbers:
+        aliases = candidates[frame]
+        label = (
+            "human center frame"
+            if frame == center_frame
+            else "human support frame"
+        )
+        if not aliases:
+            raise WorkflowError(f"{label} is missing for numeric frame {frame}")
+        if len(aliases) != 1:
+            raise WorkflowError(
+                f"human frame {frame} has multiple JPEG aliases"
+            )
+        name = aliases[0]
+        if frame == center_frame and name != source.name:
+            raise WorkflowError(
+                "human center frame is not its unique numeric JPEG entry"
+            )
+        try:
+            entry_stat = os.stat(
+                name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise WorkflowError(f"{label} is missing or unsafe") from exc
+        if not stat.S_ISREG(entry_stat.st_mode):
+            raise WorkflowError(f"{label} is not a regular JPEG")
+        resolved[frame] = (source.parent / name, entry_stat)
+    return resolved
+
+
+def _load_human_clip_rgb(
+    record: Mapping[str, object],
+    *,
+    center_frame: int,
+    offsets: tuple[int, ...],
+) -> tuple[dict[int, Any], dict[int, Path]]:
+    center_path = record.get("image_path")
+    if not isinstance(center_path, Path):
+        raise WorkflowError("human frame image_path must be a Path")
+    center_sha256 = record.get("image_sha256")
+    if not _is_sha256(center_sha256):
+        raise WorkflowError("human frame image_sha256 is invalid")
+    frame_numbers = tuple(center_frame + offset for offset in offsets)
+    directory_fd, directory_stat = _open_stable_human_image_directory(
+        center_path
+    )
+    try:
+        resolved = _resolve_human_jpeg_entries(
+            center_path,
+            center_frame=center_frame,
+            frame_numbers=frame_numbers,
+            directory_fd=directory_fd,
+        )
+        arrays = {}
+        paths = {}
+        for offset, frame in zip(offsets, frame_numbers, strict=True):
+            path, entry_stat = resolved[frame]
+            arrays[offset] = _load_stable_human_rgb(
+                path,
+                label=(
+                    "human center frame"
+                    if offset == 0
+                    else "human support frame"
+                ),
+                expected_sha256=(str(center_sha256) if offset == 0 else None),
+                directory_fd=directory_fd,
+                entry_name=path.name,
+                expected_stat=entry_stat,
+            )
+            paths[offset] = path
+        _assert_stable_human_image_directory(
+            center_path,
+            directory_fd,
+            directory_stat,
+        )
+        return arrays, paths
+    finally:
+        os.close(directory_fd)
+
+
 def _load_full_frame_clip(
     cfg: object,
     record: Mapping[str, object],
@@ -5602,23 +5808,17 @@ def _load_full_frame_clip(
     human_image_path = record.get("image_path")
     if human_image_path is None:
         center_path = _full_frame_path(cfg, site, sequence, center)
-    elif not isinstance(human_image_path, Path):
-        raise WorkflowError("human frame image_path must be a Path")
-    else:
-        center_path = human_image_path
-        if center_path.stem != f"{center:06d}":
-            raise WorkflowError("human frame image_path does not match its identity")
-    if human_image_path is None:
+        human_arrays = None
+        human_paths = None
         center_array = _load_full_rgb(center_path)
     else:
-        center_sha256 = record.get("image_sha256")
-        if not _is_sha256(center_sha256):
-            raise WorkflowError("human frame image_sha256 is invalid")
-        center_array = _load_stable_human_rgb(
-            center_path,
-            label="human center frame",
-            expected_sha256=str(center_sha256),
+        human_arrays, human_paths = _load_human_clip_rgb(
+            record,
+            center_frame=center,
+            offsets=offsets,
         )
+        center_path = human_paths[0]
+        center_array = human_arrays[0]
     height, width = center_array.shape[:2]
     frames = []
     valid = []
@@ -5627,8 +5827,8 @@ def _load_full_frame_clip(
     for offset in offsets:
         frame_number = center + offset
         path = (
-            center_path.with_name(f"{frame_number:06d}{center_path.suffix}")
-            if human_image_path is not None
+            human_paths[offset]
+            if human_paths is not None
             else _full_frame_path(cfg, site, sequence, frame_number)
         )
         is_valid = (
@@ -5639,16 +5839,8 @@ def _load_full_frame_clip(
         valid.append(is_valid)
         support_paths.append(str(path) if is_valid else None)
         if is_valid:
-            if human_image_path is not None:
-                array = (
-                    center_array
-                    if offset == 0
-                    else _load_stable_human_rgb(
-                        path,
-                        label="human support frame",
-                        expected_sha256=None,
-                    )
-                )
+            if human_arrays is not None:
+                array = human_arrays[offset]
             else:
                 array = _load_full_rgb(path)
             if array.shape != center_array.shape:

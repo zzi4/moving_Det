@@ -2652,6 +2652,154 @@ def test_full_frame_clip_uses_human_frame_image_path(tmp_path):
 
 
 @REQUIRES_TORCH
+def test_human_full_frame_clip_resolves_numeric_jpeg_names_case_insensitively(
+    tmp_path,
+):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    offsets = (-4, -2, 0, 2, 4)
+    names = {
+        -4: "27.jpg",
+        -2: "000029.JPG",
+        0: "31.JpG",
+        2: "33.jpg",
+        4: "000035.jPg",
+    }
+    paths = {}
+    for index, offset in enumerate(offsets):
+        path = image_dir / names[offset]
+        Image.new("RGB", (8, 8), color=(10 + index, 20, 30)).save(
+            path,
+            format="JPEG",
+        )
+        paths[offset] = path
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+    cache = SimpleNamespace(
+        get=lambda key: SimpleNamespace(matrix=np.eye(2, 3, dtype=np.float32))
+    )
+
+    clip = vru_cli_module._load_full_frame_clip(
+        cfg,
+        {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "center_frame": 31,
+            "image_path": paths[0],
+            "image_sha256": hashlib.sha256(paths[0].read_bytes()).hexdigest(),
+        },
+        offsets=offsets,
+        cache=cache,
+    )
+
+    assert clip["valid"].tolist() == [True] * len(offsets)
+    assert clip["metadata"]["support_paths"] == tuple(
+        str(paths[offset]) for offset in offsets
+    )
+
+
+@REQUIRES_TORCH
+def test_human_full_frame_clip_rejects_duplicate_numeric_support_alias(tmp_path):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center_path = image_dir / "31.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center_path)
+    for name in ("33.jpg", "000033.JPG"):
+        Image.new("RGB", (8, 8), color=(40, 50, 60)).save(
+            image_dir / name,
+            format="JPEG",
+        )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    with pytest.raises(WorkflowError, match="multiple JPEG aliases"):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "image_path": center_path,
+                "image_sha256": hashlib.sha256(
+                    center_path.read_bytes()
+                ).hexdigest(),
+            },
+            offsets=(0, 2),
+            cache=SimpleNamespace(
+                get=lambda key: SimpleNamespace(
+                    matrix=np.eye(2, 3, dtype=np.float32)
+                )
+            ),
+        )
+
+
+@REQUIRES_TORCH
+@pytest.mark.parametrize("name", ("３１.jpg", "frame31.jpg", "31.png"))
+def test_human_full_frame_clip_rejects_invalid_center_jpeg_identity(
+    tmp_path,
+    name,
+):
+    image_path = tmp_path / "nas" / "site19_sequence" / "sequence_a" / name
+    image_path.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(image_path)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    with pytest.raises(WorkflowError, match="ASCII digits|JPEG suffix"):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "image_path": image_path,
+                "image_sha256": hashlib.sha256(
+                    image_path.read_bytes()
+                ).hexdigest(),
+            },
+            offsets=(0,),
+            cache=None,
+        )
+
+
+@REQUIRES_TORCH
+def test_human_full_frame_clip_rejects_symlink_selected_support(tmp_path):
+    image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
+    image_dir.mkdir(parents=True)
+    center_path = image_dir / "31.jpg"
+    target_path = tmp_path / "outside.jpg"
+    Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center_path)
+    Image.new("RGB", (8, 8), color=(40, 50, 60)).save(target_path)
+    (image_dir / "33.JPG").symlink_to(target_path)
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "legacy-images",
+    )
+
+    with pytest.raises(WorkflowError, match="regular JPEG"):
+        vru_cli_module._load_full_frame_clip(
+            cfg,
+            {
+                "site": "site19",
+                "sequence": "sequence_a",
+                "center_frame": 31,
+                "image_path": center_path,
+                "image_sha256": hashlib.sha256(
+                    center_path.read_bytes()
+                ).hexdigest(),
+            },
+            offsets=(0, 2),
+            cache=SimpleNamespace(get=lambda key: None),
+        )
+
+
+@REQUIRES_TORCH
 @pytest.mark.parametrize("center", (2926, 3216), ids=("first", "last"))
 def test_human_full_frame_clip_requires_nas_neighbors_outside_annotation_interval(
     tmp_path,
@@ -2737,9 +2885,9 @@ def test_human_center_read_rejects_replacement_and_restore_race(
 ):
     image_dir = tmp_path / "nas" / "site19_sequence" / "sequence_a"
     image_dir.mkdir(parents=True)
-    center_path = image_dir / "000031.bmp"
-    replacement_path = image_dir / "replacement.bmp"
-    backup_path = image_dir / "original.bmp"
+    center_path = image_dir / "31.jpg"
+    replacement_path = image_dir / "replacement.jpg"
+    backup_path = image_dir / "original.jpg"
     Image.new("RGB", (8, 8), color=(10, 20, 30)).save(center_path)
     Image.new("RGB", (8, 8), color=(200, 210, 220)).save(replacement_path)
     expected_sha256 = hashlib.sha256(center_path.read_bytes()).hexdigest()
