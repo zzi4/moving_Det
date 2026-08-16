@@ -7596,6 +7596,196 @@ def test_validation_snapshot_rejects_extra_before_copying_its_payload(
             pytest.fail("validation run with extra payload must be rejected")
 
 
+@pytest.mark.parametrize(
+    "mutation_point",
+    ("after-initial-list", "after-run-parse"),
+)
+def test_validation_snapshot_rejects_extra_added_around_run_parsing(
+    tmp_path,
+    monkeypatch,
+    mutation_point,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    extra = threshold.parent / "late-extra.bin"
+    mutated = False
+
+    def add_extra():
+        nonlocal mutated
+        if not mutated:
+            extra.write_bytes(b"late undeclared payload")
+            mutated = True
+
+    if mutation_point == "after-initial-list":
+        real_listdir = vru_cli_module.os.listdir
+
+        def list_then_add_extra(path):
+            names = real_listdir(path)
+            add_extra()
+            return names
+
+        monkeypatch.setattr(vru_cli_module.os, "listdir", list_then_add_extra)
+    else:
+        real_read_json = vru_cli_module._read_json
+
+        def parse_run_then_add_extra(path):
+            payload = real_read_json(path)
+            candidate = Path(path)
+            if (
+                candidate.name == "run.json"
+                and candidate.parent.name == "validation-run"
+            ):
+                add_extra()
+            return payload
+
+        monkeypatch.setattr(
+            vru_cli_module,
+            "_read_json",
+            parse_run_then_add_extra,
+        )
+
+    with pytest.raises(WorkflowError, match="artifact set|changed"):
+        with vru_cli_module._snapshot_evaluation_inputs(
+            manifest,
+            checkpoint,
+            threshold,
+            {"model_name": "baseline"},
+        ):
+            pytest.fail("late extra payload must invalidate the snapshot")
+
+    assert mutated is True
+
+
+_STRICT_VALIDATION_PAYLOADS = (
+    "ground-truth.jsonl",
+    "metrics.json",
+    "per_class.csv",
+    "per_size.csv",
+    "per_speed.csv",
+    "per_track.csv",
+    "predictions.jsonl",
+    "threshold.json",
+)
+
+
+@pytest.mark.parametrize("trigger_payload", _STRICT_VALIDATION_PAYLOADS)
+@pytest.mark.parametrize("mutation", ("insert", "delete", "rename"))
+def test_validation_snapshot_rechecks_entries_during_every_payload_copy(
+    tmp_path,
+    monkeypatch,
+    trigger_payload,
+    mutation,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    run_path = threshold.parent / "run.json"
+    renamed_run = threshold.parent / "renamed-run.json"
+    extra = threshold.parent / "late-extra.bin"
+    real_copy = vru_cli_module._copy_evaluation_regular_file
+    mutated = False
+
+    def mutate_source_entries():
+        nonlocal mutated
+        if mutation == "insert":
+            extra.write_bytes(b"late undeclared payload")
+        elif mutation == "delete":
+            run_path.unlink()
+        else:
+            run_path.rename(renamed_run)
+        mutated = True
+
+    def mutate_while_copying(source_name, *args, **kwargs):
+        if not mutated and source_name == trigger_payload:
+            mutate_source_entries()
+        return real_copy(source_name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_copy_evaluation_regular_file",
+        mutate_while_copying,
+    )
+
+    with pytest.raises(WorkflowError, match="artifact set|changed"):
+        with vru_cli_module._snapshot_evaluation_inputs(
+            manifest,
+            checkpoint,
+            threshold,
+            {"model_name": "baseline"},
+        ):
+            pytest.fail("payload-time entry mutation must invalidate snapshot")
+
+    assert mutated is True
+
+
+@pytest.mark.parametrize("mutation", ("insert", "delete", "rename"))
+def test_validation_snapshot_rechecks_entries_after_last_payload_copy(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    run_path = threshold.parent / "run.json"
+    renamed_run = threshold.parent / "renamed-run.json"
+    extra = threshold.parent / "late-extra.bin"
+    real_copy = vru_cli_module._copy_evaluation_regular_file
+    mutated = False
+
+    def mutate_source_entries():
+        nonlocal mutated
+        if mutation == "insert":
+            extra.write_bytes(b"late undeclared payload")
+        elif mutation == "delete":
+            run_path.unlink()
+        else:
+            run_path.rename(renamed_run)
+        mutated = True
+
+    def mutate_after_copy(source_name, *args, **kwargs):
+        result = real_copy(source_name, *args, **kwargs)
+        if not mutated and source_name == _STRICT_VALIDATION_PAYLOADS[-1]:
+            mutate_source_entries()
+        return result
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_copy_evaluation_regular_file",
+        mutate_after_copy,
+    )
+
+    with pytest.raises(WorkflowError, match="artifact set|changed"):
+        with vru_cli_module._snapshot_evaluation_inputs(
+            manifest,
+            checkpoint,
+            threshold,
+            {"model_name": "baseline"},
+        ):
+            pytest.fail("post-copy entry mutation must invalidate snapshot")
+
+    assert mutated is True
+
+
 def test_evaluate_test_records_frozen_threshold_source_and_never_reselects(
     tmp_path,
 ):

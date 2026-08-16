@@ -3825,6 +3825,77 @@ def _evaluation_file_signature(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _evaluation_directory_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        stat.S_IFMT(value.st_mode),
+        value.st_dev,
+        value.st_ino,
+    )
+
+
+def _list_stable_evaluation_directory(
+    descriptor: int,
+    *,
+    label: str,
+    expected_identity: tuple[int, ...] | None = None,
+    expected_signature: tuple[int, ...] | None = None,
+) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
+    try:
+        before = os.fstat(descriptor)
+        names = tuple(sorted(os.listdir(descriptor)))
+        after = os.fstat(descriptor)
+    except OSError as exc:
+        raise WorkflowError(f"{label} cannot be safely listed") from exc
+    before_identity = _evaluation_directory_identity(before)
+    after_identity = _evaluation_directory_identity(after)
+    before_signature = _evaluation_file_signature(before)
+    after_signature = _evaluation_file_signature(after)
+    if (
+        not stat.S_ISDIR(before.st_mode)
+        or not stat.S_ISDIR(after.st_mode)
+        or before_identity != after_identity
+        or before_signature != after_signature
+        or (
+            expected_identity is not None
+            and (
+                before_identity != expected_identity
+                or after_identity != expected_identity
+            )
+        )
+        or (
+            expected_signature is not None
+            and (
+                before_signature != expected_signature
+                or after_signature != expected_signature
+            )
+        )
+    ):
+        raise WorkflowError(f"{label} changed while snapshotting")
+    return names, after_identity, after_signature
+
+
+def _require_evaluation_artifact_set(
+    names: Sequence[str],
+    expected_names: set[str],
+    *,
+    label: str,
+) -> None:
+    actual_names = set(names)
+    if actual_names == expected_names:
+        return
+    missing = sorted(expected_names - actual_names)
+    extra = sorted(actual_names - expected_names)
+    details = []
+    if missing:
+        details.append(f"missing: {', '.join(missing)}")
+    if extra:
+        details.append(f"extra: {', '.join(extra)}")
+    raise WorkflowError(
+        f"{label} artifact set is invalid"
+        + (f" ({'; '.join(details)})" if details else "")
+    )
+
+
 def _absolute_evaluation_source(path: Path, *, label: str) -> Path:
     source = Path(path)
     if not source.parts or ".." in source.parts or "\x00" in str(source):
@@ -4149,12 +4220,14 @@ def _snapshot_evaluation_inputs(
                 registry=registry,
             )
             threshold_source = validation_source / threshold_source.name
-            try:
-                validation_names = tuple(sorted(os.listdir(validation_fd)))
-            except OSError as exc:
-                raise WorkflowError(
-                    "validation evaluation run cannot be safely listed"
-                ) from exc
+            (
+                validation_names,
+                validation_directory_identity,
+                validation_directory_signature,
+            ) = _list_stable_evaluation_directory(
+                validation_fd,
+                label="validation evaluation run",
+            )
             if not {"run.json", "threshold.json"}.issubset(
                 validation_names
             ):
@@ -4199,23 +4272,17 @@ def _snapshot_evaluation_inputs(
                 validation_run_header["artifact_schema"]
             )
             expected_validation_names = {"run.json", *declared_artifacts}
-            actual_validation_names = set(validation_names)
-            if actual_validation_names != expected_validation_names:
-                missing = sorted(
-                    expected_validation_names - actual_validation_names
-                )
-                extra = sorted(
-                    actual_validation_names - expected_validation_names
-                )
-                details = []
-                if missing:
-                    details.append(f"missing: {', '.join(missing)}")
-                if extra:
-                    details.append(f"extra: {', '.join(extra)}")
-                raise WorkflowError(
-                    "validation evaluation run artifact set is invalid"
-                    + (f" ({'; '.join(details)})" if details else "")
-                )
+            validation_names, _, _ = _list_stable_evaluation_directory(
+                validation_fd,
+                label="validation evaluation run",
+                expected_identity=validation_directory_identity,
+                expected_signature=validation_directory_signature,
+            )
+            _require_evaluation_artifact_set(
+                validation_names,
+                expected_validation_names,
+                label="validation evaluation run",
+            )
             for name in sorted(declared_artifacts):
                 digest, identity = _copy_evaluation_regular_file(
                     name,
@@ -4232,6 +4299,17 @@ def _snapshot_evaluation_inputs(
                     )
                 source_identities.add(identity)
                 validation_digests[name] = digest
+            validation_names, _, _ = _list_stable_evaluation_directory(
+                validation_fd,
+                label="validation evaluation run",
+                expected_identity=validation_directory_identity,
+                expected_signature=validation_directory_signature,
+            )
+            _require_evaluation_artifact_set(
+                validation_names,
+                expected_validation_names,
+                label="validation evaluation run",
+            )
             _close_evaluation_descriptor(registry, validation_fd)
             validation_run, _, _ = _load_verified_evaluation_run(
                 validation_snapshot
