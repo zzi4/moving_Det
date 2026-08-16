@@ -1,6 +1,8 @@
 from collections import OrderedDict
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
 import pickle
 import struct
@@ -79,6 +81,87 @@ def _freeze_small_p2_artifact(tmp_path, monkeypatch):
         lambda nc: _SmallP2Detector("fake", ch=3, nc=nc, verbose=False),
     )
     return freeze_p2_initialization(source_weights, tmp_path / "frozen")
+
+
+def _ordinary_checkpoint_bytes(value: float) -> bytes:
+    stream = io.BytesIO()
+    torch.save(
+        {
+            "state": OrderedDict(
+                {"model.000.weight": torch.tensor([value, value + 1.0])}
+            )
+        },
+        stream,
+    )
+    return stream.getvalue()
+
+
+def _checkpoint_state_from_stream(stream):
+    stream.seek(0)
+    return torch.load(
+        stream,
+        map_location="cpu",
+        weights_only=True,
+    )["state"]
+
+
+def _ambiguous_eocd_archive(content: bytes) -> bytes:
+    original_eocd = content.rfind(b"PK\x05\x06")
+    assert original_eocd > 0
+    (
+        signature,
+        disk_number,
+        directory_disk,
+        disk_entries,
+        total_entries,
+        directory_size,
+        directory_offset,
+        comment_size,
+    ) = struct.unpack_from("<4s4H2LH", content, original_eocd)
+    assert signature == b"PK\x05\x06"
+    assert comment_size == 0
+    central_directory = content[
+        directory_offset : directory_offset + directory_size
+    ]
+    zip64_bridge = bytearray(
+        content[directory_offset + directory_size : original_eocd]
+    )
+    assert len(zip64_bridge) == 76
+    assert zip64_bridge[:4] == b"PK\x06\x06"
+    assert zip64_bridge[56:60] == b"PK\x06\x07"
+    second_directory_offset = original_eocd + 22
+    second_zip64_offset = second_directory_offset + directory_size
+    struct.pack_into("<Q", zip64_bridge, 48, second_directory_offset)
+    struct.pack_into("<Q", zip64_bridge, 64, second_zip64_offset)
+    second_eocd = struct.pack(
+        "<4s4H2LH",
+        signature,
+        disk_number,
+        directory_disk,
+        disk_entries,
+        total_entries,
+        directory_size,
+        second_directory_offset,
+        0,
+    )
+    first_eocd = struct.pack(
+        "<4s4H2LH",
+        signature,
+        disk_number,
+        directory_disk,
+        disk_entries,
+        total_entries,
+        directory_size,
+        directory_offset,
+        len(central_directory) + len(zip64_bridge) + len(second_eocd),
+    )
+    return (
+        content[:original_eocd]
+        + first_eocd
+        + central_directory
+        + zip64_bridge
+        + second_eocd
+    )
 
 
 def _synthetic_temporal_batch() -> dict[str, object]:
@@ -235,11 +318,15 @@ def test_baseline_loss_backward_produces_finite_nonzero_gradients():
     assert any(torch.count_nonzero(gradient) > 0 for gradient in gradients)
 
 
-def test_weights_none_never_constructs_yolo(monkeypatch):
-    def reject_yolo_construction(*_args, **_kwargs):
-        raise AssertionError("YOLO must not be constructed for weights=None")
+def test_weights_none_never_loads_ultralytics_state(monkeypatch):
+    def reject_source_load(*_args, **_kwargs):
+        raise AssertionError("source checkpoint must not load for weights=None")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_yolo_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_source_load,
+    )
 
     detector = create_p2_obb_detector(weights=None)
 
@@ -247,20 +334,23 @@ def test_weights_none_never_constructs_yolo(monkeypatch):
 
 
 def test_local_pretrained_source_counts_and_loads_compatible_tensors(
+    tmp_path,
     monkeypatch,
 ):
     source = create_p2_obb_detector(weights=None)
     with torch.no_grad():
         source.model[0].conv.weight.fill_(0.125)
+    checkpoint = tmp_path / "local-only.pt"
+    checkpoint.write_bytes(b"ordinary local checkpoint placeholder")
 
-    class LocalYOLO:
-        def __init__(self, weights):
-            assert weights == "local-only.pt"
-            self.model = source
+    def load_source(stream):
+        stream.seek(0)
+        assert stream.read() == checkpoint.read_bytes()
+        return source.state_dict()
 
-    monkeypatch.setattr(baseline_module, "YOLO", LocalYOLO)
+    monkeypatch.setattr(baseline_module, "_load_ultralytics_state", load_source)
 
-    detector = create_p2_obb_detector(weights="local-only.pt")
+    detector = create_p2_obb_detector(weights=checkpoint)
 
     assert detector.transferred_tensors == len(source.state_dict())
     torch.testing.assert_close(
@@ -269,17 +359,21 @@ def test_local_pretrained_source_counts_and_loads_compatible_tensors(
     )
 
 
-def test_frozen_p2_bypasses_yolo_and_strictly_loads_all_target_tensors(
+def test_frozen_p2_bypasses_ordinary_load_and_strictly_loads_target(
     tmp_path,
     monkeypatch,
 ):
     artifact = _freeze_small_p2_artifact(tmp_path, monkeypatch)
     expected_state, _ = load_frozen_p2_initialization(artifact)
 
-    def reject_yolo(*_args, **_kwargs):
-        raise AssertionError("frozen P2 loading must not construct YOLO")
+    def reject_source_load(*_args, **_kwargs):
+        raise AssertionError("frozen P2 loading must not load ordinary source")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_yolo)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_source_load,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
 
     detector = create_p2_obb_detector(weights=artifact, nc=4)
@@ -337,28 +431,21 @@ def test_frozen_p2_rejects_unexpected_runtime_target_config_hash(
         create_p2_obb_detector(weights=artifact, nc=4)
 
 
-def test_ordinary_checkpoint_named_p2_init_still_uses_yolo(
+def test_ordinary_checkpoint_named_p2_init_still_uses_ordinary_loader(
     tmp_path,
     monkeypatch,
 ):
     ordinary = tmp_path / "p2-init.pt"
     ordinary.write_bytes(b"ordinary Ultralytics checkpoint placeholder")
 
-    class SourceModel:
-        def float(self):
-            return self
+    def load_source(stream):
+        stream.seek(0)
+        assert stream.read() == ordinary.read_bytes()
+        return OrderedDict(
+            {"model.000.weight": torch.tensor([7.0, 8.0])}
+        )
 
-        def state_dict(self):
-            return OrderedDict(
-                {"model.000.weight": torch.tensor([7.0, 8.0])}
-            )
-
-    class LocalYOLO:
-        def __init__(self, weights):
-            assert weights == str(ordinary)
-            self.model = SourceModel()
-
-    monkeypatch.setattr(baseline_module, "YOLO", LocalYOLO)
+    monkeypatch.setattr(baseline_module, "_load_ultralytics_state", load_source)
     monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
 
     detector = create_p2_obb_detector(weights=ordinary, nc=4)
@@ -369,6 +456,243 @@ def test_ordinary_checkpoint_named_p2_init_still_uses_yolo(
         detector.state_dict()["model.000.weight"],
         torch.tensor([7.0, 8.0]),
     )
+
+
+def test_ordinary_loader_consumes_probe_snapshot_during_in_place_change(
+    tmp_path,
+    monkeypatch,
+):
+    ordinary = tmp_path / "ordinary.pt"
+    original_content = _ordinary_checkpoint_bytes(3.0)
+    replacement_content = _ordinary_checkpoint_bytes(9.0)
+    assert len(original_content) == len(replacement_content)
+    ordinary.write_bytes(original_content)
+    real_zipfile = zipfile.ZipFile
+    race_triggered = False
+
+    def mutating_zipfile(*args, **kwargs):
+        nonlocal race_triggered
+        if not race_triggered:
+            race_triggered = True
+            with ordinary.open("r+b") as stream:
+                stream.write(replacement_content)
+                stream.truncate()
+        return real_zipfile(*args, **kwargs)
+
+    snapshot_paths = []
+    real_probe = baseline_module._static_frozen_marker_evidence_from_snapshot
+
+    def recording_probe(snapshot):
+        snapshot_paths.append(snapshot.path)
+        return real_probe(snapshot)
+
+    monkeypatch.setattr(transfer_module.zipfile, "ZipFile", mutating_zipfile)
+    monkeypatch.setattr(
+        baseline_module,
+        "_static_frozen_marker_evidence_from_snapshot",
+        recording_probe,
+    )
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        _checkpoint_state_from_stream,
+    )
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+    descriptor_count = len(os.listdir("/proc/self/fd"))
+
+    detector = create_p2_obb_detector(weights=ordinary, nc=4)
+
+    assert race_triggered is True
+    torch.testing.assert_close(
+        detector.state_dict()["model.000.weight"],
+        torch.tensor([3.0, 4.0]),
+    )
+    assert len(snapshot_paths) == 1
+    snapshot_path = snapshot_paths[0]
+    assert snapshot_path != ordinary
+    assert snapshot_path.suffix == ".pt"
+    assert not snapshot_path.exists()
+    assert not snapshot_path.parent.exists()
+    assert len(os.listdir("/proc/self/fd")) == descriptor_count
+
+
+def test_failed_ordinary_loader_cleans_probe_snapshot(tmp_path, monkeypatch):
+    ordinary = tmp_path / "ordinary.pt"
+    ordinary.write_bytes(_ordinary_checkpoint_bytes(3.0))
+    snapshot_paths = []
+    real_probe = baseline_module._static_frozen_marker_evidence_from_snapshot
+
+    def recording_probe(snapshot):
+        snapshot_paths.append(snapshot.path)
+        return real_probe(snapshot)
+
+    def failing_source_load(_stream):
+        raise RuntimeError("synthetic source load failure")
+
+    monkeypatch.setattr(
+        baseline_module,
+        "_static_frozen_marker_evidence_from_snapshot",
+        recording_probe,
+    )
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        failing_source_load,
+    )
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+    descriptor_count = len(os.listdir("/proc/self/fd"))
+
+    with pytest.raises(RuntimeError, match="synthetic source load failure"):
+        create_p2_obb_detector(weights=ordinary, nc=4)
+
+    assert len(snapshot_paths) == 1
+    snapshot_path = snapshot_paths[0]
+    assert snapshot_path != ordinary
+    assert not snapshot_path.exists()
+    assert not snapshot_path.parent.exists()
+    assert len(os.listdir("/proc/self/fd")) == descriptor_count
+
+
+def test_ordinary_loader_is_pinned_when_snapshot_path_is_replaced(
+    tmp_path,
+    monkeypatch,
+):
+    ordinary = tmp_path / "ordinary.pt"
+    ordinary.write_bytes(_ordinary_checkpoint_bytes(3.0))
+    replacement_content = _ordinary_checkpoint_bytes(9.0)
+    real_probe = transfer_module._static_frozen_marker_evidence_from_snapshot
+    replaced_snapshot_paths = []
+
+    def replacing_snapshot_path(snapshot):
+        assert not snapshot.path.exists()
+        marker = real_probe(snapshot)
+        replacement = snapshot.path.parent / "replacement.pt"
+        replacement.write_bytes(replacement_content)
+        os.replace(replacement, snapshot.path)
+        replaced_snapshot_paths.append(snapshot.path)
+        return marker
+
+    def load_state_from_stream(stream):
+        stream.seek(0)
+        return torch.load(
+            stream,
+            map_location="cpu",
+            weights_only=True,
+        )["state"]
+
+    monkeypatch.setattr(
+        baseline_module,
+        "_static_frozen_marker_evidence_from_snapshot",
+        replacing_snapshot_path,
+    )
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        load_state_from_stream,
+    )
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    detector = create_p2_obb_detector(weights=ordinary, nc=4)
+
+    torch.testing.assert_close(
+        detector.state_dict()["model.000.weight"],
+        torch.tensor([3.0, 4.0]),
+    )
+    assert len(replaced_snapshot_paths) == 1
+    assert not replaced_snapshot_paths[0].exists()
+    assert not replaced_snapshot_paths[0].parent.exists()
+
+
+def test_frozen_loader_consumes_probe_snapshot_during_path_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = _freeze_small_p2_artifact(tmp_path, monkeypatch)
+    replacement = tmp_path / "replacement.pt"
+    replacement.write_bytes(_ordinary_checkpoint_bytes(9.0))
+    real_zipfile = zipfile.ZipFile
+    race_triggered = False
+
+    def replacing_zipfile(*args, **kwargs):
+        nonlocal race_triggered
+        if not race_triggered:
+            race_triggered = True
+            os.replace(replacement, artifact)
+        return real_zipfile(*args, **kwargs)
+
+    def reject_source_load(*_args, **_kwargs):
+        raise AssertionError("verified frozen snapshot must not route ordinary")
+
+    monkeypatch.setattr(transfer_module.zipfile, "ZipFile", replacing_zipfile)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_source_load,
+    )
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    detector = create_p2_obb_detector(weights=artifact, nc=4)
+
+    assert race_triggered is True
+    assert detector.initialization_kind == "frozen_p2"
+    assert detector.transferred_tensors == 427
+
+
+def test_zip_comment_with_eocd_signature_remains_ordinary_and_loads(
+    tmp_path,
+    monkeypatch,
+):
+    ordinary = tmp_path / "ordinary.pt"
+    content = bytearray(_ordinary_checkpoint_bytes(5.0))
+    end_of_central_directory = content.rfind(b"PK\x05\x06")
+    assert end_of_central_directory > 0
+    comment = b"valid-comment-PK\x05\x06-inside"
+    struct.pack_into(
+        "<H",
+        content,
+        end_of_central_directory + 20,
+        len(comment),
+    )
+    ordinary.write_bytes(content + comment)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        _checkpoint_state_from_stream,
+    )
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    detector = create_p2_obb_detector(weights=ordinary, nc=4)
+
+    assert detector.initialization_kind == "ultralytics"
+    torch.testing.assert_close(
+        detector.state_dict()["model.000.weight"],
+        torch.tensor([5.0, 6.0]),
+    )
+
+
+def test_multiple_self_consistent_eocd_candidates_fail_closed(
+    tmp_path,
+    monkeypatch,
+):
+    artifact = tmp_path / "ambiguous.pt"
+    artifact.write_bytes(
+        _ambiguous_eocd_archive(_ordinary_checkpoint_bytes(5.0))
+    )
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+
+    def reject_model_construction(*_args, **_kwargs):
+        raise AssertionError("ambiguous EOCD must fail before model construction")
+
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
+    monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
+
+    with pytest.raises(ValueError, match="frozen initialization"):
+        create_p2_obb_detector(weights=artifact, nc=4)
 
 
 @pytest.mark.parametrize("damage", ["missing-fields", "extra-field"])
@@ -386,10 +710,14 @@ def test_universal_artifact_marker_always_routes_to_strict_loader(
         payload["unexpected"] = "tampered"
     torch.save(payload, artifact)
 
-    def reject_yolo(*_args, **_kwargs):
-        raise AssertionError("Universal artifact marker must not route to YOLO")
+    def reject_ordinary_load(*_args, **_kwargs):
+        raise AssertionError("Universal marker must not route ordinary loading")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_yolo)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_ordinary_load,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
 
     with pytest.raises(ValueError, match="frozen initialization children"):
@@ -414,7 +742,11 @@ def test_marker_with_weights_only_unsupported_value_fails_before_models(
     def reject_model_construction(*_args, **_kwargs):
         raise AssertionError("tagged artifact must fail before model construction")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
 
     with pytest.raises(
@@ -442,7 +774,11 @@ def test_ordered_marker_with_unsupported_value_fails_before_models(
     def reject_model_construction(*_args, **_kwargs):
         raise AssertionError("tagged artifact must fail before model construction")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
 
     with pytest.raises(ValueError, match="frozen initialization children"):
@@ -472,7 +808,11 @@ def test_legacy_marker_with_unsupported_value_fails_before_models(
     def reject_model_construction(*_args, **_kwargs):
         raise AssertionError("legacy tagged artifact must fail before construction")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
 
     with pytest.raises(ValueError, match="frozen initialization children"):
@@ -499,7 +839,11 @@ def test_truncated_tagged_torch_zip_fails_before_models(
     def reject_model_construction(*_args, **_kwargs):
         raise AssertionError("truncated tagged ZIP must fail before construction")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
 
     with pytest.raises(ValueError, match="frozen initialization children"):
@@ -525,7 +869,11 @@ def test_corrupt_zip_signature_fails_before_models(tmp_path, monkeypatch):
     def reject_model_construction(*_args, **_kwargs):
         raise AssertionError("corrupt ZIP must fail before model construction")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
 
     with pytest.raises(ValueError, match="frozen initialization children"):
@@ -564,7 +912,11 @@ def test_forged_pickle_frame_is_indeterminate(
     def reject_model_construction(*_args, **_kwargs):
         raise AssertionError("forged FRAME must fail before model construction")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
 
     with pytest.raises(ValueError, match="frozen initialization children"):
@@ -605,14 +957,18 @@ def test_indeterminate_tagged_torch_archive_fails_before_models(
     def reject_model_construction(*_args, **_kwargs):
         raise AssertionError("indeterminate archive must fail before construction")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
 
     with pytest.raises(ValueError, match="frozen initialization"):
         create_p2_obb_detector(weights=artifact, nc=4)
 
 
-def test_marker_detection_never_reads_the_entire_checkpoint(
+def test_marker_detection_never_uses_unbounded_path_read_bytes(
     tmp_path,
     monkeypatch,
 ):
@@ -622,7 +978,7 @@ def test_marker_detection_never_reads_the_entire_checkpoint(
 
     def reject_read_bytes(path):
         read_paths.append(path)
-        raise AssertionError("marker detection must not read the whole file")
+        raise AssertionError("marker detection must use bounded fd reads")
 
     monkeypatch.setattr(Path, "read_bytes", reject_read_bytes)
 
@@ -817,6 +1173,21 @@ def test_symlink_checkpoint_probe_is_fail_closed(tmp_path):
     assert transfer_module._static_frozen_marker_evidence(artifact) is None
 
 
+def test_fifo_checkpoint_probe_opens_nonblocking(tmp_path, monkeypatch):
+    artifact = tmp_path / "fifo.pt"
+    os.mkfifo(artifact)
+    real_open = os.open
+
+    def nonblocking_open(path, flags, *args, **kwargs):
+        if Path(path) == artifact:
+            assert flags & os.O_NONBLOCK
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(transfer_module.os, "open", nonblocking_open)
+
+    assert transfer_module._static_frozen_marker_evidence(artifact) is None
+
+
 def test_complete_tagged_artifact_with_unsupported_value_fails_before_models(
     tmp_path,
     monkeypatch,
@@ -845,7 +1216,11 @@ def test_complete_tagged_artifact_with_unsupported_value_fails_before_models(
     def reject_model_construction(*_args, **_kwargs):
         raise AssertionError("tagged artifact must fail before model construction")
 
-    monkeypatch.setattr(baseline_module, "YOLO", reject_model_construction)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        reject_model_construction,
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", reject_model_construction)
 
     with pytest.raises(ValueError, match="checkpoint payload is malformed"):
@@ -860,7 +1235,7 @@ def test_complete_tagged_artifact_with_unsupported_value_fails_before_models(
         for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
     ],
 )
-def test_unmarked_weights_only_unsupported_checkpoint_still_uses_yolo(
+def test_unmarked_weights_only_unsupported_checkpoint_remains_ordinary(
     tmp_path,
     monkeypatch,
     legacy,
@@ -874,21 +1249,13 @@ def test_unmarked_weights_only_unsupported_checkpoint_still_uses_yolo(
         pickle_protocol=pickle_protocol,
     )
 
-    class SourceModel:
-        def float(self):
-            return self
-
-        def state_dict(self):
-            return OrderedDict(
-                {"model.000.weight": torch.tensor([3.0, 4.0])}
-            )
-
-    class LocalYOLO:
-        def __init__(self, weights):
-            assert weights == str(ordinary)
-            self.model = SourceModel()
-
-    monkeypatch.setattr(baseline_module, "YOLO", LocalYOLO)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        lambda _stream: OrderedDict(
+            {"model.000.weight": torch.tensor([3.0, 4.0])}
+        ),
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
 
     detector = create_p2_obb_detector(weights=ordinary, nc=4)
@@ -899,7 +1266,7 @@ def test_unmarked_weights_only_unsupported_checkpoint_still_uses_yolo(
 
 @pytest.mark.parametrize("root_kind", ["dict", "ordered", "list", "tuple"])
 @pytest.mark.parametrize("legacy", [False, True])
-def test_nested_marker_in_ordinary_unsupported_checkpoint_still_uses_yolo(
+def test_nested_marker_in_unsupported_checkpoint_remains_ordinary(
     tmp_path,
     monkeypatch,
     root_kind,
@@ -924,21 +1291,13 @@ def test_nested_marker_in_ordinary_unsupported_checkpoint_still_uses_yolo(
         _use_new_zipfile_serialization=not legacy,
     )
 
-    class SourceModel:
-        def float(self):
-            return self
-
-        def state_dict(self):
-            return OrderedDict(
-                {"model.000.weight": torch.tensor([5.0, 6.0])}
-            )
-
-    class LocalYOLO:
-        def __init__(self, weights):
-            assert weights == str(ordinary)
-            self.model = SourceModel()
-
-    monkeypatch.setattr(baseline_module, "YOLO", LocalYOLO)
+    monkeypatch.setattr(
+        baseline_module,
+        "_load_ultralytics_state",
+        lambda _stream: OrderedDict(
+            {"model.000.weight": torch.tensor([5.0, 6.0])}
+        ),
+    )
     monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
 
     detector = create_p2_obb_detector(weights=ordinary, nc=4)

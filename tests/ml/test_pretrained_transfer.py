@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import OrderedDict
 import hashlib
 import json
+import os
 from pathlib import Path
 import random
 
@@ -227,6 +228,100 @@ def test_fake_freeze_is_deterministic_scoped_and_strictly_loadable(
         provenance["transferred_tensors"] = 428
     with pytest.raises(TypeError):
         provenance["loaded"][0]["name"] = "changed"
+
+
+def test_freeze_source_loader_consumes_verified_snapshot_during_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    source_weights = tmp_path / "universal.pt"
+    original_content = b"approved synthetic Universal checkpoint"
+    source_weights.write_bytes(original_content)
+    replacement = tmp_path / "replacement.pt"
+    replacement.write_bytes(b"unapproved replacement checkpoint")
+    source_sha256 = hashlib.sha256(original_content).hexdigest()
+    consumed_descriptors = []
+
+    monkeypatch.setattr(
+        transfer_module,
+        "APPROVED_UNIVERSAL_SHA256",
+        source_sha256,
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "APPROVED_UNIVERSAL_PATH",
+        source_weights.resolve(),
+        raising=False,
+    )
+    monkeypatch.setattr(transfer_module, "_build_p2_target", _FakeP2Target)
+
+    def replacing_source_loader(stream):
+        consumed_descriptors.append(stream.fileno())
+        stream.seek(0)
+        assert stream.read() == original_content
+        os.replace(replacement, source_weights)
+        return _fake_source_state()
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_load_universal_state",
+        replacing_source_loader,
+    )
+
+    artifact = freeze_p2_initialization(
+        source_weights,
+        tmp_path / "frozen",
+    )
+
+    assert artifact.is_file()
+    assert len(consumed_descriptors) == 1
+    report = json.loads(
+        (artifact.parent / "transfer_report.json").read_text(encoding="utf-8")
+    )
+    assert report["source_weights_sha256"] == source_sha256
+
+
+def test_freeze_source_loader_receives_identity_pinned_stream(
+    tmp_path,
+    monkeypatch,
+):
+    source_weights = tmp_path / "universal.pt"
+    original_content = b"approved synthetic Universal checkpoint"
+    source_weights.write_bytes(original_content)
+    source_sha256 = hashlib.sha256(original_content).hexdigest()
+    consumed_descriptors = []
+    monkeypatch.setattr(
+        transfer_module,
+        "APPROVED_UNIVERSAL_SHA256",
+        source_sha256,
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "APPROVED_UNIVERSAL_PATH",
+        source_weights.resolve(),
+        raising=False,
+    )
+    monkeypatch.setattr(transfer_module, "_build_p2_target", _FakeP2Target)
+
+    def load_from_stream(stream):
+        consumed_descriptors.append(stream.fileno())
+        stream.seek(0)
+        assert stream.read() == original_content
+        return _fake_source_state()
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_load_universal_state",
+        load_from_stream,
+    )
+
+    artifact = freeze_p2_initialization(
+        source_weights,
+        tmp_path / "frozen",
+    )
+
+    assert artifact.is_file()
+    assert len(consumed_descriptors) == 1
 
 
 def test_load_rejects_tampered_transfer_count_after_outer_hash_is_refreshed(
@@ -470,7 +565,7 @@ def test_freeze_rejects_unsafe_source_and_output_paths_before_model_loading(
     assert called is False
 
 
-def test_freeze_detects_source_mutation_and_does_not_publish(
+def test_freeze_source_in_place_mutation_cannot_change_verified_snapshot(
     tmp_path,
     monkeypatch,
 ):
@@ -489,8 +584,10 @@ def test_freeze_detects_source_mutation_and_does_not_publish(
         raising=False,
     )
 
-    def mutating_loader(path):
-        path.write_bytes(b"changed while loading")
+    def mutating_loader(stream):
+        stream.seek(0)
+        assert stream.read() == b"approved synthetic Universal checkpoint"
+        source_weights.write_bytes(b"changed while loading")
         return _fake_source_state()
 
     monkeypatch.setattr(
@@ -505,10 +602,13 @@ def test_freeze_detects_source_mutation_and_does_not_publish(
     )
     output = tmp_path / "frozen"
 
-    with pytest.raises(ValueError, match="changed while loading"):
-        freeze_p2_initialization(source_weights, output)
+    artifact = freeze_p2_initialization(source_weights, output)
 
-    assert not output.exists()
+    assert artifact == output / "p2-init.pt"
+    report = json.loads(
+        (output / "transfer_report.json").read_text(encoding="utf-8")
+    )
+    assert report["source_weights_sha256"] == source_sha256
 
 
 def test_freeze_requires_the_approved_absolute_source_path(

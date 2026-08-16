@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from collections.abc import Mapping
+from dataclasses import dataclass
 import hashlib
 import io
 import json
@@ -14,7 +15,7 @@ import stat
 import struct
 import tempfile
 from types import MappingProxyType
-from typing import Any, Iterator
+from typing import Any, BinaryIO, Iterator
 import zipfile
 
 import numpy as np
@@ -94,10 +95,85 @@ _PICKLE_SEQUENCE = object()
 _ARCHIVE_NOT_TORCH = object()
 _ARCHIVE_INDETERMINATE = object()
 _ZIP_CENTRAL_HEADER = struct.Struct("<4s6H3L5H2L")
+_ZIP_EOCD_HEADER = struct.Struct("<4s4H2LH")
+_ZIP64_EOCD_HEADER = struct.Struct("<4sQ2H2L4Q")
+_ZIP64_EOCD_LOCATOR = struct.Struct("<4sLQL")
+_SNAPSHOT_COPY_CHUNK = 1024 * 1024
 
 
 class _ProbeDict(dict[object, object]):
     pass
+
+
+class _CheckpointMissingError(ValueError):
+    pass
+
+
+class _CheckpointUnsafeError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class _CheckpointSnapshot:
+    source_path: Path
+    path: Path
+    stream: BinaryIO
+    file_size: int
+    sha256: str
+
+
+class _ValidatedZipView:
+    def __init__(self, stream: BinaryIO, eocd_offset: int) -> None:
+        self._stream = stream
+        self._eocd_offset = eocd_offset
+        self._size = eocd_offset + _ZIP_EOCD_HEADER.size
+        self._position = 0
+
+    def seekable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._position
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            position = offset
+        elif whence == os.SEEK_CUR:
+            position = self._position + offset
+        elif whence == os.SEEK_END:
+            position = self._size + offset
+        else:
+            raise ValueError("invalid ZIP seek mode")
+        if position < 0:
+            raise ValueError("negative ZIP seek position")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        if self._position >= self._size:
+            return b""
+        available = self._size - self._position
+        read_size = available if size is None or size < 0 else min(size, available)
+        start = self._position
+        self._stream.seek(start)
+        content = self._stream.read(read_size)
+        self._position += len(content)
+        comment_length_offset = self._eocd_offset + 20
+        overlap_start = max(start, comment_length_offset)
+        overlap_end = min(
+            start + len(content),
+            comment_length_offset + 2,
+        )
+        if overlap_start < overlap_end:
+            normalized = bytearray(content)
+            normalized[
+                overlap_start - start : overlap_end - start
+            ] = b"\x00" * (overlap_end - overlap_start)
+            return bytes(normalized)
+        return content
 
 
 def _validated_state(
@@ -307,6 +383,144 @@ def _reject_symlink_components(path: Path) -> None:
         current = current.parent
 
 
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            raise OSError("checkpoint snapshot write made no progress")
+        offset += written
+
+
+@contextmanager
+def _open_checkpoint_snapshot(
+    path: Path,
+    *,
+    label: str,
+) -> Iterator[_CheckpointSnapshot]:
+    source = Path(path)
+    if ".." in source.parts:
+        raise _CheckpointUnsafeError(f"{label} path traversal is forbidden")
+    try:
+        _reject_symlink_components(source)
+    except ValueError as exc:
+        raise _CheckpointUnsafeError(str(exc)) from exc
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise _CheckpointUnsafeError(
+            f"{label} requires O_NOFOLLOW support"
+        )
+    flags = (
+        os.O_RDONLY
+        | nofollow
+        | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        source_descriptor = os.open(source, flags)
+    except FileNotFoundError as exc:
+        raise _CheckpointMissingError(f"{label} does not exist: {source}") from exc
+    except OSError as exc:
+        raise _CheckpointUnsafeError(
+            f"{label} cannot be opened safely: {source}"
+        ) from exc
+    try:
+        initial_metadata = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(initial_metadata.st_mode)
+            or initial_metadata.st_size < 0
+            or initial_metadata.st_size > _CHECKPOINT_PROBE_FILE_LIMIT
+        ):
+            raise _CheckpointUnsafeError(
+                f"{label} must be a bounded regular file: {source}"
+            )
+        file_size = initial_metadata.st_size
+        digest = hashlib.sha256()
+        with tempfile.TemporaryDirectory(
+            prefix="moving-det-checkpoint-"
+        ) as temporary_root:
+            snapshot_path = Path(temporary_root) / "checkpoint.pt"
+            snapshot_flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            snapshot_descriptor = os.open(
+                snapshot_path,
+                snapshot_flags,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            snapshot_stream: BinaryIO | None = None
+            try:
+                remaining = file_size
+                while remaining:
+                    chunk = os.read(
+                        source_descriptor,
+                        min(remaining, _SNAPSHOT_COPY_CHUNK),
+                    )
+                    if not chunk:
+                        raise _CheckpointUnsafeError(
+                            f"{label} changed while snapshotting"
+                        )
+                    digest.update(chunk)
+                    _write_all(snapshot_descriptor, chunk)
+                    remaining -= len(chunk)
+                if os.read(source_descriptor, 1):
+                    raise _CheckpointUnsafeError(
+                        f"{label} changed while snapshotting"
+                    )
+                final_metadata = os.fstat(source_descriptor)
+                if _file_identity(final_metadata) != _file_identity(
+                    initial_metadata
+                ):
+                    raise _CheckpointUnsafeError(
+                        f"{label} changed while snapshotting"
+                    )
+                snapshot_metadata = os.fstat(snapshot_descriptor)
+                if (
+                    not stat.S_ISREG(snapshot_metadata.st_mode)
+                    or snapshot_metadata.st_size != file_size
+                ):
+                    raise _CheckpointUnsafeError(
+                        f"{label} snapshot is incomplete"
+                    )
+                os.fchmod(snapshot_descriptor, stat.S_IRUSR)
+                os.lseek(snapshot_descriptor, 0, os.SEEK_SET)
+                snapshot_stream = os.fdopen(
+                    snapshot_descriptor,
+                    "rb",
+                    closefd=True,
+                )
+                snapshot_descriptor = -1
+                os.unlink(snapshot_path)
+                yield _CheckpointSnapshot(
+                    source_path=source,
+                    path=snapshot_path,
+                    stream=snapshot_stream,
+                    file_size=file_size,
+                    sha256=digest.hexdigest(),
+                )
+            finally:
+                if snapshot_stream is not None:
+                    snapshot_stream.close()
+                elif snapshot_descriptor >= 0:
+                    os.close(snapshot_descriptor)
+    finally:
+        os.close(source_descriptor)
+
+
 def _regular_file_bytes(path: Path, *, label: str) -> bytes:
     source = Path(path)
     if ".." in source.parts:
@@ -334,7 +548,9 @@ def _paths_overlap(left: Path, right: Path) -> bool:
 def _validated_freeze_paths(source_weights: Path, output: Path) -> tuple[Path, Path]:
     source = Path(source_weights)
     destination = Path(output)
-    _regular_file_bytes(source, label="source weights")
+    if ".." in source.parts:
+        raise ValueError("source weights path traversal is forbidden")
+    _reject_symlink_components(source)
     if not destination.name or ".." in destination.parts:
         raise ValueError("output path traversal is forbidden")
     _reject_symlink_components(destination)
@@ -342,7 +558,7 @@ def _validated_freeze_paths(source_weights: Path, output: Path) -> tuple[Path, P
         raise ValueError("output overlaps source weights")
     if destination.exists() or destination.is_symlink():
         raise ValueError("output directory must not already exist")
-    return source.resolve(strict=True), destination.resolve(strict=False)
+    return source.resolve(strict=False), destination.resolve(strict=False)
 
 
 @contextmanager
@@ -365,11 +581,45 @@ def _scoped_rng(seed: int) -> Iterator[None]:
         np.random.set_state(numpy_state)
 
 
-def _load_universal_state(path: Path) -> Mapping[str, Tensor]:
-    from ultralytics import YOLO
+def _load_ultralytics_state(stream: BinaryIO) -> Mapping[str, Tensor]:
+    from ultralytics.nn import tasks as ultralytics_tasks
 
-    source = YOLO(str(path)).model
-    return source.float().state_dict()
+    stream.seek(0)
+    with ultralytics_tasks.temporary_modules(
+        modules={
+            "ultralytics.yolo.utils": "ultralytics.utils",
+            "ultralytics.yolo.v8": "ultralytics.models.yolo",
+            "ultralytics.yolo.data": "ultralytics.data",
+        },
+        attributes={
+            "ultralytics.nn.modules.block.Silence": "torch.nn.Identity",
+            "ultralytics.nn.tasks.YOLOv10DetectionModel": (
+                "ultralytics.nn.tasks.DetectionModel"
+            ),
+            "ultralytics.utils.loss.v10DetectLoss": (
+                "ultralytics.utils.loss.E2EDetectLoss"
+            ),
+            **(
+                {"pathlib.PosixPath": "pathlib.WindowsPath"}
+                if ultralytics_tasks.WINDOWS
+                else {"pathlib.WindowsPath": "pathlib.PosixPath"}
+            ),
+        },
+    ):
+        checkpoint = ultralytics_tasks.torch_load(
+            stream,
+            map_location="cpu",
+        )
+    if not isinstance(checkpoint, dict):
+        checkpoint = {"model": getattr(checkpoint, "model", None)}
+    candidate = checkpoint.get("ema") or checkpoint.get("model")
+    if not isinstance(candidate, torch.nn.Module):
+        raise ValueError("Ultralytics checkpoint does not contain a model")
+    return candidate.float().state_dict()
+
+
+def _load_universal_state(stream: BinaryIO) -> Mapping[str, Tensor]:
+    return _load_ultralytics_state(stream)
 
 
 def _build_p2_target(nc: int) -> object:
@@ -659,13 +909,13 @@ def _pickle_stream_end(content: bytes, offset: int) -> int | None:
     return None
 
 
-def _legacy_torch_pickle(path: Path) -> bytes | object:
+def _legacy_torch_pickle(snapshot: _CheckpointSnapshot) -> bytes | object:
     try:
-        with path.open("rb") as stream:
-            content = stream.read(
-                _PICKLE_PROBE_LIMIT + _LEGACY_HEADER_LIMIT + 1
-            )
-    except OSError:
+        snapshot.stream.seek(0)
+        content = snapshot.stream.read(
+            _PICKLE_PROBE_LIMIT + _LEGACY_HEADER_LIMIT + 1
+        )
+    except (OSError, ValueError):
         return _ARCHIVE_INDETERMINATE
     magic = _legacy_scalar_pickle(content, 0)
     if magic is None:
@@ -690,116 +940,187 @@ def _legacy_torch_pickle(path: Path) -> bytes | object:
     return content[system_info_end:payload_end]
 
 
-def _bounded_probe_file_size(path: Path) -> int | object:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
-        return _ARCHIVE_NOT_TORCH
-    except OSError:
-        return _ARCHIVE_INDETERMINATE
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_size < 0
-        or metadata.st_size > _CHECKPOINT_PROBE_FILE_LIMIT
+def _valid_zip64_bridge(
+    stream: BinaryIO,
+    *,
+    directory_end: int,
+    eocd_offset: int,
+    disk_entries: int,
+    total_entries: int,
+    directory_size: int,
+    directory_offset: int,
+) -> bool:
+    if directory_end == eocd_offset:
+        return True
+    if eocd_offset - directory_end != (
+        _ZIP64_EOCD_HEADER.size + _ZIP64_EOCD_LOCATOR.size
     ):
-        return _ARCHIVE_INDETERMINATE
-    return metadata.st_size
+        return False
+    try:
+        stream.seek(directory_end)
+        zip64_header = stream.read(_ZIP64_EOCD_HEADER.size)
+        locator_header = stream.read(_ZIP64_EOCD_LOCATOR.size)
+        if (
+            len(zip64_header) != _ZIP64_EOCD_HEADER.size
+            or len(locator_header) != _ZIP64_EOCD_LOCATOR.size
+        ):
+            return False
+        zip64_fields = _ZIP64_EOCD_HEADER.unpack(zip64_header)
+        locator_fields = _ZIP64_EOCD_LOCATOR.unpack(locator_header)
+    except (OSError, ValueError, struct.error):
+        return False
+    return (
+        zip64_fields[0] == b"PK\x06\x06"
+        and zip64_fields[1] == _ZIP64_EOCD_HEADER.size - 12
+        and zip64_fields[4] == 0
+        and zip64_fields[5] == 0
+        and zip64_fields[6] == disk_entries
+        and zip64_fields[7] == total_entries
+        and zip64_fields[8] == directory_size
+        and zip64_fields[9] == directory_offset
+        and locator_fields[0] == b"PK\x06\x07"
+        and locator_fields[1] == 0
+        and locator_fields[2] == directory_end
+        and locator_fields[3] == 1
+    )
+
+
+def _valid_central_directory(
+    stream: BinaryIO,
+    *,
+    eocd_offset: int,
+    disk_entries: int,
+    total_entries: int,
+    directory_size: int,
+    directory_offset: int,
+) -> bool:
+    directory_end = directory_offset + directory_size
+    if not _valid_zip64_bridge(
+        stream,
+        directory_end=directory_end,
+        eocd_offset=eocd_offset,
+        disk_entries=disk_entries,
+        total_entries=total_entries,
+        directory_size=directory_size,
+        directory_offset=directory_offset,
+    ):
+        return False
+    entry_count = 0
+    consumed = 0
+    try:
+        stream.seek(directory_offset)
+        while consumed < directory_size:
+            header = stream.read(_ZIP_CENTRAL_HEADER.size)
+            if len(header) != _ZIP_CENTRAL_HEADER.size:
+                return False
+            fields = _ZIP_CENTRAL_HEADER.unpack(header)
+            if (
+                fields[0] != b"PK\x01\x02"
+                or fields[13] != 0
+                or fields[16] >= directory_offset
+            ):
+                return False
+            variable_size = fields[10] + fields[11] + fields[12]
+            entry_size = _ZIP_CENTRAL_HEADER.size + variable_size
+            if entry_size > directory_size - consumed:
+                return False
+            stream.seek(variable_size, os.SEEK_CUR)
+            consumed += entry_size
+            entry_count += 1
+            if entry_count > _ZIP_MEMBER_LIMIT:
+                return False
+    except (OSError, ValueError, struct.error):
+        return False
+    return consumed == directory_size and entry_count == total_entries
 
 
 def _bounded_zip_directory(
-    path: Path,
-    file_size: int,
-) -> tuple[int, int] | None:
+    snapshot: _CheckpointSnapshot,
+) -> tuple[int, int, int] | None:
+    file_size = snapshot.file_size
     read_size = min(file_size, _ZIP_EOCD_SEARCH_LIMIT)
     if read_size < 22:
         return None
     try:
-        with path.open("rb") as stream:
-            stream.seek(file_size - read_size)
-            tail = stream.read(read_size)
-    except OSError:
+        snapshot.stream.seek(file_size - read_size)
+        tail = snapshot.stream.read(read_size)
+    except (OSError, ValueError):
         return None
     if len(tail) != read_size:
         return None
-    relative_offset = tail.rfind(b"PK\x05\x06")
-    if relative_offset < 0 or relative_offset + 22 > len(tail):
+    candidates: list[tuple[int, int, int]] = []
+    search_offset = 0
+    tail_absolute_offset = file_size - read_size
+    while True:
+        relative_offset = tail.find(b"PK\x05\x06", search_offset)
+        if relative_offset < 0:
+            break
+        search_offset = relative_offset + 1
+        if relative_offset + _ZIP_EOCD_HEADER.size > len(tail):
+            continue
+        try:
+            (
+                signature,
+                disk_number,
+                directory_disk,
+                disk_entries,
+                total_entries,
+                directory_size,
+                directory_offset,
+                comment_size,
+            ) = _ZIP_EOCD_HEADER.unpack_from(tail, relative_offset)
+        except struct.error:
+            continue
+        absolute_offset = tail_absolute_offset + relative_offset
+        if (
+            signature != b"PK\x05\x06"
+            or absolute_offset + _ZIP_EOCD_HEADER.size + comment_size
+            != file_size
+            or disk_number != 0
+            or directory_disk != 0
+            or disk_entries != total_entries
+            or total_entries > _ZIP_MEMBER_LIMIT
+            or directory_size > _ZIP_CENTRAL_DIRECTORY_LIMIT
+            or directory_offset > absolute_offset
+            or directory_size > absolute_offset - directory_offset
+        ):
+            continue
+        if not _valid_central_directory(
+            snapshot.stream,
+            eocd_offset=absolute_offset,
+            disk_entries=disk_entries,
+            total_entries=total_entries,
+            directory_size=directory_size,
+            directory_offset=directory_offset,
+        ):
+            continue
+        candidates.append(
+            (total_entries, directory_size, absolute_offset)
+        )
+        if len(candidates) > 1:
+            return None
+    if len(candidates) != 1:
         return None
-    try:
-        (
-            signature,
-            disk_number,
-            directory_disk,
-            disk_entries,
-            total_entries,
-            directory_size,
-            directory_offset,
-            comment_size,
-        ) = struct.unpack_from("<4s4H2LH", tail, relative_offset)
-    except struct.error:
-        return None
-    absolute_offset = file_size - read_size + relative_offset
-    if (
-        signature != b"PK\x05\x06"
-        or absolute_offset + 22 + comment_size != file_size
-        or disk_number != 0
-        or directory_disk != 0
-        or disk_entries != total_entries
-        or total_entries > _ZIP_MEMBER_LIMIT
-        or directory_size > _ZIP_CENTRAL_DIRECTORY_LIMIT
-        or directory_offset > absolute_offset
-        or directory_size > absolute_offset - directory_offset
-    ):
-        return None
-    entry_count = 0
-    consumed = 0
-    try:
-        with path.open("rb") as stream:
-            stream.seek(directory_offset)
-            while consumed < directory_size:
-                header = stream.read(_ZIP_CENTRAL_HEADER.size)
-                if len(header) != _ZIP_CENTRAL_HEADER.size:
-                    return None
-                fields = _ZIP_CENTRAL_HEADER.unpack(header)
-                if fields[0] != b"PK\x01\x02" or fields[13] != 0:
-                    return None
-                variable_size = fields[10] + fields[11] + fields[12]
-                entry_size = _ZIP_CENTRAL_HEADER.size + variable_size
-                if entry_size > directory_size - consumed:
-                    return None
-                stream.seek(variable_size, os.SEEK_CUR)
-                consumed += entry_size
-                entry_count += 1
-                if entry_count > _ZIP_MEMBER_LIMIT:
-                    return None
-    except (OSError, struct.error):
-        return None
-    if consumed != directory_size or entry_count != total_entries:
-        return None
-    return total_entries, directory_size
+    return candidates[0]
 
 
-def _torch_archive_pickle(path: Path) -> bytes | object:
-    file_size = _bounded_probe_file_size(path)
-    if file_size is _ARCHIVE_NOT_TORCH:
-        return _ARCHIVE_NOT_TORCH
-    if file_size is _ARCHIVE_INDETERMINATE:
-        return _ARCHIVE_INDETERMINATE
-    assert type(file_size) is int
+def _torch_archive_pickle(snapshot: _CheckpointSnapshot) -> bytes | object:
     try:
-        with path.open("rb") as stream:
-            signature = stream.read(4)
-    except OSError:
+        snapshot.stream.seek(0)
+        signature = snapshot.stream.read(4)
+    except (OSError, ValueError):
         return _ARCHIVE_INDETERMINATE
     if signature != b"PK\x03\x04":
         if signature.startswith(b"PK"):
             return _ARCHIVE_INDETERMINATE
-        return _legacy_torch_pickle(path)
-    directory = _bounded_zip_directory(path, file_size)
+        return _legacy_torch_pickle(snapshot)
+    directory = _bounded_zip_directory(snapshot)
     if directory is None:
         return _ARCHIVE_INDETERMINATE
-    expected_members, _directory_size = directory
+    expected_members, _directory_size, eocd_offset = directory
     try:
-        with zipfile.ZipFile(path) as archive:
+        archive_view = _ValidatedZipView(snapshot.stream, eocd_offset)
+        with zipfile.ZipFile(archive_view) as archive:
             members = archive.infolist()
             if (
                 len(members) != expected_members
@@ -839,8 +1160,10 @@ def _torch_archive_pickle(path: Path) -> bytes | object:
         return _ARCHIVE_INDETERMINATE
 
 
-def _static_frozen_marker_evidence(path: Path) -> bool | None:
-    content = _torch_archive_pickle(path)
+def _static_frozen_marker_evidence_from_snapshot(
+    snapshot: _CheckpointSnapshot,
+) -> bool | None:
+    content = _torch_archive_pickle(snapshot)
     if content is _ARCHIVE_NOT_TORCH:
         return False
     if content is _ARCHIVE_INDETERMINATE:
@@ -848,6 +1171,16 @@ def _static_frozen_marker_evidence(path: Path) -> bool | None:
     assert isinstance(content, bytes)
     probed = _probe_pickle_top_level_marker(content)
     return probed
+
+
+def _static_frozen_marker_evidence(path: Path) -> bool | None:
+    try:
+        with _open_checkpoint_snapshot(path, label="checkpoint") as snapshot:
+            return _static_frozen_marker_evidence_from_snapshot(snapshot)
+    except _CheckpointMissingError:
+        return False
+    except _CheckpointUnsafeError:
+        return None
 
 
 def _is_frozen_p2_initialization(path: Path) -> bool:
@@ -976,8 +1309,6 @@ def freeze_p2_initialization(
             f"{approved_lexical_path}"
         )
     _reject_symlink_components(requested_source)
-    if not requested_source.is_file():
-        raise ValueError(f"source weights must be a regular file: {requested_source}")
     if (
         not approved_lexical_path.is_absolute()
         or requested_source != approved_lexical_path
@@ -992,15 +1323,18 @@ def freeze_p2_initialization(
         raise ValueError(
             f"source weights must use the approved Universal path: {approved_path}"
         )
-    source_sha256 = _sha256_regular_file(source_path, label="source weights")
-    if source_sha256 != APPROVED_UNIVERSAL_SHA256:
-        raise ValueError("source weights SHA-256 is not the approved Universal hash")
-
-    with _scoped_rng(seed):
-        loaded_source = _load_universal_state(source_path)
+    with _open_checkpoint_snapshot(
+        source_path,
+        label="source weights",
+    ) as source_snapshot:
+        source_sha256 = source_snapshot.sha256
+        if source_sha256 != APPROVED_UNIVERSAL_SHA256:
+            raise ValueError(
+                "source weights SHA-256 is not the approved Universal hash"
+            )
+        with _scoped_rng(seed):
+            loaded_source = _load_universal_state(source_snapshot.stream)
     source_state = _validated_state(loaded_source, label="source")
-    if _sha256_regular_file(source_path, label="source weights") != source_sha256:
-        raise ValueError("source weights changed while loading")
     with _scoped_rng(seed):
         target = _build_p2_target(nc)
     target_state = _validated_state(target.state_dict(), label="target")
@@ -1255,15 +1589,14 @@ def _deep_freeze(value: object) -> object:
     return value
 
 
-def load_frozen_p2_initialization(
+def _load_frozen_p2_initialization_snapshot(
     path: Path,
+    snapshot: _CheckpointSnapshot,
 ) -> tuple[dict[str, Tensor], Mapping[str, object]]:
-    """Strictly verify and load a frozen Universal-P2 initialization artifact."""
     artifact = Path(path)
     if artifact.name != "p2-init.pt":
         raise ValueError("frozen initialization path must name p2-init.pt")
-    checkpoint_content = _regular_file_bytes(artifact, label="frozen checkpoint")
-    root = artifact.resolve(strict=True).parent
+    root = artifact.parent.resolve(strict=True)
     _reject_symlink_components(root)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("frozen initialization root must be a regular directory")
@@ -1287,21 +1620,22 @@ def load_frozen_p2_initialization(
         "transfer_report.json",
     }:
         raise ValueError("run metadata artifact set is invalid")
-    contents = {
-        "p2-init.pt": checkpoint_content,
-        "transfer_report.json": report_content,
+    digests = {
+        "p2-init.pt": snapshot.sha256,
+        "transfer_report.json": hashlib.sha256(report_content).hexdigest(),
     }
-    for name, content in contents.items():
+    for name, actual_digest in digests.items():
         entry = artifacts[name]
         if not isinstance(entry, dict) or set(entry) != {"sha256"}:
             raise ValueError("run metadata artifact fingerprint is invalid")
         expected = entry["sha256"]
-        if not _is_sha256(expected) or expected != hashlib.sha256(content).hexdigest():
+        if not _is_sha256(expected) or expected != actual_digest:
             raise ValueError(f"frozen artifact SHA-256 mismatch: {name}")
 
     try:
+        snapshot.stream.seek(0)
         payload = torch.load(
-            io.BytesIO(checkpoint_content),
+            snapshot.stream,
             map_location="cpu",
             weights_only=True,
         )
@@ -1346,3 +1680,15 @@ def load_frozen_p2_initialization(
         "target_tensors": validated_report["target_count"],
     }
     return model_state, _deep_freeze(provenance)
+
+
+def load_frozen_p2_initialization(
+    path: Path,
+) -> tuple[dict[str, Tensor], Mapping[str, object]]:
+    """Strictly verify and load a frozen Universal-P2 initialization artifact."""
+    artifact = Path(path)
+    with _open_checkpoint_snapshot(
+        artifact,
+        label="frozen checkpoint",
+    ) as snapshot:
+        return _load_frozen_p2_initialization_snapshot(artifact, snapshot)
