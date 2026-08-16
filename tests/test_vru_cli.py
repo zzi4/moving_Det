@@ -35,6 +35,7 @@ from moving_det.vru_cli import (
     build_parser,
     main,
     run_audit_sample,
+    run_build_human_benchmark,
     run_build_manifest,
     run_cache_alignments,
     run_compare,
@@ -45,6 +46,7 @@ from moving_det.vru_cli import (
 
 
 EXPECTED_COMMANDS = {
+    "build-human-benchmark",
     "build-manifest",
     "cache-alignments",
     "train",
@@ -96,6 +98,10 @@ def test_vru_cli_exposes_exact_workflow_commands():
 @pytest.mark.parametrize(
     "arguments",
     [
+        (
+            "build-human-benchmark --zip manual.zip --image-root /data/images "
+            "--output runs/human-benchmark"
+        ),
         (
             "build-manifest --config configs/vrud-temporal-obb.yaml "
             "--output runs/vrud-pilot/manifest"
@@ -173,6 +179,119 @@ def test_diagnose_overfit_parser_preserves_all_frozen_inputs():
     assert args.manifest == Path("manifest")
     assert args.alignment_cache == Path("cache")
     assert args.output == Path("diagnostic")
+
+
+def test_build_human_benchmark_parser_preserves_all_required_inputs():
+    args = build_parser().parse_args(
+        [
+            "build-human-benchmark",
+            "--zip",
+            "manual.zip",
+            "--image-root",
+            "/data/images",
+            "--output",
+            "runs/human-benchmark",
+        ]
+    )
+
+    assert args.command == "build-human-benchmark"
+    assert args.zip == Path("manual.zip")
+    assert args.image_root == Path("/data/images")
+    assert args.output == Path("runs/human-benchmark")
+
+
+def test_build_human_benchmark_routes_through_main():
+    captured = {}
+
+    def handler(args):
+        captured["args"] = args
+        return 19
+
+    result = main(
+        "build-human-benchmark --zip manual.zip --image-root images "
+        "--output benchmark".split(),
+        handlers={"build-human-benchmark": handler},
+    )
+
+    assert result == 19
+    assert captured["args"].command == "build-human-benchmark"
+
+
+def test_build_human_benchmark_handler_resolves_paths_and_prints_manifest(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    source_zip = tmp_path / "manual.zip"
+    source_zip.write_bytes(b"synthetic ZIP")
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    output = tmp_path / "runs" / "human-benchmark"
+    captured = {}
+    benchmark = object()
+
+    def builder(zip_path, images):
+        captured["builder"] = (zip_path, images)
+        return benchmark
+
+    def freezer(value, destination):
+        captured["freezer"] = (value, destination)
+        return destination / "benchmark.json"
+
+    args = build_parser().parse_args(
+        [
+            "build-human-benchmark",
+            "--zip",
+            "manual.zip",
+            "--image-root",
+            "images",
+            "--output",
+            "runs/human-benchmark",
+        ]
+    )
+    result = run_build_human_benchmark(args, builder=builder, freezer=freezer)
+
+    assert result == 0
+    assert captured["builder"] == (source_zip.resolve(), image_root.resolve())
+    assert captured["freezer"] == (benchmark, output.resolve())
+    assert capsys.readouterr().out.strip() == str(
+        (output / "benchmark.json").resolve()
+    )
+
+
+@pytest.mark.parametrize("overlap", ["zip", "image-root"])
+def test_build_human_benchmark_rejects_overlap_before_parsing_archive(
+    tmp_path,
+    overlap,
+):
+    source_zip = tmp_path / "manual.zip"
+    source_zip.write_bytes(b"not parsed")
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    output = source_zip if overlap == "zip" else image_root / "benchmark"
+    called = False
+
+    def builder(*_args):
+        nonlocal called
+        called = True
+        raise AssertionError("archive parser must not be called")
+
+    args = build_parser().parse_args(
+        [
+            "build-human-benchmark",
+            "--zip",
+            str(source_zip),
+            "--image-root",
+            str(image_root),
+            "--output",
+            str(output),
+        ]
+    )
+    with pytest.raises(WorkflowError, match="overlaps"):
+        run_build_human_benchmark(args, builder=builder)
+
+    assert called is False
 
 
 def test_diagnose_overfit_routes_through_main():

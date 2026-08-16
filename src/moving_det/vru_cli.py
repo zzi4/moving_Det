@@ -249,6 +249,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    human_benchmark = subparsers.add_parser(
+        "build-human-benchmark",
+        help="parse and atomically freeze the approved human OBB benchmark",
+    )
+    human_benchmark.add_argument("--zip", type=_path_argument, required=True)
+    human_benchmark.add_argument(
+        "--image-root",
+        type=_path_argument,
+        required=True,
+    )
+    human_benchmark.add_argument("--output", type=_path_argument, required=True)
+
     build = subparsers.add_parser(
         "build-manifest",
         help="build the strict frozen VRUD manifests",
@@ -386,6 +398,7 @@ def main(
     _validate_cross_arguments(parser, args)
     selected = (
         {
+            "build-human-benchmark": run_build_human_benchmark,
             "build-manifest": run_build_manifest,
             "cache-alignments": run_cache_alignments,
             "train": run_train,
@@ -621,6 +634,51 @@ def _load_config(
 
         loader = load_temporal_config
     return loader(Path(path))
+
+
+def run_build_human_benchmark(
+    args: argparse.Namespace,
+    *,
+    builder: Callable[[Path, Path], object] | None = None,
+    freezer: Callable[[object, Path], Path] | None = None,
+) -> int:
+    zip_path = Path(args.zip)
+    image_root = Path(args.image_root)
+    output = Path(args.output)
+    _reject_symlink_components(zip_path)
+    _reject_symlink_components(image_root)
+    if not zip_path.is_file():
+        raise WorkflowError(f"human annotation ZIP does not exist: {zip_path}")
+    if not image_root.is_dir():
+        raise WorkflowError(
+            f"human benchmark image root does not exist: {image_root}"
+        )
+    resolved_zip = zip_path.resolve(strict=True)
+    resolved_image_root = image_root.resolve(strict=True)
+    if not output.name or ".." in output.parts:
+        raise WorkflowError(f"output path traversal is forbidden: {output}")
+    validated_output = _validate_output(
+        output,
+        inputs=(resolved_zip,),
+        source_roots=(resolved_image_root,),
+    )
+    if validated_output.exists():
+        if not validated_output.is_dir() or any(validated_output.iterdir()):
+            raise WorkflowError("output must be an empty directory")
+    resolved_output = validated_output.resolve(strict=False)
+
+    if builder is None:
+        from moving_det.ml.human_benchmark import parse_human_benchmark
+
+        builder = parse_human_benchmark
+    if freezer is None:
+        from moving_det.ml.human_benchmark_artifacts import freeze_human_benchmark
+
+        freezer = freeze_human_benchmark
+    benchmark = builder(resolved_zip, resolved_image_root)
+    manifest = Path(freezer(benchmark, resolved_output))
+    print(manifest.resolve())
+    return 0
 
 
 def run_build_manifest(
