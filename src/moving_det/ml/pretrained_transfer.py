@@ -125,8 +125,54 @@ def _require_exact_fields(
 
 
 def _require_plain_int(value: object, *, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is not int:
         raise ValueError(f"{label} must be an integer")
+    return value
+
+
+def _require_nonnegative_plain_int(value: object, *, label: str) -> int:
+    converted = _require_plain_int(value, label=label)
+    if converted < 0:
+        raise ValueError(f"{label} must be non-negative")
+    return converted
+
+
+def _require_identity_fields(
+    value: Mapping[str, object],
+    *,
+    label: str,
+    include_seed_and_nc: bool,
+) -> None:
+    artifact_kind = value["artifact_kind"]
+    if not isinstance(artifact_kind, str) or artifact_kind != _ARTIFACT_KIND:
+        raise ValueError(f"{label} artifact_kind is invalid")
+    schema_version = _require_plain_int(
+        value["schema_version"],
+        label=f"{label} schema_version",
+    )
+    if schema_version != _SCHEMA_VERSION:
+        raise ValueError(f"{label} schema_version is unsupported")
+    if include_seed_and_nc:
+        seed = _require_plain_int(value["seed"], label=f"{label} seed")
+        nc = _require_plain_int(value["nc"], label=f"{label} nc")
+        if not 0 <= seed < 2**63:
+            raise ValueError(f"{label} seed is invalid")
+        if nc != _EXPECTED_NC:
+            raise ValueError(f"{label} nc must equal 4")
+
+
+def _require_shape(value: object, *, label: str) -> list[int]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} shape must be a list")
+    if any(
+        type(dimension) is not int
+        or dimension < 0
+        or dimension >= 2**63
+        for dimension in value
+    ):
+        raise ValueError(
+            f"{label} shape dimensions must be plain non-negative integers"
+        )
     return value
 
 
@@ -271,11 +317,16 @@ def _validated_freeze_paths(source_weights: Path, output: Path) -> tuple[Path, P
 def _scoped_rng(seed: int) -> Iterator[None]:
     python_state = random.getstate()
     numpy_state = np.random.get_state()
+    cuda_devices: list[int] = []
+    if torch.cuda.is_available():
+        cuda_devices = list(range(torch.cuda.device_count()))
     try:
-        with torch.random.fork_rng(devices=[]):
+        with torch.random.fork_rng(devices=cuda_devices):
             random.seed(seed)
             np.random.seed(seed % (2**32))
             torch.random.default_generator.manual_seed(seed)
+            if cuda_devices:
+                torch.cuda.manual_seed_all(seed)
             yield
     finally:
         random.setstate(python_state)
@@ -310,9 +361,7 @@ def _is_frozen_p2_initialization(path: Path) -> bool:
         return False
     return (
         isinstance(payload, dict)
-        and set(payload) == _PAYLOAD_FIELDS
         and payload.get("artifact_kind") == _ARTIFACT_KIND
-        and payload.get("schema_version") == _SCHEMA_VERSION
     )
 
 
@@ -425,12 +474,30 @@ def freeze_p2_initialization(
     nc: int = 4,
 ) -> Path:
     """Freeze the approved Universal checkpoint into a deterministic P2 artifact."""
-    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**63:
+    if type(seed) is not int or not 0 <= seed < 2**63:
         raise ValueError("seed must be an integer in [0, 2**63)")
-    if isinstance(nc, bool) or not isinstance(nc, int) or nc != _EXPECTED_NC:
+    if type(nc) is not int or nc != _EXPECTED_NC:
         raise ValueError("Universal P2 initialization requires integer nc=4")
+    requested_source = Path(source_weights)
+    approved_lexical_path = Path(APPROVED_UNIVERSAL_PATH)
+    if not requested_source.is_absolute():
+        raise ValueError(
+            "source weights must use the absolute approved Universal path: "
+            f"{approved_lexical_path}"
+        )
+    _reject_symlink_components(requested_source)
+    if not requested_source.is_file():
+        raise ValueError(f"source weights must be a regular file: {requested_source}")
+    if (
+        not approved_lexical_path.is_absolute()
+        or requested_source != approved_lexical_path
+    ):
+        raise ValueError(
+            "source weights must use the absolute approved Universal path: "
+            f"{approved_lexical_path}"
+        )
     source_path, output_path = _validated_freeze_paths(source_weights, output)
-    approved_path = Path(APPROVED_UNIVERSAL_PATH).resolve(strict=False)
+    approved_path = approved_lexical_path.resolve(strict=False)
     if source_path != approved_path:
         raise ValueError(
             f"source weights must use the approved Universal path: {approved_path}"
@@ -547,6 +614,20 @@ def _validate_report(
     model_state: Mapping[str, Tensor],
 ) -> dict[str, object]:
     _require_exact_fields(report, _REPORT_FIELDS, label="transfer report")
+    _require_identity_fields(
+        report,
+        label="transfer report",
+        include_seed_and_nc=True,
+    )
+    for hash_name in (
+        "source_weights_sha256",
+        "target_config_sha256",
+        "transfer_names_sha256",
+        "loaded_tensors_sha256",
+        "model_state_sha256",
+    ):
+        if not _is_sha256(report[hash_name]):
+            raise ValueError(f"transfer report {hash_name} is invalid")
     loaded = _entry_list(report, "loaded")
     missing = _entry_list(report, "missing_in_source")
     mismatched = _entry_list(report, "shape_mismatch")
@@ -566,6 +647,24 @@ def _validate_report(
         for entry in entries:
             if set(entry) != expected_entry_fields[label]:
                 raise ValueError(f"transfer report {label} entry fields are invalid")
+            if label == "shape_mismatch":
+                source_shape = _require_shape(
+                    entry["source_shape"],
+                    label="transfer report shape_mismatch source",
+                )
+                target_shape = _require_shape(
+                    entry["target_shape"],
+                    label="transfer report shape_mismatch target",
+                )
+                if source_shape == target_shape:
+                    raise ValueError(
+                        "transfer report shape_mismatch shapes must differ"
+                    )
+            else:
+                _require_shape(
+                    entry["shape"],
+                    label=f"transfer report {label}",
+                )
 
     count_lists = {
         "loaded_count": loaded,
@@ -574,11 +673,20 @@ def _validate_report(
         "unused_source_count": unused,
     }
     for count_name, entries in count_lists.items():
-        if _require_plain_int(report[count_name], label=count_name) != len(entries):
+        if _require_nonnegative_plain_int(
+            report[count_name],
+            label=f"transfer report {count_name}",
+        ) != len(entries):
             label = count_name.removesuffix("_count").replace("_", " ")
             raise ValueError(f"transfer report {label} count is inconsistent")
-    source_count = _require_plain_int(report["source_count"], label="source_count")
-    target_count = _require_plain_int(report["target_count"], label="target_count")
+    source_count = _require_nonnegative_plain_int(
+        report["source_count"],
+        label="transfer report source_count",
+    )
+    target_count = _require_nonnegative_plain_int(
+        report["target_count"],
+        label="transfer report target_count",
+    )
     if source_count != len(loaded) + len(mismatched) + len(unused):
         raise ValueError("transfer report source count is inconsistent")
     if target_count != len(loaded) + len(mismatched) + len(missing):
@@ -625,7 +733,6 @@ def _validate_report(
         if (
             name not in model_state
             or entry["target_shape"] != _shape(model_state[name])
-            or not isinstance(entry["source_shape"], list)
         ):
             raise ValueError("transfer report shape mismatch entry is inconsistent")
 
@@ -679,11 +786,11 @@ def load_frozen_p2_initialization(
     report = _load_canonical_json_bytes(report_content, label="transfer report")
     run = _load_canonical_json_bytes(run_content, label="run metadata")
     _require_exact_fields(run, _RUN_FIELDS, label="run metadata")
-    if (
-        run["artifact_kind"] != _ARTIFACT_KIND
-        or run["schema_version"] != _SCHEMA_VERSION
-    ):
-        raise ValueError("run metadata identity is invalid")
+    _require_identity_fields(
+        run,
+        label="run metadata",
+        include_seed_and_nc=False,
+    )
     artifacts = run["artifacts"]
     if not isinstance(artifacts, dict) or set(artifacts) != {
         "p2-init.pt",
@@ -713,17 +820,11 @@ def load_frozen_p2_initialization(
     if not isinstance(payload, dict):
         raise ValueError("frozen checkpoint payload must be a mapping")
     _require_exact_fields(payload, _PAYLOAD_FIELDS, label="frozen checkpoint")
-    if (
-        payload["artifact_kind"] != _ARTIFACT_KIND
-        or payload["schema_version"] != _SCHEMA_VERSION
-    ):
-        raise ValueError("frozen checkpoint identity is invalid")
-    seed = _require_plain_int(payload["seed"], label="seed")
-    nc = _require_plain_int(payload["nc"], label="nc")
-    if not 0 <= seed < 2**63:
-        raise ValueError("frozen checkpoint seed is invalid")
-    if nc != _EXPECTED_NC:
-        raise ValueError("frozen checkpoint requires nc=4")
+    _require_identity_fields(
+        payload,
+        label="frozen checkpoint",
+        include_seed_and_nc=True,
+    )
     for name in (
         "source_weights_sha256",
         "target_config_sha256",

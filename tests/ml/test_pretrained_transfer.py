@@ -111,6 +111,25 @@ def _refresh_run_hash(root: Path, name: str) -> None:
     _canonical_json(run_path, run)
 
 
+def _freeze_with_mismatch_and_unused(tmp_path, monkeypatch) -> Path:
+    source_weights = tmp_path / "universal.pt"
+    source_weights.write_bytes(b"approved synthetic Universal checkpoint")
+    _install_fake_models(monkeypatch, source_weights)
+
+    def source_with_nonloaded_entries(_path):
+        state = _fake_source_state()
+        state["model.427.weight"] = torch.zeros(3)
+        state["unused.weight"] = torch.zeros(2)
+        return state
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_load_universal_state",
+        source_with_nonloaded_entries,
+    )
+    return freeze_p2_initialization(source_weights, tmp_path / "frozen")
+
+
 def test_compatible_state_only_clones_exact_name_and_shape_matches():
     source = OrderedDict(
         (
@@ -267,6 +286,106 @@ def test_load_rejects_cross_category_target_partition_tamper(
         load_frozen_p2_initialization(artifact)
 
 
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "loaded-float",
+        "missing-float",
+        "mismatch-negative-source",
+        "mismatch-float-target",
+        "mismatch-equal-shapes",
+        "unused-bool",
+        "unused-overflow",
+    ],
+)
+def test_load_rejects_invalid_transfer_report_shape_schema(
+    tmp_path,
+    monkeypatch,
+    tamper,
+):
+    artifact = _freeze_with_mismatch_and_unused(tmp_path, monkeypatch)
+    report_path = artifact.parent / "transfer_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if tamper == "loaded-float":
+        report["loaded"][0]["shape"] = [2.0]
+    elif tamper == "missing-float":
+        report["missing_in_source"][0]["shape"] = [2.0]
+    elif tamper == "mismatch-negative-source":
+        report["shape_mismatch"][0]["source_shape"] = [-1]
+    elif tamper == "mismatch-float-target":
+        report["shape_mismatch"][0]["target_shape"] = [2.0]
+    elif tamper == "mismatch-equal-shapes":
+        report["shape_mismatch"][0]["source_shape"] = [2]
+    elif tamper == "unused-bool":
+        report["unused_source"][0]["shape"] = [True]
+    else:
+        report["unused_source"][0]["shape"] = [2**63]
+    _canonical_json(report_path, report)
+    _refresh_run_hash(artifact.parent, "transfer_report.json")
+
+    with pytest.raises(ValueError, match="shape"):
+        load_frozen_p2_initialization(artifact)
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered"),
+    [
+        ("schema_version", True),
+        ("seed", 20260806.0),
+        ("nc", 4.0),
+    ],
+)
+def test_load_rejects_non_plain_report_identity_fields(
+    tmp_path,
+    monkeypatch,
+    field,
+    tampered,
+):
+    source_weights = tmp_path / "universal.pt"
+    source_weights.write_bytes(b"approved synthetic Universal checkpoint")
+    _install_fake_models(monkeypatch, source_weights)
+    artifact = freeze_p2_initialization(source_weights, tmp_path / "frozen")
+    report_path = artifact.parent / "transfer_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report[field] = tampered
+    _canonical_json(report_path, report)
+    _refresh_run_hash(artifact.parent, "transfer_report.json")
+
+    with pytest.raises(ValueError, match=field):
+        load_frozen_p2_initialization(artifact)
+
+
+def test_load_rejects_boolean_run_schema_version(tmp_path, monkeypatch):
+    source_weights = tmp_path / "universal.pt"
+    source_weights.write_bytes(b"approved synthetic Universal checkpoint")
+    _install_fake_models(monkeypatch, source_weights)
+    artifact = freeze_p2_initialization(source_weights, tmp_path / "frozen")
+    run_path = artifact.parent / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["schema_version"] = True
+    _canonical_json(run_path, run)
+
+    with pytest.raises(ValueError, match="schema_version"):
+        load_frozen_p2_initialization(artifact)
+
+
+def test_load_rejects_boolean_checkpoint_schema_version(
+    tmp_path,
+    monkeypatch,
+):
+    source_weights = tmp_path / "universal.pt"
+    source_weights.write_bytes(b"approved synthetic Universal checkpoint")
+    _install_fake_models(monkeypatch, source_weights)
+    artifact = freeze_p2_initialization(source_weights, tmp_path / "frozen")
+    payload = torch.load(artifact, map_location="cpu", weights_only=True)
+    payload["schema_version"] = True
+    torch.save(payload, artifact)
+    _refresh_run_hash(artifact.parent, "p2-init.pt")
+
+    with pytest.raises(ValueError, match="schema_version"):
+        load_frozen_p2_initialization(artifact)
+
+
 def test_load_rejects_noncanonical_json_even_with_refreshed_outer_hash(
     tmp_path,
     monkeypatch,
@@ -291,6 +410,11 @@ def test_freeze_rejects_unsafe_source_and_output_paths_before_model_loading(
 ):
     source_weights = tmp_path / "universal.pt"
     source_weights.write_bytes(b"approved synthetic Universal checkpoint")
+    monkeypatch.setattr(
+        transfer_module,
+        "APPROVED_UNIVERSAL_PATH",
+        source_weights.resolve(),
+    )
     source_link = tmp_path / "source-link.pt"
     source_link.symlink_to(source_weights)
     called = False
@@ -373,7 +497,22 @@ def test_freeze_requires_the_approved_absolute_source_path(
         freeze_p2_initialization(copied, tmp_path / "frozen")
 
 
-def test_freeze_does_not_seed_cuda_generators(
+def test_freeze_rejects_relative_spelling_of_approved_source_path(
+    tmp_path,
+    monkeypatch,
+):
+    source_weights = tmp_path / "universal.pt"
+    source_weights.write_bytes(b"approved synthetic Universal checkpoint")
+    _install_fake_models(monkeypatch, source_weights)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="absolute approved Universal path"):
+        freeze_p2_initialization(Path("universal.pt"), tmp_path / "frozen")
+
+    assert not (tmp_path / "frozen").exists()
+
+
+def test_freeze_does_not_initialize_unavailable_cuda_generators(
     tmp_path,
     monkeypatch,
 ):
@@ -381,6 +520,14 @@ def test_freeze_does_not_seed_cuda_generators(
     source_weights.write_bytes(b"approved synthetic Universal checkpoint")
     _install_fake_models(monkeypatch, source_weights)
     cuda_seed_calls = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "device_count",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("unavailable CUDA must not enumerate devices")
+        ),
+    )
     monkeypatch.setattr(
         torch.cuda,
         "manual_seed_all",
@@ -390,6 +537,76 @@ def test_freeze_does_not_seed_cuda_generators(
     freeze_p2_initialization(source_weights, tmp_path / "frozen")
 
     assert cuda_seed_calls == []
+
+
+def test_freeze_scopes_and_seeds_every_injected_cuda_generator(
+    tmp_path,
+    monkeypatch,
+):
+    source_weights = tmp_path / "universal.pt"
+    source_weights.write_bytes(b"approved synthetic Universal checkpoint")
+    _install_fake_models(monkeypatch, source_weights)
+    cuda_states = [
+        torch.tensor([11], dtype=torch.uint8),
+        torch.tensor([29], dtype=torch.uint8),
+    ]
+    initial_states = [state.clone() for state in cuda_states]
+    observed = []
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_rng_state",
+        lambda device: cuda_states[device].clone(),
+    )
+
+    def set_cuda_state(state, device):
+        cuda_states[device] = state.clone()
+
+    def seed_all_cuda(seed):
+        for device in range(2):
+            cuda_states[device] = torch.tensor(
+                [(seed + device) % 251],
+                dtype=torch.uint8,
+            )
+
+    monkeypatch.setattr(torch.cuda, "set_rng_state", set_cuda_state)
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", seed_all_cuda)
+
+    def cuda_mutating_source(_path):
+        observed.append(("source", tuple(int(state.item()) for state in cuda_states)))
+        cuda_states[0].add_(7)
+        return _fake_source_state()
+
+    def cuda_mutating_target(nc):
+        observed.append(("target", tuple(int(state.item()) for state in cuda_states)))
+        cuda_states[1].add_(9)
+        return _FakeP2Target(nc)
+
+    monkeypatch.setattr(
+        transfer_module,
+        "_load_universal_state",
+        cuda_mutating_source,
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "_build_p2_target",
+        cuda_mutating_target,
+    )
+
+    freeze_p2_initialization(source_weights, tmp_path / "first")
+    for actual, expected in zip(cuda_states, initial_states):
+        torch.testing.assert_close(actual, expected)
+    freeze_p2_initialization(source_weights, tmp_path / "second")
+
+    for actual, expected in zip(cuda_states, initial_states):
+        torch.testing.assert_close(actual, expected)
+    assert observed[:2] == observed[2:]
+    assert observed[0][1] == (
+        20260806 % 251,
+        (20260806 + 1) % 251,
+    )
 
 
 def test_freeze_rejects_float_nc_before_publishing(tmp_path, monkeypatch):

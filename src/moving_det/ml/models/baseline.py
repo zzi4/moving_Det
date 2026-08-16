@@ -48,8 +48,11 @@ def create_p2_obb_detector(
         weights is not None
         and _is_frozen_p2_initialization(Path(weights))
     )
-    if frozen and nc != 4:
-        raise ValueError("frozen P2 initialization requires nc=4")
+    if frozen and (
+        type(nc) is not int
+        or nc != 4
+    ):
+        raise ValueError("frozen P2 initialization requires plain integer nc=4")
     detector = OBBModel(
         str(_MODEL_CONFIG),
         ch=3,

@@ -297,6 +297,27 @@ def test_frozen_p2_rejects_non_four_class_target(tmp_path, monkeypatch):
         create_p2_obb_detector(weights=artifact, nc=3)
 
 
+@pytest.mark.parametrize("invalid_nc", [4.0, True])
+def test_frozen_p2_rejects_non_plain_nc_before_detector_construction(
+    tmp_path,
+    monkeypatch,
+    invalid_nc,
+):
+    artifact = _freeze_small_p2_artifact(tmp_path, monkeypatch)
+
+    def reject_detector_construction(*_args, **_kwargs):
+        raise AssertionError("invalid frozen nc must fail before construction")
+
+    monkeypatch.setattr(
+        baseline_module,
+        "OBBModel",
+        reject_detector_construction,
+    )
+
+    with pytest.raises(ValueError, match="plain integer nc=4"):
+        create_p2_obb_detector(weights=artifact, nc=invalid_nc)
+
+
 def test_frozen_p2_rejects_unexpected_runtime_target_config_hash(
     tmp_path,
     monkeypatch,
@@ -343,3 +364,28 @@ def test_ordinary_checkpoint_named_p2_init_still_uses_yolo(
         detector.state_dict()["model.000.weight"],
         torch.tensor([7.0, 8.0]),
     )
+
+
+@pytest.mark.parametrize("damage", ["missing-fields", "extra-field"])
+def test_universal_artifact_marker_always_routes_to_strict_loader(
+    tmp_path,
+    monkeypatch,
+    damage,
+):
+    artifact = tmp_path / "p2-init.pt"
+    payload = {
+        "artifact_kind": "universal_p2_initialization",
+        "schema_version": 1,
+    }
+    if damage == "extra-field":
+        payload["unexpected"] = "tampered"
+    torch.save(payload, artifact)
+
+    def reject_yolo(*_args, **_kwargs):
+        raise AssertionError("Universal artifact marker must not route to YOLO")
+
+    monkeypatch.setattr(baseline_module, "YOLO", reject_yolo)
+    monkeypatch.setattr(baseline_module, "OBBModel", _SmallP2Detector)
+
+    with pytest.raises(ValueError, match="frozen initialization children"):
+        create_p2_obb_detector(weights=artifact, nc=4)
