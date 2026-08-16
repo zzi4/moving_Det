@@ -5,9 +5,11 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import zipfile
 
 import pytest
 
+from moving_det.geometry.obb import obb_to_points, points_to_obb
 from moving_det.ml.human_benchmark import (
     HumanBenchmark,
     HumanFrame,
@@ -35,22 +37,36 @@ CHILD_NAMES = ARTIFACT_NAMES - {"benchmark.json"}
 @pytest.fixture
 def synthetic_benchmark(tmp_path: Path) -> HumanBenchmark:
     source_zip = tmp_path / "manual.zip"
-    source_zip.write_bytes(b"synthetic annotation source")
     image_root = tmp_path / "images" / "site19_sequence" / "sequence_a"
     image_root.mkdir(parents=True)
     first_image = image_root / "000010.jpg"
     second_image = image_root / "000011.jpg"
     first_image.write_bytes(b"first synthetic image")
     second_image.write_bytes(b"second synthetic image")
+    first_annotation = "synthetic/site19_sequence/sequence_a/000010.json"
+    second_annotation = "synthetic/site19_sequence/sequence_a/000011.json"
+    with zipfile.ZipFile(source_zip, "w") as archive:
+        archive.writestr(first_annotation, b"{}")
+        archive.writestr(
+            first_annotation.removesuffix(".json") + ".jpg",
+            first_image.read_bytes(),
+        )
+        archive.writestr(second_annotation, b"{}")
+        archive.writestr(
+            second_annotation.removesuffix(".json") + ".jpg",
+            second_image.read_bytes(),
+        )
+        archive.writestr(
+            "annotation-only/site19_sequence/sequence_a/000010.json",
+            b"{}",
+        )
     frames = (
         HumanFrame(
             site="site19",
             sequence="sequence_a",
             frame=10,
             image_path=first_image,
-            annotation_member=(
-                "synthetic/site19_sequence/sequence_a/000010.json"
-            ),
+            annotation_member=first_annotation,
             image_sha256=hashlib.sha256(first_image.read_bytes()).hexdigest(),
         ),
         HumanFrame(
@@ -58,9 +74,7 @@ def synthetic_benchmark(tmp_path: Path) -> HumanBenchmark:
             sequence="sequence_a",
             frame=11,
             image_path=second_image,
-            annotation_member=(
-                "synthetic/site19_sequence/sequence_a/000011.json"
-            ),
+            annotation_member=second_annotation,
             image_sha256=hashlib.sha256(second_image.read_bytes()).hexdigest(),
         ),
     )
@@ -349,6 +363,115 @@ def _rewrite_jsonl(output: Path, name: str, update) -> None:
     _rewrite_manifest(output, refresh)
 
 
+@pytest.mark.parametrize(
+    "annotation_member",
+    [
+        "missing/site19_sequence/sequence_a/000010.json",
+        "annotation-only/site19_sequence/sequence_a/000010.json",
+    ],
+)
+def test_load_requires_real_annotation_and_paired_jpeg_members(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+    annotation_member: str,
+) -> None:
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    _rewrite_jsonl(
+        output,
+        "frames.jsonl",
+        lambda rows: rows[0].update(annotation_member=annotation_member),
+    )
+
+    with pytest.raises(ValueError, match="source ZIP member"):
+        load_human_benchmark(output)
+
+
+def test_load_rejects_rehashed_images_from_a_forged_common_root(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+) -> None:
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    forged_sequence = (
+        tmp_path / "forged-images" / "site19_sequence" / "sequence_a"
+    )
+    forged_sequence.mkdir(parents=True)
+    forged_paths = []
+    for frame in (10, 11):
+        path = forged_sequence / f"{frame:06d}.jpg"
+        path.write_bytes(f"forged image {frame}".encode("ascii"))
+        forged_paths.append(path)
+
+    def replace_images(rows):
+        for row, forged in zip(rows, forged_paths, strict=True):
+            row["image_path"] = str(forged.resolve())
+            row["image_sha256"] = hashlib.sha256(forged.read_bytes()).hexdigest()
+
+    _rewrite_jsonl(output, "frames.jsonl", replace_images)
+
+    with pytest.raises(ValueError, match="image bytes differ.*source ZIP"):
+        load_human_benchmark(output)
+
+
+def test_load_binds_image_basename_to_the_paired_zip_jpeg(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+) -> None:
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(synthetic_benchmark, output)
+    original = synthetic_benchmark.frames[0].image_path
+    alias = original.with_name("10.JPG")
+    alias.write_bytes(original.read_bytes())
+    _rewrite_jsonl(
+        output,
+        "frames.jsonl",
+        lambda rows: rows[0].update(image_path=str(alias.resolve())),
+    )
+
+    with pytest.raises(ValueError, match="paired JPEG.*image path"):
+        load_human_benchmark(output)
+
+
+def test_freeze_accepts_task1_numeric_stems_and_case_insensitive_suffixes(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+) -> None:
+    original_frame = synthetic_benchmark.frames[0]
+    renamed_image = original_frame.image_path.with_name("10.JpG")
+    original_frame.image_path.rename(renamed_image)
+    renamed_annotation = "synthetic/site19_sequence/sequence_a/10.JsOn"
+    renamed_jpeg = "synthetic/site19_sequence/sequence_a/10.JpG"
+    alternate_zip = tmp_path / "alternate.zip"
+    with (
+        zipfile.ZipFile(synthetic_benchmark.source_zip) as source,
+        zipfile.ZipFile(alternate_zip, "w") as destination,
+    ):
+        for info in source.infolist():
+            name = {
+                original_frame.annotation_member: renamed_annotation,
+                original_frame.annotation_member.removesuffix(".json")
+                + ".jpg": renamed_jpeg,
+            }.get(info.filename, info.filename)
+            destination.writestr(name, source.read(info))
+    first_frame = replace(
+        original_frame,
+        image_path=renamed_image,
+        annotation_member=renamed_annotation,
+    )
+    benchmark = replace(
+        synthetic_benchmark,
+        source_zip=alternate_zip,
+        source_zip_sha256=hashlib.sha256(alternate_zip.read_bytes()).hexdigest(),
+        frames=(first_frame, synthetic_benchmark.frames[1]),
+    )
+    output = tmp_path / "benchmark"
+
+    freeze_human_benchmark(benchmark, output)
+
+    assert load_human_benchmark(output) == benchmark
+
+
 @pytest.mark.parametrize("field", ["image", "annotation"])
 def test_load_rejects_frame_sources_bound_to_another_identity(
     tmp_path: Path,
@@ -398,6 +521,33 @@ def test_load_rederives_truth_motion_instead_of_trusting_rehashed_values(
 
     with pytest.raises(ValueError, match="derived motion mismatch"):
         load_human_benchmark(output)
+
+
+def test_load_uses_small_explicit_speed_tolerance(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+) -> None:
+    near = tmp_path / "near"
+    freeze_human_benchmark(synthetic_benchmark, near)
+    _rewrite_jsonl(
+        near,
+        "ground-truth.jsonl",
+        lambda rows: rows[0].update(pixel_speed=2.0 + 5e-10),
+    )
+
+    loaded = load_human_benchmark(near)
+
+    assert loaded.truths[0].pixel_speed == pytest.approx(2.0 + 5e-10)
+
+    material = tmp_path / "material"
+    freeze_human_benchmark(synthetic_benchmark, material)
+    _rewrite_jsonl(
+        material,
+        "ground-truth.jsonl",
+        lambda rows: rows[0].update(pixel_speed=2.0 + 1e-6),
+    )
+    with pytest.raises(ValueError, match="derived motion mismatch"):
+        load_human_benchmark(material)
 
 
 @pytest.mark.parametrize(
@@ -467,6 +617,40 @@ def test_load_rejects_ignore_geometry_outside_task1_semantics(
         load_human_benchmark(output)
 
 
+def test_truth_boundary_accepts_roundoff_but_rejects_real_excursion(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+) -> None:
+    boundary_obb = points_to_obb(
+        [(0.0, 10.0), (10.0, 11.0), (10.4, 7.0), (0.4, 6.0)]
+    )
+    reconstructed_min_x = float(obb_to_points(boundary_obb)[:, 0].min())
+    assert -1e-12 < reconstructed_min_x < 0.0
+    boundary_truth = replace(
+        synthetic_benchmark.truths[0],
+        obb=boundary_obb,
+        pixel_speed=0.0,
+    )
+    boundary = replace(
+        synthetic_benchmark,
+        annotation_count=4,
+        truths=(boundary_truth,),
+    )
+    output = tmp_path / "boundary"
+
+    freeze_human_benchmark(boundary, output)
+
+    assert load_human_benchmark(output) == boundary
+
+    outside_obb = replace(boundary_obb, cx=boundary_obb.cx - 1e-6)
+    outside = replace(
+        boundary,
+        truths=(replace(boundary_truth, obb=outside_obb),),
+    )
+    with pytest.raises(ValueError, match="truth OBB.*inside"):
+        freeze_human_benchmark(outside, tmp_path / "outside")
+
+
 def test_load_enforces_exact_annotation_count_relation(
     tmp_path: Path,
     synthetic_benchmark: HumanBenchmark,
@@ -488,6 +672,45 @@ def test_load_enforces_exact_annotation_count_relation(
     _rewrite_manifest(output, change_manifest)
 
     with pytest.raises(ValueError, match="exact annotation count"):
+        load_human_benchmark(output)
+
+
+def test_load_treats_vehicle_none_as_a_stable_track_class(
+    tmp_path: Path,
+    synthetic_benchmark: HumanBenchmark,
+) -> None:
+    valid_truth = replace(
+        synthetic_benchmark.truths[1],
+        track_id=9,
+        pixel_speed=0.0,
+    )
+    source = replace(
+        synthetic_benchmark,
+        annotation_count=4,
+        truths=(valid_truth,),
+    )
+    output = tmp_path / "benchmark"
+    freeze_human_benchmark(source, output)
+    _rewrite_jsonl(
+        output,
+        "ignore.jsonl",
+        lambda rows: rows[0].update(class_id=None, track_id=9),
+    )
+    audit_path = output / "vehicle-audit.json"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["annotation_count"] = 3
+    audit_content = _canonical_bytes(audit)
+    audit_path.write_bytes(audit_content)
+
+    def change_manifest(manifest):
+        manifest["annotation_count"] = 3
+        manifest["files"]["vehicle-audit.json"]["sha256"] = hashlib.sha256(
+            audit_content
+        ).hexdigest()
+
+    _rewrite_manifest(output, change_manifest)
+
+    with pytest.raises(ValueError, match="class drift"):
         load_human_benchmark(output)
 
 
@@ -645,12 +868,13 @@ def test_load_revalidates_source_zip_and_image_fingerprints(
     synthetic_benchmark: HumanBenchmark,
 ) -> None:
     changed_zip = tmp_path / "changed-zip"
+    source_zip_bytes = synthetic_benchmark.source_zip.read_bytes()
     freeze_human_benchmark(synthetic_benchmark, changed_zip)
     synthetic_benchmark.source_zip.write_bytes(b"changed source ZIP")
     with pytest.raises(ValueError, match="source ZIP fingerprint"):
         load_human_benchmark(changed_zip)
 
-    synthetic_benchmark.source_zip.write_bytes(b"synthetic annotation source")
+    synthetic_benchmark.source_zip.write_bytes(source_zip_bytes)
     changed_image = tmp_path / "changed-image"
     freeze_human_benchmark(synthetic_benchmark, changed_image)
     synthetic_benchmark.frames[0].image_path.write_bytes(b"changed image")

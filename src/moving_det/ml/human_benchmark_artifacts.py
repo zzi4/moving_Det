@@ -4,12 +4,14 @@ import hashlib
 import json
 import math
 import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 import shutil
 import tempfile
 from types import MappingProxyType
 from typing import Any, BinaryIO
+import zipfile
 
 from moving_det.ml.human_benchmark import (
     IMAGE_HEIGHT,
@@ -77,6 +79,9 @@ _IGNORE_FIELDS = frozenset(
     }
 )
 _SHA256_HEX_LENGTH = 64
+_TRUTH_BOUNDARY_TOLERANCE = 1e-12
+_SPEED_ABSOLUTE_TOLERANCE = 1e-9
+_SPEED_RELATIVE_TOLERANCE = 1e-12
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -568,28 +573,28 @@ def _validate_frame_sources(frames: tuple[HumanFrame, ...]) -> Path:
         raise ValueError("human benchmark must contain at least one frame")
     image_roots: set[Path] = set()
     for row in frames:
-        frame_stem = f"{row.frame:06d}"
-        expected_tail = (
-            f"{row.site}_sequence",
-            row.sequence,
-            f"{frame_stem}.jpg",
-        )
-        image_tail = (
+        image_directory = (
             row.image_path.parent.parent.name,
             row.image_path.parent.name,
-            row.image_path.name,
         )
         member = PurePosixPath(row.annotation_member)
-        expected_member_tail = (
+        expected_directory = (
             f"{row.site}_sequence",
             row.sequence,
-            f"{frame_stem}.json",
         )
-        if (
-            image_tail != expected_tail
-            or len(member.parts) < 3
-            or tuple(member.parts[-3:]) != expected_member_tail
-        ):
+        try:
+            sources_match = (
+                image_directory == expected_directory
+                and row.image_path.suffix.lower() == ".jpg"
+                and _archive_frame(row.image_path.name) == row.frame
+                and len(member.parts) >= 3
+                and tuple(member.parent.parts[-2:]) == expected_directory
+                and member.suffix.lower() == ".json"
+                and _archive_frame(row.annotation_member) == row.frame
+            )
+        except ValueError:
+            sources_match = False
+        if not sources_match:
             raise ValueError(
                 "frame identity does not match its image/annotation source: "
                 f"{(row.site, row.sequence, row.frame)}"
@@ -598,6 +603,98 @@ def _validate_frame_sources(frames: tuple[HumanFrame, ...]) -> Path:
     if len(image_roots) != 1:
         raise ValueError("frame identity sources do not share one image root")
     return image_roots.pop()
+
+
+def _archive_frame(member: str) -> int:
+    stem = PurePosixPath(member).stem
+    if not stem.isascii() or not stem.isdigit():
+        raise ValueError(f"source ZIP member frame stem must be numeric: {member}")
+    return int(stem)
+
+
+def _unsafe_zip_member(info: zipfile.ZipInfo) -> bool:
+    path = PurePosixPath(info.filename)
+    return (
+        info.is_dir()
+        or path.is_absolute()
+        or ".." in path.parts
+        or stat.S_ISLNK(info.external_attr >> 16)
+    )
+
+
+def _validate_source_archive(benchmark: HumanBenchmark) -> None:
+    try:
+        with zipfile.ZipFile(benchmark.source_zip) as archive:
+            infos = archive.infolist()
+            by_name: dict[str, zipfile.ZipInfo] = {}
+            for info in infos:
+                if info.filename in by_name:
+                    raise ValueError(
+                        f"duplicate source ZIP member: {info.filename}"
+                    )
+                by_name[info.filename] = info
+
+            for row in benchmark.frames:
+                annotation = by_name.get(row.annotation_member)
+                if annotation is None or _unsafe_zip_member(annotation):
+                    raise ValueError(
+                        "source ZIP member is missing or unsafe: "
+                        f"{row.annotation_member}"
+                    )
+                annotation_path = PurePosixPath(annotation.filename)
+                if (
+                    annotation_path.suffix.lower() != ".json"
+                    or _archive_frame(annotation.filename) != row.frame
+                ):
+                    raise ValueError(
+                        f"source ZIP member does not match frame: {annotation.filename}"
+                    )
+                jpeg_members = [
+                    info
+                    for info in infos
+                    if not _unsafe_zip_member(info)
+                    and PurePosixPath(info.filename).parent
+                    == annotation_path.parent
+                    and PurePosixPath(info.filename).suffix.lower() == ".jpg"
+                    and _archive_frame(info.filename) == row.frame
+                ]
+                if len(jpeg_members) != 1:
+                    raise ValueError(
+                        "source ZIP member has no unique paired JPEG: "
+                        f"{row.annotation_member}"
+                    )
+                if (
+                    PurePosixPath(jpeg_members[0].filename).name
+                    != row.image_path.name
+                ):
+                    raise ValueError(
+                        "source ZIP paired JPEG does not match image path name: "
+                        f"{row.image_path.name}"
+                    )
+                digest = hashlib.sha256()
+                with (
+                    archive.open(jpeg_members[0]) as zip_stream,
+                    row.image_path.open("rb") as image_stream,
+                ):
+                    while True:
+                        zip_chunk = zip_stream.read(1024 * 1024)
+                        image_chunk = image_stream.read(1024 * 1024)
+                        if zip_chunk != image_chunk:
+                            raise ValueError(
+                                "image bytes differ from source ZIP: "
+                                f"{row.image_path}"
+                            )
+                        if not image_chunk:
+                            break
+                        digest.update(image_chunk)
+                if digest.hexdigest() != row.image_sha256:
+                    raise ValueError(
+                        f"benchmark image SHA-256 mismatch: {row.image_path}"
+                    )
+    except zipfile.BadZipFile as exc:
+        raise ValueError(
+            f"invalid human benchmark source ZIP: {benchmark.source_zip}"
+        ) from exc
 
 
 def _load_truths(
@@ -721,7 +818,12 @@ def _validate_truth_motion(truths: tuple[HumanTruth, ...]) -> None:
         raise ValueError("truth derived motion row count mismatch")
     for stored, expected in zip(truths, derived, strict=True):
         if (
-            stored.pixel_speed != expected.pixel_speed
+            not math.isclose(
+                stored.pixel_speed,
+                expected.pixel_speed,
+                abs_tol=_SPEED_ABSOLUTE_TOLERANCE,
+                rel_tol=_SPEED_RELATIVE_TOLERANCE,
+            )
             or stored.visible_span != expected.visible_span
         ):
             raise ValueError(
@@ -771,7 +873,10 @@ def _validate_truth_geometry(truths: tuple[HumanTruth, ...]) -> None:
         ):
             raise ValueError("truth OBB width/theta must use canonical form")
         if any(
-            x < 0 or x >= IMAGE_WIDTH or y < 0 or y >= IMAGE_HEIGHT
+            x < -_TRUTH_BOUNDARY_TOLERANCE
+            or x >= IMAGE_WIDTH + _TRUTH_BOUNDARY_TOLERANCE
+            or y < -_TRUTH_BOUNDARY_TOLERANCE
+            or y >= IMAGE_HEIGHT + _TRUTH_BOUNDARY_TOLERANCE
             for x, y in validated_points
         ):
             raise ValueError("truth OBB points must all remain inside the image")
@@ -839,10 +944,8 @@ def _validate_track_identities(
     }
     if truth_ids & ignore_ids:
         raise ValueError("truth and ignore records contain duplicate identities")
-    track_classes: dict[tuple[str, str, int], int] = {}
+    track_classes: dict[tuple[str, str, int], int | None] = {}
     for row in (*truths, *ignores):
-        if row.class_id is None:
-            continue
         key = (row.site, row.sequence, row.track_id)
         previous = track_classes.setdefault(key, row.class_id)
         if previous != row.class_id:
@@ -886,6 +989,7 @@ def _validate_benchmark_semantics(benchmark: HumanBenchmark) -> Path:
     ):
         raise ValueError("frame records must have sorted unique identities")
     image_root = _validate_frame_sources(benchmark.frames)
+    _validate_source_archive(benchmark)
     frame_identity_set = frozenset(frame_identities)
 
     if not isinstance(benchmark.truths, tuple):
