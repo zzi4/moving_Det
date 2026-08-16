@@ -132,8 +132,11 @@ conda run -n moving-det-vru moving-det-vru train \
   --weights yolo11m-obb.pt
 ```
 
-MG 和 LSTFE 从同一个内部基线 checkpoint 初始化。`--baseline-init` 是明确写法；
-为兼容冻结的 Task 13 命令，时序模型的 `--weights <internal-best.pt>` 具有相同含义：
+MG 和 LSTFE 只能从同一个正式 Baseline `best.pt` 初始化。该 checkpoint 必须直接由
+上面的冻结 Universal-P2 文件开始训练，不能带时序 alignment 指纹，也不能是内部
+init 或 resume 的产物；其 P2 文件、SHA-256、Universal 来源 SHA-256 和 427/859
+迁移计数都会在加载检测器参数前重新严格验证。`--baseline-init` 是明确写法；为兼容
+冻结的 Task 13 命令，时序模型的 `--weights <baseline-best.pt>` 具有相同含义：
 
 ```bash
 conda run -n moving-det-vru moving-det-vru train \
@@ -148,6 +151,11 @@ conda run -n moving-det-vru moving-det-vru train \
   --output runs/vrud-pilot/lstfe \
   --baseline-init runs/vrud-pilot/baseline/checkpoints/best.pt
 ```
+
+`--baseline-init` 会拒绝 MG/LSTFE checkpoint、Baseline `last.pt`、由 resume/internal
+init 产生的 Baseline checkpoint，以及不来自正式冻结 P2 artifact 的 checkpoint。
+时序训练中断后必须使用 `--resume <temporal-output>/checkpoints/last.pt` 恢复，不能把
+该时序 checkpoint 再作为 `--baseline-init`。
 
 64 样本 gate 必须同时给出固定样本数和最大 step。CLI 从原 manifest
 确定性地派生恰好 64 行的新 manifest，不修改源 artifact：
@@ -244,6 +252,8 @@ immutable snapshot 指纹，再把同一个 snapshot 注入真实 MG-VTOD 与 LS
   优化器、恢复状态和 `load_provenance` 的内部实验 checkpoint；从公开 YOLO
   权重初始化时，后者记录实际已加载本地文件的绝对路径与 SHA-256。内部
   init/resume 与公开权重字段严格分离；checkpoint 不能当作公开 YOLO 权重读取。
+  正式时序 checkpoint 还会完整保留 Baseline best 的路径/SHA-256/epoch/manifest，
+  以及冻结 P2 的路径/SHA-256、Universal 来源 SHA-256 和 427/859 计数。
 - `<evaluation>/run.json`：模型、split、manifest/checkpoint SHA-256、类别 schema、
   冻结逐帧全集、阈值和缓存来源。
 - `<evaluation>/predictions.jsonl` 与 `ground-truth.jsonl`：带站点、序列、帧号的

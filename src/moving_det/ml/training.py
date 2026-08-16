@@ -16,6 +16,7 @@ import random
 import subprocess
 import tempfile
 import time
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -34,6 +35,7 @@ from moving_det.ml.dataset import (
     collate_temporal_obb,
 )
 from moving_det.ml.factory import create_model
+from moving_det.ml import pretrained_transfer as pretrained_transfer_module
 from moving_det.ml.distributed import (
     DistributedContext,
     distributed_mean,
@@ -323,10 +325,20 @@ def save_checkpoint(
     return _atomic_torch_save(payload, Path(path))
 
 
-def _load_checkpoint_payload(checkpoint: Path) -> dict[str, Any]:
+class _PinnedCheckpointPayload(dict[str, Any]):
+    checkpoint_sha256: str | None = None
+
+
+def _load_checkpoint_payload_stream(
+    stream: Any,
+    checkpoint: Path,
+    *,
+    checkpoint_sha256: str | None = None,
+) -> _PinnedCheckpointPayload:
     try:
+        stream.seek(0)
         payload = torch.load(
-            Path(checkpoint),
+            stream,
             map_location="cpu",
             weights_only=False,
         )
@@ -342,7 +354,19 @@ def _load_checkpoint_payload(checkpoint: Path) -> dict[str, Any]:
         raise ValueError(
             "internal experiment checkpoint has no manifest fingerprint"
         )
-    return payload
+    result = _PinnedCheckpointPayload(payload)
+    result.checkpoint_sha256 = checkpoint_sha256
+    return result
+
+
+def _load_checkpoint_payload(checkpoint: Path) -> dict[str, Any]:
+    try:
+        with Path(checkpoint).open("rb") as stream:
+            return _load_checkpoint_payload_stream(stream, checkpoint)
+    except OSError as exc:
+        raise ValueError(
+            f"failed to load internal experiment checkpoint: {checkpoint}"
+        ) from exc
 
 
 def _verify_manifest_sha256(
@@ -453,6 +477,166 @@ def load_experiment_checkpoint(
     allowed_missing = _validate_model_state(model, source_state)
     _apply_model_state(model, source_state, allowed_missing)
     return payload
+
+
+def _validated_baseline_initialization(
+    payload: Mapping[str, Any],
+    checkpoint: Path,
+    manifest_dir: Path,
+) -> Mapping[str, object]:
+    """Validate and freeze the only lineage accepted for temporal init."""
+    if Path(checkpoint).name != "best.pt":
+        raise ValueError(
+            "temporal initialization requires the formal baseline best.pt"
+        )
+    _verify_manifest_sha256(payload["manifest_sha256"], manifest_dir)
+    if payload.get("model_name") != "baseline":
+        raise ValueError(
+            "temporal initialization requires a baseline model checkpoint"
+        )
+    if (
+        "alignment_cache_sha256" not in payload
+        or payload["alignment_cache_sha256"] is not None
+    ):
+        raise ValueError(
+            "baseline initialization checkpoint must have a null alignment "
+            "fingerprint"
+        )
+    epoch = payload.get("epoch")
+    if type(epoch) is not int or epoch < 0:
+        raise ValueError(
+            "baseline initialization checkpoint epoch must be a "
+            "non-negative integer"
+        )
+    history = _validate_resume_history(
+        payload.get("history"),
+        checkpoint_epoch=epoch,
+        checkpoint_optimizer_steps=payload.get("optimizer_steps"),
+    )
+    best_map50, best_epoch, stale_epochs = _derive_strict_best(history)
+    if (
+        payload.get("best_map50") != best_map50
+        or best_epoch != epoch
+        or stale_epochs != 0
+        or payload.get("epochs_without_improvement") != 0
+    ):
+        raise ValueError(
+            "baseline initialization checkpoint is not its formal strict "
+            "best epoch"
+        )
+
+    raw_provenance = payload.get("load_provenance")
+    if not isinstance(raw_provenance, Mapping):
+        raise ValueError(
+            "baseline initialization load provenance must be a mapping"
+        )
+    provenance = dict(raw_provenance)
+    expected_fields = {
+        "kind",
+        "checkpoint",
+        "checkpoint_sha256",
+        "weights",
+        "weights_sha256",
+        "manifest_sha256",
+    }
+    if set(provenance) != expected_fields:
+        raise ValueError(
+            "baseline initialization load provenance fields are invalid"
+        )
+    if provenance["kind"] != "pretrained":
+        raise ValueError(
+            "baseline initialization requires direct pretrained provenance"
+        )
+    if (
+        provenance["checkpoint"] is not None
+        or provenance["checkpoint_sha256"] is not None
+    ):
+        raise ValueError(
+            "baseline initialization pretrained provenance cannot contain "
+            "an internal or resume checkpoint source"
+        )
+    if provenance["manifest_sha256"] != payload["manifest_sha256"]:
+        raise ValueError(
+            "baseline initialization provenance manifest does not match "
+            "the checkpoint manifest"
+        )
+    weights = provenance["weights"]
+    recorded_weights_sha256 = provenance["weights_sha256"]
+    if type(weights) is not str or not weights:
+        raise ValueError(
+            "baseline initialization provenance weights path is invalid"
+        )
+    weights_path = Path(weights)
+    if not weights_path.is_absolute():
+        raise ValueError(
+            "baseline initialization provenance weights path must be absolute"
+        )
+    if (
+        type(recorded_weights_sha256) is not str
+        or len(recorded_weights_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in recorded_weights_sha256
+        )
+    ):
+        raise ValueError(
+            "baseline initialization provenance weights SHA-256 is invalid"
+        )
+
+    with pretrained_transfer_module._open_checkpoint_snapshot(
+        weights_path,
+        label="frozen P2 initialization",
+    ) as weights_snapshot:
+        if weights_snapshot.sha256 != recorded_weights_sha256:
+            raise ValueError(
+                "baseline initialization frozen P2 weights SHA-256 does not "
+                "match recorded provenance"
+            )
+        _frozen_state, frozen_provenance = (
+            pretrained_transfer_module._load_frozen_p2_initialization_snapshot(
+                weights_path,
+                weights_snapshot,
+            )
+        )
+
+    if frozen_provenance.get("initialization_kind") != "frozen_p2":
+        raise ValueError(
+            "baseline initialization weights are not a frozen P2 artifact"
+        )
+    universal_sha256 = frozen_provenance.get("source_weights_sha256")
+    if universal_sha256 != pretrained_transfer_module.APPROVED_UNIVERSAL_SHA256:
+        raise ValueError(
+            "baseline initialization frozen P2 Universal source SHA is not "
+            "approved"
+        )
+    transferred_tensors = frozen_provenance.get("transferred_tensors")
+    target_tensors = frozen_provenance.get("target_tensors")
+    if type(transferred_tensors) is not int or transferred_tensors != 427:
+        raise ValueError(
+            "baseline initialization frozen P2 transfer count must equal 427"
+        )
+    if type(target_tensors) is not int or target_tensors != 859:
+        raise ValueError(
+            "baseline initialization frozen P2 target count must equal 859"
+        )
+
+    checkpoint_sha256 = getattr(payload, "checkpoint_sha256", None)
+    if checkpoint_sha256 is None:
+        checkpoint_sha256 = _file_sha256(checkpoint)
+    return MappingProxyType(
+        {
+            "kind": "baseline_init",
+            "baseline_checkpoint": str(Path(checkpoint).absolute()),
+            "baseline_checkpoint_sha256": checkpoint_sha256,
+            "baseline_epoch": epoch,
+            "baseline_manifest_sha256": payload["manifest_sha256"],
+            "p2_initialization": str(weights_path),
+            "p2_initialization_sha256": weights_snapshot.sha256,
+            "universal_source_sha256": universal_sha256,
+            "transferred_tensors": transferred_tensors,
+            "target_tensors": target_tensors,
+        }
+    )
 
 
 def _clip_spec(model_name: str, cfg: TemporalOBBConfig) -> ClipSpec:
@@ -1881,21 +2065,26 @@ def train_model(
 
         if init_checkpoint is not None:
             source = Path(init_checkpoint)
-            init_payload = load_experiment_checkpoint(
-                model,
+            with pretrained_transfer_module._open_checkpoint_snapshot(
                 source,
-                manifest_root,
-            )
-            load_provenance = {
-                "kind": "internal_init",
-                "checkpoint": str(source),
-                "checkpoint_sha256": _file_sha256(source),
-                "weights": None,
-                "weights_sha256": None,
-                "manifest_sha256": init_payload["manifest_sha256"],
-                "source_model_name": init_payload.get("model_name"),
-                "source_epoch": init_payload.get("epoch"),
-            }
+                label="baseline initialization checkpoint",
+            ) as checkpoint_snapshot:
+                init_payload = _load_checkpoint_payload_stream(
+                    checkpoint_snapshot.stream,
+                    source,
+                    checkpoint_sha256=checkpoint_snapshot.sha256,
+                )
+                validated_initialization = (
+                    _validated_baseline_initialization(
+                        init_payload,
+                        source,
+                        manifest_root,
+                    )
+                )
+            source_state = dict(init_payload["model"])
+            allowed_missing = _validate_model_state(model, source_state)
+            _apply_model_state(model, source_state, allowed_missing)
+            load_provenance = dict(validated_initialization)
         elif resume_checkpoint is not None:
             source = Path(resume_checkpoint)
             assert resume_payload is not None
