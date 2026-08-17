@@ -1715,6 +1715,68 @@ def test_distributed_launch_failure_finalizes_run_and_gate(tmp_path):
 
 
 @REQUIRES_TORCH
+def test_two_gpu_resume_scope_preflight_has_no_output_or_launcher_side_effects(
+    tmp_path,
+):
+    import torch
+
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    source = tmp_path / "source" / "checkpoints"
+    source.mkdir(parents=True)
+    checkpoint_payload = {
+        "model": {},
+        "manifest_sha256": "a" * 64,
+        "train_scope": "temporal",
+    }
+    torch.save(checkpoint_payload, source / "last.pt")
+    torch.save(checkpoint_payload, source / "best.pt")
+    source_run = source / "run.json"
+    source_run.write_text(
+        json.dumps({"train_scope": "temporal"}) + "\n",
+        encoding="utf-8",
+    )
+    source_run_bytes = source_run.read_bytes()
+    output = tmp_path / "rejected-distributed-resume"
+    commands = []
+
+    args = build_parser().parse_args(
+        [
+            "train",
+            "--model",
+            "baseline",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--resume",
+            str(source / "last.pt"),
+            "--devices",
+            "2",
+        ]
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"run\.json.*expected='full'.*observed='temporal'",
+    ):
+        run_train(
+            args,
+            config_loader=lambda _path: cfg,
+            process_runner=lambda command, **_kwargs: (
+                commands.append(command)
+                or subprocess.CompletedProcess(command, 17)
+            ),
+            cuda_device_count=lambda: 2,
+        )
+
+    assert commands == []
+    assert not output.exists()
+    assert source_run.read_bytes() == source_run_bytes
+
+
+@REQUIRES_TORCH
 def test_distributed_worker_passes_context_to_trainer_and_validator(tmp_path):
     from moving_det.distributed_train import (
         build_parser as build_worker_parser,

@@ -1665,22 +1665,6 @@ def run_train(
             Path(getattr(cfg, "metadata_root")),
         ),
     )
-    if (
-        using_default_trainer
-        and args.resume is None
-        and output.exists()
-        and any(output.iterdir())
-    ):
-        raise WorkflowError("fresh training output must be empty")
-    output.mkdir(parents=True, exist_ok=True)
-    manifest_for_training = manifest
-    if args.overfit_samples is not None:
-        manifest_for_training = _stage_overfit_manifest(
-            manifest,
-            output / "overfit-manifest",
-            count=args.overfit_samples,
-        )
-
     init_checkpoint: Path | None = None
     resume_checkpoint: Path | None = (
         Path(args.resume) if args.resume is not None else None
@@ -1702,12 +1686,7 @@ def run_train(
                 "temporal training requires --baseline-init/--weights or --resume"
             )
 
-    if using_default_trainer and args.model != "baseline":
-        assert alignment_cache is not None
-        _verify_alignment_cache_summary(
-            alignment_cache,
-            source_manifest=manifest,
-        )
+    checkpoint_output = output / "checkpoints"
     if using_default_trainer:
         for path, label in (
             (init_checkpoint, "baseline initialization checkpoint"),
@@ -1715,8 +1694,35 @@ def run_train(
         ):
             if path is not None and (path.is_symlink() or not path.is_file()):
                 raise WorkflowError(f"{label} is missing or unsafe: {path}")
+        if resume_checkpoint is not None:
+            from moving_det.ml.training import _preflight_resume_train_scope
 
-    checkpoint_output = output / "checkpoints"
+            _preflight_resume_train_scope(
+                resume_checkpoint,
+                checkpoint_output,
+                args.train_scope,
+            )
+    if using_default_trainer and args.model != "baseline":
+        assert alignment_cache is not None
+        _verify_alignment_cache_summary(
+            alignment_cache,
+            source_manifest=manifest,
+        )
+    if (
+        using_default_trainer
+        and args.resume is None
+        and output.exists()
+        and any(output.iterdir())
+    ):
+        raise WorkflowError("fresh training output must be empty")
+    output.mkdir(parents=True, exist_ok=True)
+    manifest_for_training = manifest
+    if args.overfit_samples is not None:
+        manifest_for_training = _stage_overfit_manifest(
+            manifest,
+            output / "overfit-manifest",
+            count=args.overfit_samples,
+        )
     if args.devices == 2:
         if not using_default_trainer:
             raise WorkflowError(

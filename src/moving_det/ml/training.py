@@ -1887,10 +1887,80 @@ def _verify_resume_train_scope(
     label: str,
     train_scope: TrainScope,
 ) -> None:
-    if payload.get("train_scope") != train_scope:
+    if "train_scope" not in payload:
+        raise ValueError(f"resume {label} missing train_scope")
+    observed = payload["train_scope"]
+    if observed not in ("full", "temporal"):
         raise ValueError(
-            f"resume {label} checkpoint train scope is incompatible"
+            f"resume {label} has invalid train_scope: observed={observed!r}"
         )
+    if observed != train_scope:
+        raise ValueError(
+            f"resume {label} train scope mismatch: "
+            f"expected={train_scope!r}, observed={observed!r}"
+        )
+
+
+def _load_resume_checkpoint_snapshot(
+    checkpoint: Path,
+    *,
+    label: str,
+) -> _PinnedCheckpointPayload:
+    source = Path(checkpoint)
+    with pretrained_transfer_module._open_checkpoint_snapshot(
+        source,
+        label=f"resume {label}",
+    ) as snapshot:
+        return _load_checkpoint_payload_stream(
+            snapshot.stream,
+            source,
+            checkpoint_sha256=snapshot.sha256,
+        )
+
+
+def _preflight_resume_train_scope(
+    resume_checkpoint: Path,
+    output_dir: Path,
+    train_scope: TrainScope,
+) -> tuple[_PinnedCheckpointPayload, _PinnedCheckpointPayload]:
+    source = Path(resume_checkpoint)
+    resume_payload = _load_resume_checkpoint_snapshot(
+        source,
+        label="last.pt",
+    )
+    source_best = _load_resume_checkpoint_snapshot(
+        source.parent / "best.pt",
+        label="best.pt",
+    )
+    source_run = _load_run_json_snapshot(source.parent / "run.json")
+    _verify_resume_train_scope(
+        source_run,
+        label="run.json",
+        train_scope=train_scope,
+    )
+    _verify_resume_train_scope(
+        resume_payload,
+        label="last.pt",
+        train_scope=train_scope,
+    )
+    _verify_resume_train_scope(
+        source_best,
+        label="best.pt",
+        train_scope=train_scope,
+    )
+    try:
+        source_run_dir = source.parent.resolve(strict=True)
+        target_output = Path(output_dir).resolve(strict=False)
+    except OSError as exc:
+        raise ValueError(
+            "failed to resolve resume source or target output directory"
+        ) from exc
+    if target_output == source_run_dir:
+        raise ValueError(
+            "resume target output directory cannot reuse the source run "
+            f"directory: {source_run_dir}"
+        )
+    return resume_payload, source_best
 
 
 def _resume_reproducibility_state(
@@ -2200,6 +2270,15 @@ def train_model(
         raise ValueError("train_scope must be 'full' or 'temporal'")
     if train_scope == "temporal" and model_name == "baseline":
         raise ValueError("temporal scope requires a temporal model")
+    output_root = Path(output_dir)
+    resume_payload: _PinnedCheckpointPayload | None = None
+    source_best: _PinnedCheckpointPayload | None = None
+    if resume_checkpoint is not None:
+        resume_payload, source_best = _preflight_resume_train_scope(
+            Path(resume_checkpoint),
+            output_root,
+            train_scope,
+        )
     incoming_resume_rng = (
         _capture_global_rng_state()
         if resume_checkpoint is not None
@@ -2216,7 +2295,6 @@ def train_model(
     is_primary = (
         distributed_context is None or distributed_context.is_primary
     )
-    output_root = Path(output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc)
     started_clock = time.perf_counter()
@@ -2374,23 +2452,6 @@ def train_model(
             selected_hooks.scaler_factory or _default_scaler_factory
         )
         validator = selected_hooks.validator or _default_validator
-        resume_payload: dict[str, Any] | None = None
-        source_best: dict[str, Any] | None = None
-        if resume_checkpoint is not None:
-            source = Path(resume_checkpoint)
-            resume_payload = _load_checkpoint_payload(source)
-            source_best = _load_checkpoint_payload(source.parent / "best.pt")
-            _verify_resume_train_scope(
-                resume_payload,
-                label="last",
-                train_scope=train_scope,
-            )
-            _verify_resume_train_scope(
-                source_best,
-                label="best",
-                train_scope=train_scope,
-            )
-
         train_loader: Any | None = None
         validation_loader: Any | None = None
         gate_loader: Any | None = None

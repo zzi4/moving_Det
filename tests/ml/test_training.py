@@ -1197,6 +1197,9 @@ def test_resume_rejects_changed_train_scope_before_loader(
             map50_values=[0.2],
         ),
     )
+    source_run = first.output_dir / "run.json"
+    source_run_bytes = source_run.read_bytes()
+    rejected_output = tmp_path / "rejected-resume"
 
     def fail_loader(*_args, **_kwargs):
         pytest.fail("changed train scope reached loader construction")
@@ -1206,7 +1209,7 @@ def test_resume_rejects_changed_train_scope_before_loader(
             "mg_vtod",
             replace(temporal_config, pilot_epochs=2),
             manifest,
-            tmp_path / "rejected-resume",
+            rejected_output,
             train_scope="full",
             resume_checkpoint=first.last_checkpoint,
             hooks=replace(
@@ -1217,6 +1220,186 @@ def test_resume_rejects_changed_train_scope_before_loader(
                 loader_factory=fail_loader,
             ),
         )
+    assert not rejected_output.exists()
+    assert source_run.read_bytes() == source_run_bytes
+
+
+def _tamper_resume_train_scope(
+    result,
+    artifact: str,
+    value: object | None,
+) -> None:
+    path = result.output_dir / artifact
+    if artifact == "run.json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if value is None:
+            payload.pop("train_scope")
+        else:
+            payload["train_scope"] = value
+        path.write_text(
+            json.dumps(payload, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if value is None:
+        payload.pop("train_scope")
+    else:
+        payload["train_scope"] = value
+    torch.save(payload, path)
+
+
+@pytest.mark.parametrize(
+    ("artifact", "value", "message"),
+    [
+        ("run.json", None, r"run\.json.*missing train_scope"),
+        (
+            "run.json",
+            "invalid",
+            r"run\.json.*invalid train_scope.*observed='invalid'",
+        ),
+        (
+            "run.json",
+            "full",
+            r"run\.json.*expected='temporal'.*observed='full'",
+        ),
+        (
+            "last.pt",
+            "full",
+            r"last\.pt.*expected='temporal'.*observed='full'",
+        ),
+        (
+            "best.pt",
+            "full",
+            r"best\.pt.*expected='temporal'.*observed='full'",
+        ),
+    ],
+)
+def test_resume_scope_preflight_validates_run_last_best_and_request(
+    tmp_path,
+    temporal_config,
+    artifact,
+    value,
+    message,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "mg_vtod",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "source",
+        train_scope="temporal",
+        hooks=_tiny_hooks(
+            TrainableTinyTemporalOBB(),
+            map50_values=[0.2],
+        ),
+    )
+    _tamper_resume_train_scope(first, artifact, value)
+    source_run = first.output_dir / "run.json"
+    source_run_bytes = source_run.read_bytes()
+    rejected_output = tmp_path / "rejected"
+
+    with pytest.raises(ValueError, match=message):
+        train_model(
+            "mg_vtod",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            rejected_output,
+            train_scope="temporal",
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(
+                TrainableTinyTemporalOBB(),
+                map50_values=[0.3],
+            ),
+        )
+
+    assert not rejected_output.exists()
+    assert source_run.read_bytes() == source_run_bytes
+
+
+def test_resume_scope_preflight_preserves_existing_target_sentinel(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "mg_vtod",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "source",
+        train_scope="temporal",
+        hooks=_tiny_hooks(
+            TrainableTinyTemporalOBB(),
+            map50_values=[0.2],
+        ),
+    )
+    source_run = first.output_dir / "run.json"
+    source_run_bytes = source_run.read_bytes()
+    rejected_output = tmp_path / "existing-target"
+    rejected_output.mkdir()
+    sentinel = rejected_output / "sentinel.txt"
+    sentinel.write_bytes(b"preserve")
+
+    with pytest.raises(ValueError, match=r"run\.json.*expected='full'"):
+        train_model(
+            "mg_vtod",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            rejected_output,
+            train_scope="full",
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(
+                TrainableTinyTemporalOBB(),
+                map50_values=[0.3],
+            ),
+        )
+
+    assert list(rejected_output.iterdir()) == [sentinel]
+    assert sentinel.read_bytes() == b"preserve"
+    assert source_run.read_bytes() == source_run_bytes
+
+
+def test_resume_rejects_reusing_source_run_as_target_before_mutation(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "mg_vtod",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "source",
+        train_scope="temporal",
+        hooks=_tiny_hooks(
+            TrainableTinyTemporalOBB(),
+            map50_values=[0.2],
+        ),
+    )
+    before = {
+        path.name: path.read_bytes()
+        for path in first.output_dir.iterdir()
+        if path.is_file()
+    }
+
+    with pytest.raises(ValueError, match="resume target.*source run"):
+        train_model(
+            "mg_vtod",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            first.output_dir,
+            train_scope="temporal",
+            resume_checkpoint=first.last_checkpoint,
+            hooks=_tiny_hooks(
+                TrainableTinyTemporalOBB(),
+                map50_values=[0.3],
+            ),
+        )
+
+    assert {
+        path.name: path.read_bytes()
+        for path in first.output_dir.iterdir()
+        if path.is_file()
+    } == before
 
 
 def test_default_full_train_scope_is_recorded(
