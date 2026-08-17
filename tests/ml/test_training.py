@@ -1252,11 +1252,17 @@ def _tamper_resume_train_scope(
 @pytest.mark.parametrize(
     ("artifact", "value", "message"),
     [
-        ("run.json", None, r"run\.json.*missing train_scope"),
+        (
+            "run.json",
+            None,
+            r"run\.json.*missing train_scope.*expected='temporal'"
+            r".*observed=<missing>",
+        ),
         (
             "run.json",
             "invalid",
-            r"run\.json.*invalid train_scope.*observed='invalid'",
+            r"run\.json.*invalid train_scope.*expected='temporal'"
+            r".*observed='invalid'",
         ),
         (
             "run.json",

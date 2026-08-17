@@ -1888,11 +1888,15 @@ def _verify_resume_train_scope(
     train_scope: TrainScope,
 ) -> None:
     if "train_scope" not in payload:
-        raise ValueError(f"resume {label} missing train_scope")
+        raise ValueError(
+            f"resume {label} missing train_scope: "
+            f"expected={train_scope!r}, observed=<missing>"
+        )
     observed = payload["train_scope"]
     if observed not in ("full", "temporal"):
         raise ValueError(
-            f"resume {label} has invalid train_scope: observed={observed!r}"
+            f"resume {label} has invalid train_scope: "
+            f"expected={train_scope!r}, observed={observed!r}"
         )
     if observed != train_scope:
         raise ValueError(
