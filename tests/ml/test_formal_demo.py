@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from contextlib import contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import stat
 from subprocess import CompletedProcess
 from types import SimpleNamespace
 
@@ -17,6 +21,7 @@ from moving_det.ml.formal_demo import (
     FormalDemoRequest,
     VerifiedComparison,
     VerifiedRun,
+    atomic_output_stage,
     build_formal_demo,
     encode_scene,
     load_verified_run,
@@ -26,7 +31,11 @@ from moving_det.ml.formal_demo import (
     render_scene_sequences,
     require_contiguous_numbered_frames,
     select_formal_cases,
+    snapshot_formal_images,
     write_demo_manifest,
+    verify_formal_transitions,
+    verified_benchmark_snapshot,
+    validate_final_demo_tree,
 )
 from moving_det.ml.human_benchmark import HumanBenchmark, HumanFrame, HumanTruth
 from moving_det.models import OBB
@@ -111,6 +120,68 @@ def test_case_selection_is_lexical_and_covers_required_states():
         (0, "site19"),
         (1, "site22"),
     ]
+    false_positive = first[-1]
+    assert false_positive.confidence is None  # legacy rows without FP geometry stay nullable
+
+
+def test_case_selection_preserves_track_zero_and_false_positive_identity():
+    rows = (
+        {
+            "site": "site19",
+            "sequence": "day",
+            "frame": 1,
+            "track_id": 0,
+            "visible_span": 0,
+            "class_id": 0,
+            "state": "rescued",
+            "confidence": None,
+            "obb": None,
+            "tile_xywh": None,
+        },
+        {
+            "site": "site19",
+            "sequence": "day",
+            "frame": 2,
+            "track_id": 1,
+            "visible_span": 0,
+            "class_id": 0,
+            "state": "regressed",
+            "confidence": None,
+            "obb": None,
+            "tile_xywh": None,
+        },
+        {
+            "site": "site19",
+            "sequence": "day",
+            "frame": 3,
+            "track_id": 2,
+            "visible_span": 0,
+            "class_id": 0,
+            "state": "stable_fn",
+            "confidence": None,
+            "obb": None,
+            "tile_xywh": None,
+        },
+        {
+            "site": "site19",
+            "sequence": "day",
+            "frame": 4,
+            "track_id": None,
+            "visible_span": None,
+            "class_id": 1,
+            "state": "new_false_positive",
+            "confidence": 0.75,
+            "obb": [8.0, 6.0, 4.0, 2.0, 0.0],
+            "tile_xywh": [0, 0, 16, 12],
+        },
+    )
+
+    cases = select_formal_cases(rows, per_state=1)
+
+    assert cases[0].track_id == 0
+    assert cases[-1].confidence == 0.75
+    assert cases[-1].obb == (8.0, 6.0, 4.0, 2.0, 0.0)
+    assert cases[-1].tile_xywh == (0, 0, 16, 12)
 
 
 def _png(path: Path) -> None:
@@ -153,13 +224,23 @@ def _write_verified_comparison(root: Path, *, candidate: str = "mg_full") -> Non
                 "tile_xywh": [0, 0, 16, 12] if is_fp else None,
             }
         )
+    def reference(label: str) -> dict[str, object]:
+        return {
+            "run_dir": f"/runs/{label}",
+            "checkpoint_sha256": ("b" if label == "baseline" else "c") * 64,
+            "threshold_sha256": ("d" if label == "baseline" else "e") * 64,
+            "threshold": 0.25 if label == "baseline" else 0.3,
+            "model_name": "baseline" if label == "baseline" else "mg_vtod",
+            "motion_off": label == "motion_off",
+        }
+
     comparison = {
         "schema_version": 1,
         "primary_candidate": candidate,
         "runs": {
-            "baseline": {"run_dir": "/runs/baseline"},
-            candidate: {"run_dir": f"/runs/{candidate}"},
-            "motion_off": {"run_dir": "/runs/motion-off"},
+            "baseline": reference("baseline"),
+            candidate: reference(candidate),
+            "motion_off": reference("motion_off"),
         },
         "metrics": {},
         "transitions": {},
@@ -180,69 +261,6 @@ def _write_verified_comparison(root: Path, *, candidate: str = "mg_full") -> Non
         "frame_count": 873,
         "ground_truth_count": 4,
         "runs": comparison["runs"],
-        "artifact_schema": {name: 1 for name in sorted(payloads)},
-        "artifact_sha256": {
-            name: hashlib.sha256(content).hexdigest()
-            for name, content in sorted(payloads.items())
-        },
-    }
-    (root / "run.json").write_bytes(_canonical_json(run))
-
-
-def _write_verified_run(root: Path, model: str, image: Path) -> None:
-    root.mkdir()
-    key = {"site": "site19", "sequence": "day-a", "frame": 1}
-    prediction = {
-        "schema_version": 1,
-        **key,
-        "class_id": 0,
-        "confidence": 0.9,
-        "obb": [8.0, 6.0, 4.0, 2.0, 0.0],
-        "tile_xywh": [0, 0, 16, 12],
-    }
-    truth = {
-        "schema_version": 2,
-        **key,
-        "class_id": 0,
-        "track_id": 1,
-        "pixel_speed_per_frame": 2.0,
-        "visible_span": 0,
-        "obb": [8.0, 6.0, 4.0, 2.0, 0.0],
-    }
-    diagnostic = {
-        "schema_version": 1,
-        **key,
-        "frame_shape": [12, 16],
-        "image_root": str(image.parent.resolve()),
-        "offsets": [0] if model == "baseline" else [-2, -1, 0, 1, 2],
-        "support_paths": (
-            [str(image.resolve())]
-            if model == "baseline"
-            else [str(image.resolve())] * 5
-        ),
-        "motion_map": [[0.0] * 320 for _ in range(180)],
-        "selected_long_index": -1,
-        "short_alignment_magnitude": [[0.0] * 320 for _ in range(180)],
-        "diagnostic_tile_xywh": [0, 0, 16, 12],
-        "motion_enabled": True,
-    }
-    payloads = {
-        "predictions.jsonl": _canonical_json(prediction),
-        "ground-truth.jsonl": _canonical_json(truth),
-        "diagnostics.jsonl": _canonical_json(diagnostic),
-    }
-    for name, content in payloads.items():
-        (root / name).write_bytes(content)
-    run = {
-        "schema_version": 1,
-        "model_name": model,
-        "evaluation_split": "test",
-        "manifest_sha256": "b" * 64,
-        "checkpoint_sha256": ("c" if model == "baseline" else "d") * 64,
-        "human_benchmark_sha256": "a" * 64,
-        "motion_off": False,
-        "image_root": str(image.parent.resolve()),
-        "detection_frame_keys": [key],
         "artifact_schema": {name: 1 for name in sorted(payloads)},
         "artifact_sha256": {
             name: hashlib.sha256(content).hexdigest()
@@ -277,24 +295,24 @@ def test_verified_comparison_rejects_lstfe_candidate(tmp_path):
         load_verified_comparison(root)
 
 
-def test_verified_human_run_requires_hashed_diagnostics_and_forbids_lstfe(tmp_path):
-    image = tmp_path / "images" / "frame.jpg"
-    image.parent.mkdir()
-    Image.new("RGB", (16, 12), (10, 20, 30)).save(image)
-    baseline = tmp_path / "baseline"
-    _write_verified_run(baseline, "baseline", image)
+def test_verified_comparison_requires_complete_threshold_run_reference(tmp_path):
+    root = tmp_path / "comparison"
+    _write_verified_comparison(root)
+    run_path = root / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    payload_path = root / "comparison.json"
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    del run["runs"]["mg_full"]["threshold_sha256"]
+    del payload["runs"]["mg_full"]["threshold_sha256"]
+    payload_bytes = _canonical_json(payload)
+    payload_path.write_bytes(payload_bytes)
+    run["artifact_sha256"]["comparison.json"] = hashlib.sha256(
+        payload_bytes
+    ).hexdigest()
+    run_path.write_bytes(_canonical_json(run))
 
-    loaded = load_verified_run(baseline, expected_model="baseline")
-
-    assert len(loaded.diagnostics) == 1
-    (baseline / "diagnostics.jsonl").write_bytes(b"{}\n")
-    with pytest.raises(ValueError, match="hash"):
-        load_verified_run(baseline, expected_model="baseline")
-
-    lstfe = tmp_path / "lstfe"
-    _write_verified_run(lstfe, "lstfe", image)
-    with pytest.raises(ValueError, match="LSTFE|model"):
-        load_verified_run(lstfe, expected_model="mg_vtod")
+    with pytest.raises(ValueError, match="run reference"):
+        load_verified_comparison(root)
 
 
 def test_build_rejects_output_overlap_before_loading_inputs(tmp_path, monkeypatch):
@@ -318,6 +336,43 @@ def test_build_rejects_output_overlap_before_loading_inputs(tmp_path, monkeypatc
     with pytest.raises(ValueError, match="overlap"):
         build_formal_demo(request)
     assert calls == []
+
+
+def test_benchmark_fingerprint_and_load_share_one_stable_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.formal_demo as formal_demo
+    import moving_det.vru_cli as vru_cli
+
+    source = tmp_path / "benchmark"
+    source.mkdir()
+    (source / "benchmark.json").write_bytes(b"original\n")
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    snapshot_manifest = b"snapshotted\n"
+    (snapshot / "benchmark.json").write_bytes(snapshot_manifest)
+    expected_sha256 = hashlib.sha256(snapshot_manifest).hexdigest()
+    loaded_paths = []
+
+    @contextmanager
+    def snapshotter(path):
+        assert path == source
+        yield snapshot, expected_sha256
+
+    def loader(path):
+        loaded_paths.append(path)
+        (source / "benchmark.json").write_bytes(b"mutated-after-snapshot\n")
+        return SimpleNamespace(frames=(), truths=())
+
+    monkeypatch.setattr(vru_cli, "_snapshot_formal_human_benchmark", snapshotter)
+    monkeypatch.setattr(formal_demo, "load_human_benchmark", loader)
+
+    with verified_benchmark_snapshot(source) as (benchmark, fingerprint):
+        assert benchmark.frames == ()
+        assert fingerprint == expected_sha256
+
+    assert loaded_paths == [snapshot]
 
 
 def test_encode_scene_uses_fixed_30fps_argument_list(tmp_path):
@@ -366,7 +421,18 @@ def test_demo_manifest_declares_relative_hashes_dimensions_and_counts(tmp_path):
         video.parent.mkdir(parents=True, exist_ok=True)
         video.write_bytes(f"video-{scene}".encode("ascii"))
         videos.append(video)
-    case = FormalCase("site19", "day-a", 3, 4, 1, 0, "rescued")
+    case = FormalCase(
+        "site19",
+        "day-a",
+        3,
+        -1,
+        0,
+        1,
+        "new_false_positive",
+        0.8,
+        (8.0, 6.0, 4.0, 2.0, 0.0),
+        (0, 0, 16, 12),
+    )
     panel = stage / "cases" / "00-rescued-panel.png"
     timeline = stage / "cases" / "00-rescued-timeline.png"
     _png(panel)
@@ -396,14 +462,25 @@ def test_demo_manifest_declares_relative_hashes_dimensions_and_counts(tmp_path):
         "site": "site19",
         "sequence": "day-a",
         "frame": 3,
-        "track_id": 4,
-        "visible_span": 1,
-        "class_id": 0,
-        "state": "rescued",
+        "track_id": -1,
+        "visible_span": 0,
+        "class_id": 1,
+        "state": "new_false_positive",
+        "confidence": 0.8,
+        "obb": [8.0, 6.0, 4.0, 2.0, 0.0],
+        "tile_xywh": [0, 0, 16, 12],
     }
     assert set(manifest["cases"][0]) == {"identity", "panel", "timeline"}
     serialized = path.read_text(encoding="utf-8")
     assert str(stage) not in serialized
+
+    with pytest.raises(ValueError, match="undeclared|tree"):
+        validate_final_demo_tree(stage, path)
+    shutil.rmtree(stage / "frames")
+    validate_final_demo_tree(stage, path)
+    (stage / "extra.txt").write_text("undeclared", encoding="utf-8")
+    with pytest.raises(ValueError, match="undeclared|tree"):
+        validate_final_demo_tree(stage, path)
 
 
 def test_case_timeline_is_deterministic_and_exactly_291_frames(tmp_path):
@@ -536,9 +613,11 @@ def _demo_evidence(tmp_path: Path) -> tuple[DemoEvidence, FormalCase]:
     baseline = VerifiedRun(
         root=tmp_path / "baseline",
         run={**common_run, "model_name": "baseline", "motion_off": False},
-        predictions=tuple(predictions),
+        predictions=(),
         ground_truth=(),
         diagnostics=tuple(baseline_diagnostics),
+        ranked_predictions=(),
+        threshold=0.5,
     )
     mg_full = VerifiedRun(
         root=tmp_path / "mg-full",
@@ -551,6 +630,29 @@ def _demo_evidence(tmp_path: Path) -> tuple[DemoEvidence, FormalCase]:
         predictions=tuple(predictions),
         ground_truth=(),
         diagnostics=tuple(mg_diagnostics),
+        ranked_predictions=tuple(predictions),
+        threshold=0.5,
+    )
+    transition_rows = tuple(
+        {
+            "state": "rescued",
+            "site": truth.site,
+            "sequence": truth.sequence,
+            "frame": truth.frame,
+            "track_id": truth.track_id,
+            "visible_span": truth.visible_span,
+            "class_id": truth.class_id,
+            "confidence": None,
+            "obb": None,
+            "tile_xywh": None,
+        }
+        for truth in truths
+    )
+    transitions = verify_formal_transitions(
+        benchmark,
+        baseline,
+        mg_full,
+        transition_rows,
     )
     evidence = DemoEvidence(
         comparison=SimpleNamespace(),
@@ -558,9 +660,54 @@ def _demo_evidence(tmp_path: Path) -> tuple[DemoEvidence, FormalCase]:
         baseline=baseline,
         mg_full=mg_full,
         image_paths=image_paths,
+        transitions=transitions,
     )
     case = FormalCase("site19", "day-a", 1, 1, 0, 0, "rescued")
     return evidence, case
+
+
+def test_image_snapshot_rejects_support_not_anchored_by_benchmark_hash(tmp_path):
+    evidence, _ = _demo_evidence(tmp_path)
+    external = tmp_path / "external.jpg"
+    Image.new("RGB", (320, 180), (1, 2, 3)).save(external)
+    diagnostics = list(evidence.mg_full.diagnostics)
+    diagnostics[0] = {
+        **diagnostics[0],
+        "support_paths": [str(external)] * 5,
+    }
+    mg_full = replace(evidence.mg_full, diagnostics=tuple(diagnostics))
+
+    with pytest.raises(ValueError, match="benchmark hash"):
+        snapshot_formal_images(
+            evidence.benchmark,
+            evidence.baseline,
+            mg_full,
+            tmp_path / "image-snapshot",
+        )
+
+
+def test_formal_transition_verifier_rejects_tampered_center_state(tmp_path):
+    evidence, case = _demo_evidence(tmp_path)
+    tampered = {
+        "state": "regressed",
+        "site": case.site,
+        "sequence": case.sequence,
+        "frame": case.frame,
+        "track_id": case.track_id,
+        "visible_span": case.visible_span,
+        "class_id": case.class_id,
+        "confidence": None,
+        "obb": None,
+        "tile_xywh": None,
+    }
+
+    with pytest.raises(ValueError, match="differ from verified run"):
+        verify_formal_transitions(
+            evidence.benchmark,
+            evidence.baseline,
+            evidence.mg_full,
+            (tampered,),
+        )
 
 
 def test_scene_and_case_rendering_include_required_formal_evidence(
@@ -644,8 +791,22 @@ def test_failed_ffmpeg_keeps_previous_demo_and_removes_stage(
         run={
             "human_benchmark_sha256": benchmark_sha256,
             "runs": {
-                "baseline": {"run_dir": str(request.baseline_run.resolve())},
-                "mg_full": {"run_dir": str(request.mg_run.resolve())},
+                "baseline": {
+                    "run_dir": str(request.baseline_run.resolve()),
+                    "model_name": "baseline",
+                    "motion_off": False,
+                    "checkpoint_sha256": "c" * 64,
+                    "threshold_sha256": "d" * 64,
+                    "threshold": 0.5,
+                },
+                "mg_full": {
+                    "run_dir": str(request.mg_run.resolve()),
+                    "model_name": "mg_vtod",
+                    "motion_off": False,
+                    "checkpoint_sha256": "c" * 64,
+                    "threshold_sha256": "d" * 64,
+                    "threshold": 0.5,
+                },
             },
         },
         payload={},
@@ -659,20 +820,24 @@ def test_failed_ffmpeg_keeps_previous_demo_and_removes_stage(
         "image_root": str((tmp_path / "images").resolve()),
         "detection_frame_keys": [],
         "checkpoint_sha256": "c" * 64,
+        "threshold_sha256": "d" * 64,
+        "motion_off": False,
     }
     baseline = VerifiedRun(
-        request.baseline_run.resolve(),
-        {**common_run, "model_name": "baseline"},
-        (),
-        (),
-        (),
+        root=request.baseline_run.resolve(),
+        run={**common_run, "model_name": "baseline"},
+        predictions=(),
+        ground_truth=(),
+        diagnostics=(),
+        threshold=0.5,
     )
     mg_full = VerifiedRun(
-        request.mg_run.resolve(),
-        {**common_run, "model_name": "mg_vtod"},
-        (),
-        (),
-        (),
+        root=request.mg_run.resolve(),
+        run={**common_run, "model_name": "mg_vtod"},
+        predictions=(),
+        ground_truth=(),
+        diagnostics=(),
+        threshold=0.5,
     )
     monkeypatch.setattr(
         formal_demo,
@@ -681,13 +846,24 @@ def test_failed_ffmpeg_keeps_previous_demo_and_removes_stage(
     )
     monkeypatch.setattr(
         formal_demo,
-        "load_human_benchmark",
-        lambda path: SimpleNamespace(frames=()),
+        "verified_benchmark_snapshot",
+        contextmanager(
+            lambda path: iter(
+                ((SimpleNamespace(frames=(), truths=()), benchmark_sha256),)
+            )
+        ),
     )
     monkeypatch.setattr(
         formal_demo,
         "load_verified_run",
-        lambda path, expected_model: baseline if expected_model == "baseline" else mg_full,
+        lambda path, **kwargs: baseline
+        if kwargs["expected_model"] == "baseline"
+        else mg_full,
+    )
+    monkeypatch.setattr(
+        formal_demo,
+        "verify_formal_transitions",
+        lambda *args: SimpleNamespace(),
     )
     monkeypatch.setattr(
         formal_demo,
@@ -723,3 +899,41 @@ def test_failed_ffmpeg_keeps_previous_demo_and_removes_stage(
 
     assert (existing / "demo.json").read_text(encoding="utf-8") == "old"
     assert list(tmp_path.glob(".demo.staging.*")) == []
+
+
+def test_atomic_publication_syncs_parent_when_rename_fails_and_rolls_back(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.formal_demo as formal_demo
+
+    output = tmp_path / "demo"
+    output.mkdir()
+    (output / "demo.json").write_text("old", encoding="utf-8")
+    real_replace = formal_demo.os.replace
+    real_fsync = formal_demo.os.fsync
+    replace_count = 0
+    directory_syncs = 0
+
+    def injected_replace(source, destination):
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            raise OSError("injected publication failure")
+        return real_replace(source, destination)
+
+    def tracked_fsync(descriptor):
+        nonlocal directory_syncs
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            directory_syncs += 1
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(formal_demo.os, "replace", injected_replace)
+    monkeypatch.setattr(formal_demo.os, "fsync", tracked_fsync)
+
+    with pytest.raises(OSError, match="injected"):
+        with atomic_output_stage(output) as stage:
+            (stage / "demo.json").write_text("new", encoding="utf-8")
+
+    assert (output / "demo.json").read_text(encoding="utf-8") == "old"
+    assert directory_syncs >= 2

@@ -3587,7 +3587,12 @@ def _validate_artifact_declarations(
     return normalized_schema, normalized_digests
 
 
-def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
+def _validate_evaluation_run_schema(
+    run: Mapping[str, object],
+    *,
+    human_benchmark_override: object | None = None,
+    human_benchmark_sha256: str | None = None,
+) -> None:
     human = set(run) == _HUMAN_EVALUATION_RUN_FIELDS
     if not human and set(run) != _EVALUATION_RUN_FIELDS:
         raise WorkflowError("evaluation run schema fields are invalid")
@@ -3632,7 +3637,22 @@ def _validate_evaluation_run_schema(run: Mapping[str, object]) -> None:
     else:
         raise WorkflowError("evaluation run split is unsupported")
     if human:
-        benchmark = _load_human_benchmark_from_run(run)
+        if human_benchmark_override is None:
+            if human_benchmark_sha256 is not None:
+                raise WorkflowError(
+                    "human benchmark override fingerprint has no benchmark"
+                )
+            benchmark = _load_human_benchmark_from_run(run)
+        else:
+            if (
+                not _is_sha256(human_benchmark_sha256)
+                or run.get("human_benchmark_sha256")
+                != human_benchmark_sha256
+            ):
+                raise WorkflowError(
+                    "human benchmark override fingerprint is mismatched"
+                )
+            benchmark = human_benchmark_override
         expected_identities = _fixed_human_frame_universe(benchmark)
         detection_identities = tuple(
             (
@@ -9403,6 +9423,18 @@ def _diagnose_overfit_real(
         raise WorkflowError("diagnostic report returned a path outside staging") from exc
 
 
+def _capture_evaluation_diagnostic(
+    frame_index: int,
+    *,
+    human_benchmark: bool,
+) -> bool:
+    if type(frame_index) is not int or frame_index < 0:
+        raise WorkflowError("evaluation diagnostic frame index is invalid")
+    if type(human_benchmark) is not bool:
+        raise WorkflowError("evaluation diagnostic benchmark flag is invalid")
+    return human_benchmark or frame_index < 3
+
+
 def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
     import torch
 
@@ -9579,7 +9611,10 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
                         frame_speed_mps=velocities[velocity_key],
                     )
                 )
-        if frame_index < 3:
+        if _capture_evaluation_diagnostic(
+            frame_index,
+            human_benchmark=human_benchmark is not None,
+        ):
             diagnostic_tile = (
                 _representative_human_diagnostic_tile(
                     human_benchmark.frames[frame_index],

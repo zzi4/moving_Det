@@ -75,100 +75,17 @@ _TRANSITION_FIELDS = frozenset(
 _ALLOWED_COMPARISON_RUNS = frozenset(
     {"baseline", "mg_full", "motion_off", "mg_frozen"}
 )
-_MAX_TEXT_BYTES = 512 * 1024 * 1024
-_RUN_REQUIRED_FIELDS = frozenset(
+_COMPARISON_RUN_REFERENCE_FIELDS = frozenset(
     {
-        "schema_version",
-        "model_name",
-        "evaluation_split",
-        "manifest_sha256",
+        "run_dir",
         "checkpoint_sha256",
-        "human_benchmark_sha256",
-        "motion_off",
-        "image_root",
-        "detection_frame_keys",
-        "artifact_schema",
-        "artifact_sha256",
-    }
-)
-_RUN_ALLOWED_FIELDS = frozenset(
-    {
-        *_RUN_REQUIRED_FIELDS,
-        "config_sha256",
-        "class_schema",
-        "continuity_frame_keys",
-        "audit",
-        "metadata_root",
-        "seed",
-        "alignment_cache",
-        "alignment_cache_sha256",
-        "threshold_source",
         "threshold_sha256",
-        "git_commit",
-        "git_dirty",
-        "environment",
-        "started_at_utc",
-        "finished_at_utc",
-        "duration_seconds",
-        "human_benchmark_source",
+        "threshold",
+        "model_name",
+        "motion_off",
     }
 )
-_RUN_ALLOWED_ARTIFACTS = frozenset(
-    {
-        "metrics.json",
-        "predictions.jsonl",
-        "ranked-predictions.jsonl",
-        "ground-truth.jsonl",
-        "per_class.csv",
-        "per_size.csv",
-        "per_pixel_speed.csv",
-        "per_track.csv",
-        "threshold.json",
-        "diagnostics.jsonl",
-    }
-)
-_PREDICTION_FIELDS = frozenset(
-    {
-        "schema_version",
-        "site",
-        "sequence",
-        "frame",
-        "class_id",
-        "confidence",
-        "obb",
-        "tile_xywh",
-    }
-)
-_HUMAN_TRUTH_FIELDS = frozenset(
-    {
-        "schema_version",
-        "site",
-        "sequence",
-        "frame",
-        "class_id",
-        "track_id",
-        "pixel_speed_per_frame",
-        "visible_span",
-        "obb",
-    }
-)
-_DIAGNOSTIC_FIELDS = frozenset(
-    {
-        "schema_version",
-        "site",
-        "sequence",
-        "frame",
-        "frame_shape",
-        "image_root",
-        "offsets",
-        "support_paths",
-        "motion_map",
-        "selected_long_index",
-        "short_alignment_magnitude",
-        "diagnostic_tile_xywh",
-        "motion_enabled",
-    }
-)
+_MAX_TEXT_BYTES = 512 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -180,6 +97,9 @@ class FormalCase:
     visible_span: int
     class_id: int
     state: str
+    confidence: float | None = None
+    obb: tuple[float, float, float, float, float] | None = None
+    tile_xywh: tuple[int, int, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +127,15 @@ class VerifiedRun:
     predictions: tuple[Mapping[str, object], ...]
     ground_truth: tuple[Mapping[str, object], ...]
     diagnostics: tuple[Mapping[str, object], ...]
+    ranked_predictions: tuple[Mapping[str, object], ...] = ()
+    threshold: float | None = None
+
+
+@dataclass(frozen=True)
+class FormalTransitionEvidence:
+    baseline_by_truth: Mapping[tuple[str, str, int, int, int, int], object]
+    mg_by_truth: Mapping[tuple[str, str, int, int, int, int], object]
+    mg_false_positives: Mapping[tuple[object, ...], object]
 
 
 @dataclass(frozen=True)
@@ -216,6 +145,7 @@ class DemoEvidence:
     baseline: VerifiedRun
     mg_full: VerifiedRun
     image_paths: Mapping[Path, Path]
+    transitions: FormalTransitionEvidence | None = None
 
 
 def select_formal_cases(
@@ -239,20 +169,38 @@ def select_formal_cases(
                     int(row["class_id"]),
                     str(row["site"]),
                     str(row["sequence"]),
-                    int(row.get("track_id") or -1),
-                    int(row.get("visible_span") or 0),
+                    -1 if row.get("track_id") is None else int(row["track_id"]),
+                    0 if row.get("visible_span") is None else int(row["visible_span"]),
                     int(row["frame"]),
                 )
             )
             winner = pool.pop(0)
+            track_value = winner.get("track_id")
+            span_value = winner.get("visible_span")
+            confidence_value = winner.get("confidence")
+            obb_value = winner.get("obb")
+            tile_value = winner.get("tile_xywh")
             case = FormalCase(
                 site=str(winner["site"]),
                 sequence=str(winner["sequence"]),
                 frame=int(winner["frame"]),
-                track_id=int(winner.get("track_id") or -1),
-                visible_span=int(winner.get("visible_span") or 0),
+                track_id=-1 if track_value is None else int(track_value),
+                visible_span=0 if span_value is None else int(span_value),
                 class_id=int(winner["class_id"]),
                 state=state,
+                confidence=(
+                    None if confidence_value is None else float(confidence_value)
+                ),
+                obb=(
+                    None
+                    if obb_value is None
+                    else tuple(float(value) for value in obb_value)
+                ),
+                tile_xywh=(
+                    None
+                    if tile_value is None
+                    else tuple(int(value) for value in tile_value)
+                ),
             )
             chosen.append(case)
             classes.add(case.class_id)
@@ -456,6 +404,32 @@ def _validate_transition_row(row: dict[str, object]) -> Mapping[str, object]:
     return MappingProxyType(dict(row))
 
 
+def _validate_comparison_run_reference(
+    label: str,
+    value: object,
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping) or set(value) != _COMPARISON_RUN_REFERENCE_FIELDS:
+        raise ValueError(f"formal comparison {label} run reference is invalid")
+    threshold = value["threshold"]
+    expected_model = "baseline" if label == "baseline" else "mg_vtod"
+    expected_motion_off = label == "motion_off"
+    run_dir = value["run_dir"]
+    if (
+        not isinstance(run_dir, str)
+        or not Path(run_dir).is_absolute()
+        or not _is_sha256(value["checkpoint_sha256"])
+        or not _is_sha256(value["threshold_sha256"])
+        or isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+        or not 0.0 <= float(threshold) <= 1.0
+        or value["model_name"] != expected_model
+        or value["motion_off"] is not expected_motion_off
+    ):
+        raise ValueError(f"formal comparison {label} run reference is invalid")
+    return MappingProxyType(dict(value))
+
+
 def load_verified_comparison(path: Path) -> VerifiedComparison:
     root = Path(path)
     _reject_symlink_components(root)
@@ -483,6 +457,10 @@ def load_verified_comparison(path: Path) -> VerifiedComparison:
         "motion_off",
     }.issubset(runs) or not set(runs).issubset(_ALLOWED_COMPARISON_RUNS):
         raise ValueError("formal comparison run set must contain Baseline and MG Full without LSTFE")
+    validated_runs = {
+        str(label): _validate_comparison_run_reference(str(label), reference)
+        for label, reference in runs.items()
+    }
     schemas = run.get("artifact_schema")
     digests = run.get("artifact_sha256")
     if (
@@ -553,7 +531,7 @@ def load_verified_comparison(path: Path) -> VerifiedComparison:
     )
     return VerifiedComparison(
         root=root.resolve(strict=True),
-        run=MappingProxyType(dict(run)),
+        run=MappingProxyType({**run, "runs": MappingProxyType(validated_runs)}),
         payload=MappingProxyType(dict(payload)),
         case_rows=case_rows,
     )
@@ -578,161 +556,19 @@ def _validate_frame_key(row: object, *, label: str) -> tuple[str, str, int]:
     return (site, sequence, frame)
 
 
-def _validate_obb_values(value: object, *, label: str) -> None:
-    if (
-        isinstance(value, (str, bytes))
-        or not isinstance(value, Sequence)
-        or len(value) != 5
-        or any(
-            isinstance(item, bool)
-            or not isinstance(item, (int, float))
-            or not math.isfinite(float(item))
-            for item in value
-        )
-        or float(value[2]) <= 0
-        or float(value[3]) <= 0
-        or float(value[2]) < float(value[3])
-        or not -math.pi / 2 <= float(value[4]) < math.pi / 2
-    ):
-        raise ValueError(f"{label} OBB is invalid")
-
-
-def _validate_prediction(row: dict[str, object], universe: set[tuple[str, str, int]]) -> Mapping[str, object]:
-    if set(row) != _PREDICTION_FIELDS or row.get("schema_version") != 1:
-        raise ValueError("formal prediction schema is invalid")
-    identity = _validate_frame_key(
-        {field: row[field] for field in ("site", "sequence", "frame")},
-        label="formal prediction",
-    )
-    confidence = row["confidence"]
-    class_id = row["class_id"]
-    tile = row["tile_xywh"]
-    if (
-        identity not in universe
-        or isinstance(class_id, bool)
-        or class_id not in {0, 1, 2, 3}
-        or isinstance(confidence, bool)
-        or not isinstance(confidence, (int, float))
-        or not math.isfinite(float(confidence))
-        or not 0.0 <= float(confidence) <= 1.0
-        or isinstance(tile, (str, bytes))
-        or not isinstance(tile, Sequence)
-        or len(tile) != 4
-        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in tile)
-    ):
-        raise ValueError("formal prediction values are invalid")
-    _validate_obb_values(row["obb"], label="formal prediction")
-    return MappingProxyType(dict(row))
-
-
-def _validate_truth(row: dict[str, object], universe: set[tuple[str, str, int]]) -> Mapping[str, object]:
-    if set(row) != _HUMAN_TRUTH_FIELDS or row.get("schema_version") != 2:
-        raise ValueError("formal human ground-truth schema is invalid")
-    identity = _validate_frame_key(
-        {field: row[field] for field in ("site", "sequence", "frame")},
-        label="formal human ground truth",
-    )
-    speed = row["pixel_speed_per_frame"]
-    if (
-        identity not in universe
-        or isinstance(row["class_id"], bool)
-        or row["class_id"] not in {0, 1, 2, 3}
-        or isinstance(row["track_id"], bool)
-        or not isinstance(row["track_id"], int)
-        or row["track_id"] < 0
-        or isinstance(row["visible_span"], bool)
-        or not isinstance(row["visible_span"], int)
-        or row["visible_span"] < 0
-        or isinstance(speed, bool)
-        or not isinstance(speed, (int, float))
-        or not math.isfinite(float(speed))
-        or float(speed) < 0
-    ):
-        raise ValueError("formal human ground-truth values are invalid")
-    _validate_obb_values(row["obb"], label="formal human ground truth")
-    return MappingProxyType(dict(row))
-
-
-def _numeric_map(value: object, *, label: str) -> None:
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence) or len(value) != 180:
-        raise ValueError(f"{label} must be a 180x320 map")
-    for row in value:
-        if isinstance(row, (str, bytes)) or not isinstance(row, Sequence) or len(row) != 320:
-            raise ValueError(f"{label} must be a 180x320 map")
-        if any(
-            isinstance(item, bool)
-            or not isinstance(item, (int, float))
-            or not math.isfinite(float(item))
-            or float(item) < 0
-            for item in row
-        ):
-            raise ValueError(f"{label} contains invalid values")
-
-
-def _validate_diagnostic(
-    row: dict[str, object],
+def load_verified_run(
+    root_value: Path,
     *,
-    universe: set[tuple[str, str, int]],
-    image_root: Path,
     expected_model: str,
-) -> Mapping[str, object]:
-    if set(row) != _DIAGNOSTIC_FIELDS or row.get("schema_version") != 1:
-        raise ValueError("formal diagnostic schema is invalid")
-    identity = _validate_frame_key(
-        {field: row[field] for field in ("site", "sequence", "frame")},
-        label="formal diagnostic",
-    )
-    shape = row["frame_shape"]
-    tile = row["diagnostic_tile_xywh"]
-    offsets = row["offsets"]
-    supports = row["support_paths"]
-    if (
-        identity not in universe
-        or row["image_root"] != str(image_root)
-        or isinstance(shape, (str, bytes))
-        or not isinstance(shape, Sequence)
-        or len(shape) != 2
-        or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in shape)
-        or isinstance(tile, (str, bytes))
-        or not isinstance(tile, Sequence)
-        or len(tile) != 4
-        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in tile)
-        or tile[2] <= 0
-        or tile[3] <= 0
-        or tile[0] + tile[2] > shape[1]
-        or tile[1] + tile[3] > shape[0]
-        or isinstance(offsets, (str, bytes))
-        or not isinstance(offsets, Sequence)
-        or not offsets
-        or any(isinstance(value, bool) or not isinstance(value, int) for value in offsets)
-        or len(offsets) != len(set(offsets))
-        or 0 not in offsets
-        or isinstance(supports, (str, bytes))
-        or not isinstance(supports, Sequence)
-        or len(supports) != len(offsets)
-        or any(
-            value is not None
-            and (not isinstance(value, str) or not Path(value).is_absolute())
-            for value in supports
-        )
-        or supports[list(offsets).index(0)] is None
-        or row["selected_long_index"] != -1
-        or row["motion_enabled"] is not True
-        or (expected_model == "baseline" and tuple(offsets) != (0,))
-        or (expected_model == "mg_vtod" and len(offsets) < 5)
-    ):
-        raise ValueError("formal diagnostic values are invalid")
-    _numeric_map(row["motion_map"], label="formal motion map")
-    _numeric_map(
-        row["short_alignment_magnitude"],
-        label="formal short alignment magnitude",
-    )
-    return MappingProxyType(dict(row))
+    benchmark: object,
+    benchmark_sha256: str,
+) -> VerifiedRun:
+    import moving_det.vru_cli as evaluation_contract
 
-
-def load_verified_run(root_value: Path, *, expected_model: str) -> VerifiedRun:
     if expected_model not in {"baseline", "mg_vtod"}:
         raise ValueError("formal demo model must be Baseline or MG Full; LSTFE is forbidden")
+    if not _is_sha256(benchmark_sha256):
+        raise ValueError("formal human benchmark fingerprint is invalid")
     root = Path(root_value)
     _reject_symlink_components(root)
     if not root.is_dir():
@@ -742,45 +578,23 @@ def load_verified_run(root_value: Path, *, expected_model: str) -> VerifiedRun:
         _read_stable_bytes(root / "run.json", label="formal evaluation run.json"),
         label="formal evaluation run.json",
     )
-    if (
-        not _RUN_REQUIRED_FIELDS.issubset(run)
-        or not set(run).issubset(_RUN_ALLOWED_FIELDS)
-        or run.get("schema_version") != 1
-    ):
-        raise ValueError("formal evaluation run schema is invalid")
+    evaluation_contract._validate_evaluation_run_schema(
+        run,
+        human_benchmark_override=benchmark,
+        human_benchmark_sha256=benchmark_sha256,
+    )
     if run.get("model_name") != expected_model:
         raise ValueError("formal demo model provenance mismatch; LSTFE is forbidden")
     if run.get("evaluation_split") != "test" or run.get("motion_off") is not False:
         raise ValueError("formal demo requires motion-on frozen test runs")
-    for field in ("manifest_sha256", "checkpoint_sha256", "human_benchmark_sha256"):
-        if not _is_sha256(run.get(field)):
-            raise ValueError(f"formal evaluation {field} is invalid")
-    image_root_value = run.get("image_root")
-    if not isinstance(image_root_value, str) or not Path(image_root_value).is_absolute():
-        raise ValueError("formal evaluation image_root is invalid")
-    image_root = Path(image_root_value).resolve(strict=False)
-    raw_universe = run.get("detection_frame_keys")
-    if isinstance(raw_universe, (str, bytes)) or not isinstance(raw_universe, Sequence) or not raw_universe:
-        raise ValueError("formal evaluation frame universe is invalid")
-    universe_rows = tuple(
-        _validate_frame_key(row, label="formal evaluation") for row in raw_universe
+    schemas, digests = evaluation_contract._validate_artifact_declarations(
+        run.get("artifact_schema"),
+        run.get("artifact_sha256"),
+        split="test",
+        human_benchmark=True,
     )
-    if len(universe_rows) != len(set(universe_rows)):
-        raise ValueError("formal evaluation frame universe contains duplicates")
-    universe = set(universe_rows)
-    schemas = run.get("artifact_schema")
-    digests = run.get("artifact_sha256")
-    required = {"predictions.jsonl", "ground-truth.jsonl", "diagnostics.jsonl"}
-    if (
-        not isinstance(schemas, Mapping)
-        or not required.issubset(schemas)
-        or not set(schemas).issubset(_RUN_ALLOWED_ARTIFACTS)
-        or any(value != 1 for value in schemas.values())
-        or not isinstance(digests, Mapping)
-        or set(digests) != set(schemas)
-        or not all(_is_sha256(value) for value in digests.values())
-    ):
-        raise ValueError("formal evaluation artifact declarations are invalid or diagnostics are missing")
+    if "diagnostics.jsonl" not in schemas:
+        raise ValueError("formal evaluation diagnostics are missing")
     expected_names = {"run.json", *schemas}
     if {entry.name for entry in root.iterdir()} != expected_names:
         raise ValueError("formal evaluation artifact set is invalid")
@@ -803,32 +617,229 @@ def load_verified_run(root_value: Path, *, expected_model: str) -> VerifiedRun:
         after.st_ctime_ns,
     ) or {entry.name for entry in root.iterdir()} != expected_names:
         raise ValueError("formal evaluation directory changed while loading")
-    predictions = tuple(
-        _validate_prediction(row, universe)
-        for row in _jsonl_objects(contents["predictions.jsonl"], label="formal predictions")
+    detection_frames = evaluation_contract._normalize_frame_keys(
+        run["detection_frame_keys"]
     )
-    truths = tuple(
-        _validate_truth(row, universe)
-        for row in _jsonl_objects(contents["ground-truth.jsonl"], label="formal ground truth")
+    continuity_frames = evaluation_contract._normalize_frame_keys(
+        run["continuity_frame_keys"]
     )
-    diagnostics = tuple(
-        _validate_diagnostic(
-            row,
-            universe=universe,
-            image_root=image_root,
-            expected_model=expected_model,
-        )
-        for row in _jsonl_objects(contents["diagnostics.jsonl"], label="formal diagnostics")
+    universe = evaluation_contract._frame_universe(
+        detection_frames,
+        continuity_frames,
     )
-    if {_frame_identity(row) for row in diagnostics} != universe:
+    predictions = evaluation_contract._validate_prediction_rows(
+        _jsonl_objects(
+            contents["predictions.jsonl"],
+            label="formal predictions",
+        ),
+        universe=universe,
+    )
+    ranked_predictions = evaluation_contract._validate_prediction_rows(
+        _jsonl_objects(
+            contents["ranked-predictions.jsonl"],
+            label="formal ranked predictions",
+        ),
+        universe=universe,
+    )
+    truths = evaluation_contract._validate_human_ground_truth_rows(
+        _jsonl_objects(
+            contents["ground-truth.jsonl"],
+            label="formal ground truth",
+        ),
+        universe=universe,
+        benchmark=benchmark,
+    )
+    diagnostics = evaluation_contract._validate_diagnostic_rows(
+        _jsonl_objects(
+            contents["diagnostics.jsonl"],
+            label="formal diagnostics",
+        ),
+        universe=universe,
+        model_name=expected_model,
+        image_root=Path(str(run["image_root"])),
+        expected_offsets=None,
+        human_benchmark=True,
+        expected_motion_enabled=True,
+    )
+    diagnostic_identities = tuple(_frame_identity(row) for row in diagnostics)
+    frozen_identities = tuple(
+        (str(row["site"]), str(row["sequence"]), int(row["frame"]))
+        for row in run["detection_frame_keys"]
+    )
+    if diagnostic_identities != frozen_identities:
         raise ValueError("formal diagnostics are incomplete")
+    metrics = _json_object(
+        contents["metrics.json"],
+        label="formal evaluation metrics",
+    )
+    for section in evaluation_contract._HUMAN_METRIC_SECTIONS:
+        if not isinstance(metrics.get(section), Mapping):
+            raise ValueError(
+                f"formal human evaluation metrics are missing {section}"
+            )
+    threshold = _load_verified_threshold(run, metrics)
+    expected_predictions = tuple(
+        row
+        for row in ranked_predictions
+        if float(row["confidence"]) >= threshold
+    )
+    if tuple(predictions) != expected_predictions:
+        raise ValueError(
+            "formal threshold predictions do not derive from the verified ranking"
+        )
     return VerifiedRun(
         root=root.resolve(strict=True),
         run=MappingProxyType(dict(run)),
-        predictions=predictions,
-        ground_truth=truths,
-        diagnostics=diagnostics,
+        predictions=tuple(MappingProxyType(dict(row)) for row in predictions),
+        ground_truth=tuple(MappingProxyType(dict(row)) for row in truths),
+        diagnostics=tuple(MappingProxyType(dict(row)) for row in diagnostics),
+        ranked_predictions=tuple(
+            MappingProxyType(dict(row)) for row in ranked_predictions
+        ),
+        threshold=threshold,
     )
+
+
+@contextmanager
+def _verified_evaluation_run_snapshot(source: Path) -> Iterator[Path]:
+    """Copy one complete evaluation run after stable, declared-byte reads."""
+    import moving_det.vru_cli as evaluation_contract
+
+    root = Path(source)
+    _reject_symlink_components(root)
+    if not root.is_dir():
+        raise ValueError("formal threshold validation run is missing or unsafe")
+    before = root.stat()
+    run_content = _read_stable_bytes(
+        root / "run.json",
+        label="formal threshold validation run.json",
+    )
+    run = _json_object(run_content, label="formal threshold validation run.json")
+    evaluation_contract._validate_evaluation_run_schema(run)
+    schemas, digests = evaluation_contract._validate_artifact_declarations(
+        run.get("artifact_schema"),
+        run.get("artifact_sha256"),
+        split=str(run.get("evaluation_split")),
+        human_benchmark="human_benchmark_sha256" in run,
+    )
+    expected_names = {"run.json", *schemas}
+    if {entry.name for entry in root.iterdir()} != expected_names:
+        raise ValueError("formal threshold validation artifact set is invalid")
+    snapshot = Path(tempfile.mkdtemp(prefix="moving-det-formal-threshold-"))
+    try:
+        payloads = {"run.json": run_content}
+        for name in sorted(schemas):
+            content = _read_stable_bytes(
+                root / name,
+                label=f"formal threshold validation {name}",
+            )
+            if hashlib.sha256(content).hexdigest() != digests[name]:
+                raise ValueError(
+                    f"formal threshold validation artifact hash mismatch: {name}"
+                )
+            payloads[name] = content
+        after = root.stat()
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or {entry.name for entry in root.iterdir()} != expected_names:
+            raise ValueError("formal threshold validation run changed while loading")
+        for name, content in payloads.items():
+            destination = snapshot / name
+            with destination.open("xb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        yield snapshot
+    finally:
+        shutil.rmtree(snapshot)
+
+
+def _load_verified_threshold(
+    run: Mapping[str, object],
+    metrics: Mapping[str, object],
+) -> float:
+    import moving_det.vru_cli as evaluation_contract
+
+    source_value = run.get("threshold_source")
+    digest = run.get("threshold_sha256")
+    if not isinstance(source_value, str) or not _is_sha256(digest):
+        raise ValueError("formal run threshold provenance is missing")
+    source = Path(source_value)
+    if source.name != "threshold.json" or not source.is_absolute():
+        raise ValueError("formal run threshold source is invalid")
+    with _verified_evaluation_run_snapshot(source.parent) as snapshot:
+        validation_run, _, _ = evaluation_contract._load_verified_evaluation_run(
+            snapshot,
+            _revalidate_threshold_source=False,
+        )
+        declarations = validation_run.get("artifact_sha256")
+        if (
+            validation_run.get("evaluation_split") != "validation"
+            or validation_run.get("model_name") != run.get("model_name")
+            or validation_run.get("manifest_sha256") != run.get("manifest_sha256")
+            or validation_run.get("checkpoint_sha256")
+            != run.get("checkpoint_sha256")
+            or not isinstance(declarations, Mapping)
+            or declarations.get("threshold.json") != digest
+        ):
+            raise ValueError("formal frozen threshold provenance is mismatched")
+        payload = _json_object(
+            _read_stable_bytes(
+                snapshot / "threshold.json",
+                label="formal frozen threshold",
+            ),
+            label="formal frozen threshold",
+        )
+        validated = evaluation_contract._threshold_payload(
+            payload,
+            evaluation_contract.EvaluationRequest(
+                cfg=None,
+                model_name=str(run["model_name"]),
+                checkpoint=Path("unused"),
+                manifest_dir=Path("unused"),
+                split="validation",
+                threshold_path=None,
+                alignment_cache=None,
+                manifest_sha256=str(run["manifest_sha256"]),
+                checkpoint_sha256=str(run["checkpoint_sha256"]),
+            ),
+        )
+    threshold = float(validated["threshold"])
+    metric_threshold = metrics.get("threshold")
+    if (
+        isinstance(metric_threshold, bool)
+        or not isinstance(metric_threshold, (int, float))
+        or not math.isfinite(float(metric_threshold))
+        or float(metric_threshold) != threshold
+    ):
+        raise ValueError(
+            "formal metrics and independent frozen threshold evidence disagree"
+        )
+    return threshold
+
+
+@contextmanager
+def verified_benchmark_snapshot(
+    source: Path,
+) -> Iterator[tuple[object, str]]:
+    """Load a human benchmark from the exact snapshot used for its fingerprint."""
+    import moving_det.vru_cli as evaluation_contract
+
+    with evaluation_contract._snapshot_formal_human_benchmark(Path(source)) as (
+        snapshot_root,
+        benchmark_sha256,
+    ):
+        if not _is_sha256(benchmark_sha256):
+            raise ValueError("formal human benchmark fingerprint is invalid")
+        yield load_human_benchmark(snapshot_root), benchmark_sha256
 
 
 @contextmanager
@@ -855,20 +866,33 @@ def atomic_output_stage(output: Path) -> Iterator[Path]:
             )
             backup.rmdir()
             os.replace(destination, backup)
+            _fsync_directory(destination.parent)
         try:
             os.replace(stage, destination)
+            _fsync_directory(destination.parent)
         except BaseException:
             if backup is not None and backup.exists() and not destination.exists():
                 os.replace(backup, destination)
+                _fsync_directory(destination.parent)
             raise
         if backup is not None:
             shutil.rmtree(backup)
+            _fsync_directory(destination.parent)
             backup = None
     finally:
         if stage.exists():
             shutil.rmtree(stage)
         if backup is not None and backup.exists():
             shutil.rmtree(backup)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(Path(path), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def require_contiguous_numbered_frames(paths: Sequence[Path]) -> None:
@@ -999,6 +1023,184 @@ def _diagnostic_rows(
             raise ValueError("formal diagnostics contain duplicate frames")
         result[identity] = row
     return result
+
+
+def _detection_rows(rows: Sequence[Mapping[str, object]]) -> tuple[object, ...]:
+    from moving_det.ml.inference import Detection
+    from moving_det.models import OBB
+    from moving_det.vrud.tiling import Tile
+
+    return tuple(
+        Detection(
+            frame=int(row["frame"]),
+            obb=OBB(*(float(value) for value in row["obb"])),
+            class_id=int(row["class_id"]),
+            confidence=float(row["confidence"]),
+            tile=Tile(*(int(value) for value in row["tile_xywh"])),
+            site=str(row["site"]),
+            sequence=str(row["sequence"]),
+        )
+        for row in rows
+    )
+
+
+def _detection_identity(row: object) -> tuple[object, ...]:
+    from moving_det.geometry.obb import normalize_theta
+
+    return (
+        str(row.site),
+        str(row.sequence),
+        int(row.frame),
+        int(row.class_id),
+        float(row.confidence),
+        float(row.obb.cx),
+        float(row.obb.cy),
+        float(row.obb.width),
+        float(row.obb.height),
+        normalize_theta(float(row.obb.theta)),
+        int(row.tile.x),
+        int(row.tile.y),
+        int(row.tile.width),
+        int(row.tile.height),
+    )
+
+
+def verify_formal_transitions(
+    benchmark: object,
+    baseline: VerifiedRun,
+    mg_full: VerifiedRun,
+    comparison_rows: Sequence[Mapping[str, object]],
+) -> FormalTransitionEvidence:
+    """Recompute comparison cases and preserve the official match assignment."""
+    from moving_det.ml.evaluation import match_detections
+    from moving_det.ml.human_evaluation import (
+        _as_ground_truth,
+        paired_human_transitions,
+        suppress_ignored_predictions,
+    )
+
+    if baseline.threshold is None or mg_full.threshold is None:
+        raise ValueError("formal transition evidence requires verified thresholds")
+    baseline_ranked = _detection_rows(baseline.ranked_predictions)
+    mg_ranked = _detection_rows(mg_full.ranked_predictions)
+    paired = paired_human_transitions(
+        baseline_ranked,
+        mg_ranked,
+        benchmark,
+        baseline.threshold,
+        mg_full.threshold,
+    )
+    truth_by_identity = {
+        (
+            row.site,
+            row.sequence,
+            row.frame,
+            row.track_id,
+            row.visible_span,
+        ): row
+        for row in benchmark.truths
+    }
+
+    def transition_key(row: Mapping[str, object]) -> tuple[object, ...]:
+        return (
+            str(row["state"]),
+            str(row["site"]),
+            str(row["sequence"]),
+            int(row["frame"]),
+            row["track_id"],
+            row["visible_span"],
+            int(row["class_id"]),
+            None if row["confidence"] is None else float(row["confidence"]),
+            None if row["obb"] is None else tuple(float(v) for v in row["obb"]),
+            None
+            if row["tile_xywh"] is None
+            else tuple(int(v) for v in row["tile_xywh"]),
+        )
+
+    expected = []
+    for transition in paired["by_identity"]:
+        identity = tuple(transition["identity"])
+        truth = truth_by_identity.get(identity)
+        if truth is None:
+            raise ValueError("formal paired transition has an unknown truth identity")
+        if transition["state"] in _REQUIRED_STATES:
+            expected.append(
+                (
+                    transition["state"],
+                    *identity,
+                    truth.class_id,
+                    None,
+                    None,
+                    None,
+                )
+            )
+    for row in paired["new_false_positives"]:
+        expected.append(
+            (
+                "new_false_positive",
+                row["site"],
+                row["sequence"],
+                row["frame"],
+                None,
+                None,
+                row["class_id"],
+                row["confidence"],
+                tuple(row["obb"]),
+                tuple(row["tile_xywh"]),
+            )
+        )
+    actual = tuple(transition_key(row) for row in comparison_rows)
+    if actual != tuple(expected):
+        raise ValueError(
+            "formal comparison transitions differ from verified run predictions"
+        )
+
+    ground_truth = _as_ground_truth(tuple(benchmark.truths))
+
+    def matched_evidence(
+        ranked: tuple[object, ...],
+        threshold: float,
+    ) -> tuple[
+        dict[tuple[str, str, int, int, int, int], object],
+        tuple[object, ...],
+        object,
+    ]:
+        unsuppressed, _ = suppress_ignored_predictions(ranked, benchmark.ignores)
+        fixed = tuple(row for row in unsuppressed if row.confidence >= threshold)
+        matched = match_detections(fixed, ground_truth, 0.25)
+        by_truth = {}
+        for prediction_index, truth_index in matched.prediction_to_gt.items():
+            truth = benchmark.truths[truth_index]
+            by_truth[
+                (
+                    truth.site,
+                    truth.sequence,
+                    truth.frame,
+                    truth.track_id,
+                    truth.visible_span,
+                    truth.class_id,
+                )
+            ] = fixed[prediction_index]
+        return by_truth, fixed, matched
+
+    baseline_by_truth, _, _ = matched_evidence(
+        baseline_ranked,
+        baseline.threshold,
+    )
+    mg_by_truth, mg_fixed, mg_matched = matched_evidence(
+        mg_ranked,
+        mg_full.threshold,
+    )
+    mg_false_positives = {
+        _detection_identity(row): row
+        for index, row in enumerate(mg_fixed)
+        if not mg_matched.prediction_is_true_positive[index]
+    }
+    return FormalTransitionEvidence(
+        baseline_by_truth=MappingProxyType(baseline_by_truth),
+        mg_by_truth=MappingProxyType(mg_by_truth),
+        mg_false_positives=MappingProxyType(mg_false_positives),
+    )
 
 
 def _obb(value: object) -> object:
@@ -1253,6 +1455,9 @@ def render_case_panels(
     if not isinstance(comparison, DemoEvidence):
         raise ValueError("formal case rendering requires verified demo evidence")
     evidence = comparison
+    if not isinstance(evidence.transitions, FormalTransitionEvidence):
+        raise ValueError("formal case rendering requires verified transition evidence")
+    transition_evidence = evidence.transitions
     benchmark = evidence.benchmark
     baseline_predictions = _group_rows(evidence.baseline.predictions)
     mg_predictions = _group_rows(evidence.mg_full.predictions)
@@ -1322,7 +1527,7 @@ def render_case_panels(
     def track_state(
         case: FormalCase,
         key: tuple[str, str, int],
-        rows: Sequence[Mapping[str, object]],
+        matches: Mapping[tuple[str, str, int, int, int, int], object],
     ) -> str:
         if case.track_id < 0:
             return "not_visible"
@@ -1336,15 +1541,15 @@ def render_case_panels(
         )
         if truth is None:
             return "not_visible"
-        return (
-            "tp"
-            if any(
-                int(row["class_id"]) == case.class_id
-                and rotated_iou(_obb(row["obb"]), truth.obb) >= 0.25
-                for row in rows
-            )
-            else "fn"
+        identity = (
+            truth.site,
+            truth.sequence,
+            truth.frame,
+            truth.track_id,
+            truth.visible_span,
+            truth.class_id,
         )
+        return "tp" if identity in matches else "fn"
 
     artifacts = []
     for index, case in enumerate(cases):
@@ -1384,6 +1589,42 @@ def render_case_panels(
         if any(frame.shape != frames[0].shape for frame in frames):
             raise ValueError("formal case support frame crops differ")
         truth_rows = truth_by_key.get(key, ())
+        if case.state != "new_false_positive":
+            selected_center_truth = next(
+                (
+                    row
+                    for row in truth_rows
+                    if row.track_id == case.track_id
+                    and row.visible_span == case.visible_span
+                    and row.class_id == case.class_id
+                ),
+                None,
+            )
+            if selected_center_truth is None:
+                raise ValueError("formal case truth identity is absent at center")
+            center_identity = (
+                selected_center_truth.site,
+                selected_center_truth.sequence,
+                selected_center_truth.frame,
+                selected_center_truth.track_id,
+                selected_center_truth.visible_span,
+                selected_center_truth.class_id,
+            )
+            center_state = {
+                (False, True): "rescued",
+                (True, False): "regressed",
+                (True, True): "stable_tp",
+                (False, False): "stable_fn",
+            }[
+                (
+                    center_identity in transition_evidence.baseline_by_truth,
+                    center_identity in transition_evidence.mg_by_truth,
+                )
+            ]
+            if center_state != case.state:
+                raise ValueError(
+                    "formal case center state differs from verified matching"
+                )
         ground_truth = tuple(
             PanelOBB(
                 local_obb(row.obb, tile),
@@ -1441,10 +1682,31 @@ def render_case_panels(
         for frame_number in range(first_frame, first_frame + 291):
             frame_key = (case.site, case.sequence, frame_number)
             baseline_states.append(
-                track_state(case, frame_key, baseline_predictions.get(frame_key, ()))
+                track_state(case, frame_key, transition_evidence.baseline_by_truth)
             )
-            mg_states.append(track_state(case, frame_key, mg_predictions.get(frame_key, ())))
+            mg_states.append(
+                track_state(case, frame_key, transition_evidence.mg_by_truth)
+            )
         if case.state == "new_false_positive":
+            if (
+                case.confidence is None
+                or case.obb is None
+                or case.tile_xywh is None
+            ):
+                raise ValueError("formal false-positive case identity is incomplete")
+            fp_identity = (
+                case.site,
+                case.sequence,
+                case.frame,
+                case.class_id,
+                case.confidence,
+                *case.obb,
+                *case.tile_xywh,
+            )
+            if fp_identity not in transition_evidence.mg_false_positives:
+                raise ValueError(
+                    "formal false-positive case differs from verified matching"
+                )
             position = case.frame - first_frame
             if not 0 <= position < 291:
                 raise ValueError("formal false-positive case lies outside its timeline")
@@ -1461,23 +1723,41 @@ def render_case_panels(
         panel.paste(two_model, (0, 0))
         draw = ImageDraw.Draw(panel)
         selected_truth = next(
-            (row for row in truth_rows if row.track_id == case.track_id),
+            (
+                row
+                for row in truth_rows
+                if row.track_id == case.track_id
+                and row.visible_span == case.visible_span
+                and row.class_id == case.class_id
+            ),
             None,
         )
-        selected_prediction = next(
-            iter(mg_predictions.get(key, ())),
-            None,
-        )
+        if selected_truth is not None:
+            truth_identity = (
+                selected_truth.site,
+                selected_truth.sequence,
+                selected_truth.frame,
+                selected_truth.track_id,
+                selected_truth.visible_span,
+                selected_truth.class_id,
+            )
+            selected_prediction = transition_evidence.mg_by_truth.get(
+                truth_identity
+            ) or transition_evidence.baseline_by_truth.get(truth_identity)
+        elif case.state == "new_false_positive":
+            selected_prediction = transition_evidence.mg_false_positives[fp_identity]
+        else:
+            selected_prediction = None
         short_side = (
             min(selected_truth.obb.width, selected_truth.obb.height)
             if selected_truth is not None
-            else min(_obb(selected_prediction["obb"]).width, _obb(selected_prediction["obb"]).height)
+            else min(selected_prediction.obb.width, selected_prediction.obb.height)
             if selected_prediction is not None
             else 0.0
         )
         speed = selected_truth.pixel_speed if selected_truth is not None else 0.0
         confidence = (
-            float(selected_prediction["confidence"])
+            float(selected_prediction.confidence)
             if selected_prediction is not None
             else 0.0
         )
@@ -1505,6 +1785,7 @@ def snapshot_formal_images(
     from PIL import Image
 
     expected_hashes: dict[Path, str] = {}
+    benchmark_hashes_by_resolved_path: dict[Path, str] = {}
     sources: set[Path] = set()
     frame_shapes: dict[Path, tuple[int, int]] = {}
     for frame in benchmark.frames:
@@ -1516,6 +1797,14 @@ def snapshot_formal_images(
         previous = expected_hashes.setdefault(source, digest)
         if previous != digest:
             raise ValueError("formal benchmark image declarations disagree")
+        _reject_symlink_components(source)
+        resolved = source.resolve(strict=True)
+        previous_resolved = benchmark_hashes_by_resolved_path.setdefault(
+            resolved,
+            digest,
+        )
+        if previous_resolved != digest:
+            raise ValueError("formal benchmark image aliases disagree")
     for run in (baseline, mg_full):
         for diagnostic in run.diagnostics:
             shape = diagnostic["frame_shape"]
@@ -1523,6 +1812,14 @@ def snapshot_formal_images(
                 if path_value is None:
                     continue
                 source = Path(str(path_value))
+                _reject_symlink_components(source)
+                resolved = source.resolve(strict=True)
+                declared = benchmark_hashes_by_resolved_path.get(resolved)
+                if declared is None:
+                    raise ValueError(
+                        "formal support image is not anchored by a benchmark hash"
+                    )
+                expected_hashes[source] = declared
                 sources.add(source)
                 expected_shape = (int(shape[1]), int(shape[0]))
                 previous_shape = frame_shapes.setdefault(source, expected_shape)
@@ -1540,8 +1837,8 @@ def snapshot_formal_images(
         resolved_sources.add(resolved)
         content = _read_stable_bytes(source, label="formal source image")
         digest = hashlib.sha256(content).hexdigest()
-        declared = expected_hashes.get(source)
-        if declared is not None and digest != declared:
+        declared = expected_hashes[source]
+        if digest != declared:
             raise ValueError("formal benchmark source image hash mismatch")
         try:
             with Image.open(io.BytesIO(content)) as image:
@@ -1606,17 +1903,32 @@ def write_demo_manifest(
             raise ValueError("formal manifest cases must be FormalCase records")
         panel = record(Path(case_files[2 * index]))
         timeline = record(Path(case_files[2 * index + 1]))
+        identity: dict[str, object] = {
+            "site": case.site,
+            "sequence": case.sequence,
+            "frame": case.frame,
+            "track_id": case.track_id,
+            "visible_span": case.visible_span,
+            "class_id": case.class_id,
+            "state": case.state,
+        }
+        if case.state == "new_false_positive":
+            if (
+                case.confidence is None
+                or case.obb is None
+                or case.tile_xywh is None
+            ):
+                raise ValueError(
+                    "formal false-positive case lacks stable prediction identity"
+                )
+            identity.update(
+                confidence=case.confidence,
+                obb=list(case.obb),
+                tile_xywh=list(case.tile_xywh),
+            )
         case_rows.append(
             {
-                "identity": {
-                    "site": case.site,
-                    "sequence": case.sequence,
-                    "frame": case.frame,
-                    "track_id": case.track_id,
-                    "visible_span": case.visible_span,
-                    "class_id": case.class_id,
-                    "state": case.state,
-                },
+                "identity": identity,
                 "panel": panel,
                 "timeline": timeline,
             }
@@ -1675,6 +1987,66 @@ def write_demo_manifest(
     return destination
 
 
+def validate_final_demo_tree(stage: Path, manifest_path: Path) -> None:
+    root = Path(stage).resolve(strict=True)
+    manifest = _json_object(
+        _read_stable_bytes(manifest_path, label="formal demo manifest"),
+        label="formal demo manifest",
+    )
+    expected_files = {Path("demo.json")}
+    declarations = []
+    scenes = manifest.get("scenes")
+    cases = manifest.get("cases")
+    if not isinstance(scenes, list) or not isinstance(cases, list):
+        raise ValueError("formal demo manifest tree declarations are invalid")
+    for scene in scenes:
+        if not isinstance(scene, Mapping):
+            raise ValueError("formal demo manifest scene is invalid")
+        declarations.append(scene)
+    for case in cases:
+        if not isinstance(case, Mapping):
+            raise ValueError("formal demo manifest case is invalid")
+        for field in ("panel", "timeline"):
+            declaration = case.get(field)
+            if not isinstance(declaration, Mapping):
+                raise ValueError("formal demo manifest case artifact is invalid")
+            declarations.append(declaration)
+    for declaration in declarations:
+        path_value = declaration.get("path")
+        digest = declaration.get("sha256")
+        if not isinstance(path_value, str) or not _is_sha256(digest):
+            raise ValueError("formal demo manifest artifact declaration is invalid")
+        relative = Path(path_value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("formal demo manifest artifact path is unsafe")
+        expected_files.add(relative)
+        artifact = root / relative
+        if artifact.is_symlink() or not artifact.is_file():
+            raise ValueError("formal demo manifest artifact is missing or unsafe")
+        if hashlib.sha256(artifact.read_bytes()).hexdigest() != digest:
+            raise ValueError("formal demo manifest artifact hash differs")
+    actual_files = set()
+    actual_dirs = set()
+    for entry in root.rglob("*"):
+        if entry.is_symlink():
+            raise ValueError("formal demo final tree contains a symlink")
+        relative = entry.relative_to(root)
+        if entry.is_file():
+            actual_files.add(relative)
+        elif entry.is_dir():
+            actual_dirs.add(relative)
+        else:
+            raise ValueError("formal demo final tree contains an unsafe entry")
+    expected_dirs = {
+        parent
+        for path in expected_files
+        for parent in path.parents
+        if parent != Path(".")
+    }
+    if actual_files != expected_files or actual_dirs != expected_dirs:
+        raise ValueError("formal demo final tree contains undeclared artifacts")
+
+
 def build_formal_demo(
     request: FormalDemoRequest,
     *,
@@ -1705,29 +2077,43 @@ def build_formal_demo(
     comparison = load_verified_comparison(request.comparison_dir)
     if not isinstance(comparison, VerifiedComparison):
         raise ValueError("formal comparison loader returned unverified evidence")
-    benchmark_manifest = _read_stable_bytes(
-        Path(request.benchmark_dir) / "benchmark.json",
-        label="formal human benchmark manifest",
-    )
-    benchmark_sha256 = hashlib.sha256(benchmark_manifest).hexdigest()
+    with verified_benchmark_snapshot(request.benchmark_dir) as (
+        benchmark,
+        benchmark_sha256,
+    ):
+        pass
     if comparison.run["human_benchmark_sha256"] != benchmark_sha256:
         raise ValueError("formal comparison and human benchmark hashes differ")
-    benchmark = load_human_benchmark(request.benchmark_dir)
-    baseline = load_verified_run(request.baseline_run, expected_model="baseline")
-    mg_full = load_verified_run(request.mg_run, expected_model="mg_vtod")
+    baseline = load_verified_run(
+        request.baseline_run,
+        expected_model="baseline",
+        benchmark=benchmark,
+        benchmark_sha256=benchmark_sha256,
+    )
+    mg_full = load_verified_run(
+        request.mg_run,
+        expected_model="mg_vtod",
+        benchmark=benchmark,
+        benchmark_sha256=benchmark_sha256,
+    )
     for label, loaded in (("baseline", baseline), ("mg_full", mg_full)):
         reference = comparison.run["runs"].get(label)
-        if not isinstance(reference, Mapping) or not isinstance(
-            reference.get("run_dir"), str
-        ):
+        if not isinstance(reference, Mapping):
             raise ValueError(f"formal comparison {label} run reference is invalid")
         if Path(str(reference["run_dir"])).resolve(strict=False) != loaded.root:
             raise ValueError(f"formal comparison {label} run reference differs")
-        for field in ("model_name", "motion_off", "checkpoint_sha256"):
-            if field in reference and reference[field] != loaded.run.get(field):
+        for field in (
+            "model_name",
+            "motion_off",
+            "checkpoint_sha256",
+            "threshold_sha256",
+        ):
+            if reference[field] != loaded.run.get(field):
                 raise ValueError(
                     f"formal comparison {label} {field} reference differs"
                 )
+        if float(reference["threshold"]) != loaded.threshold:
+            raise ValueError(f"formal comparison {label} threshold reference differs")
         if loaded.run["human_benchmark_sha256"] != benchmark_sha256:
             raise ValueError(f"formal {label} run uses a different human benchmark")
     compatibility_fields = (
@@ -1750,6 +2136,12 @@ def build_formal_demo(
         raise ValueError("formal run and human benchmark frame universes differ")
     if baseline.ground_truth != mg_full.ground_truth:
         raise ValueError("formal Baseline and MG Full ground truth differ")
+    transitions = verify_formal_transitions(
+        benchmark,
+        baseline,
+        mg_full,
+        comparison.case_rows,
+    )
     source_roots = {
         Path(str(baseline.run["image_root"])),
         Path(str(mg_full.run["image_root"])),
@@ -1786,6 +2178,7 @@ def build_formal_demo(
             baseline=baseline,
             mg_full=mg_full,
             image_paths=image_paths,
+            transitions=transitions,
         )
         scene_frames = render_scene_sequences(
             benchmark=benchmark,
@@ -1820,13 +2213,15 @@ def build_formal_demo(
             raise RuntimeError(
                 "formal demo must contain three non-empty scene videos"
             )
-        write_demo_manifest(
+        manifest_path = write_demo_manifest(
             stage,
             cases,
             case_files,
             video_files,
             fps=request.fps,
         )
+        shutil.rmtree(frame_root)
+        validate_final_demo_tree(stage, manifest_path)
     return request.output / "demo.json"
 
 
@@ -1836,4 +2231,7 @@ __all__ = [
     "build_formal_demo",
     "encode_scene",
     "select_formal_cases",
+    "verified_benchmark_snapshot",
+    "validate_final_demo_tree",
+    "verify_formal_transitions",
 ]

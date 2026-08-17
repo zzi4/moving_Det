@@ -10817,6 +10817,177 @@ def test_audit_sample_defaults_to_the_frozen_config_and_seed():
     assert args.seed == 20260806
 
 
+def test_human_evaluation_diagnostic_schedule_covers_all_three_291_frame_scenes():
+    identities = tuple(
+        (scene, frame)
+        for scene in ("day-a", "day-b", "night")
+        for frame in range(291)
+    )
+
+    selected = tuple(
+        identity
+        for index, identity in enumerate(identities)
+        if vru_cli_module._capture_evaluation_diagnostic(
+            index,
+            human_benchmark=True,
+        )
+    )
+
+    assert selected == identities
+    assert tuple(
+        index
+        for index in range(8)
+        if vru_cli_module._capture_evaluation_diagnostic(
+            index,
+            human_benchmark=False,
+        )
+    ) == (0, 1, 2)
+
+
+def test_formal_demo_loader_consumes_real_v2_human_writer_contract(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.formal_demo as formal_demo
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, _, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"synthetic MG checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+        model_name="mg_vtod",
+        threshold=0.42,
+    )
+    human_root = tmp_path / "human-benchmark"
+    human_root.mkdir()
+    output = tmp_path / "human-run"
+    args = build_parser().parse_args(
+        [
+            "evaluate",
+            "--model",
+            "mg_vtod",
+            "--checkpoint",
+            str(checkpoint),
+            "--manifest",
+            str(manifest),
+            "--split",
+            "test",
+            "--threshold",
+            str(threshold),
+            "--alignment-cache",
+            str(tmp_path / "alignment-cache"),
+            "--human-benchmark",
+            str(human_root),
+            "--output",
+            str(output),
+        ]
+    )
+    cfg = replace(
+        load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
+        image_root=tmp_path / "images",
+        metadata_root=tmp_path / "metadata",
+        output_root=tmp_path / "runs",
+    )
+    offsets = tuple(cfg.mg_offsets)
+    diagnostics = tuple(
+        {
+            "schema_version": 1,
+            "site": frame.site,
+            "sequence": frame.sequence,
+            "frame": frame.frame,
+            "frame_shape": [2160, 3840],
+            "image_root": str(cfg.image_root.resolve()),
+            "offsets": list(offsets),
+            "support_paths": [
+                str(
+                    cfg.image_root.resolve()
+                    / f"{frame.site}_sequence"
+                    / frame.sequence
+                    / f"{frame.frame + offset:06d}.jpg"
+                )
+                for offset in offsets
+            ],
+            "motion_map": [[0.0]],
+            "selected_long_index": -1,
+            "short_alignment_magnitude": [[0.0]],
+            "diagnostic_tile_xywh": [0, 0, 1024, 1024],
+            "motion_enabled": True,
+        }
+        for frame in benchmark.frames
+    )
+    original_diagnostic_validator = vru_cli_module._validate_diagnostic_rows
+
+    def lightweight_validator(rows, **kwargs):
+        if rows and rows[0].get("motion_map") == [[0.0]]:
+            normalized = tuple(dict(row) for row in rows)
+            assert len(normalized) == 873
+            assert tuple(
+                (row["site"], row["sequence"], row["frame"])
+                for row in normalized
+            ) == tuple(
+                (frame.site, frame.sequence, frame.frame)
+                for frame in benchmark.frames
+            )
+            return normalized
+        return original_diagnostic_validator(rows, **kwargs)
+
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "human_benchmark_fingerprint",
+        lambda path: "f" * 64,
+    )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_stable_human_benchmark",
+        lambda path: (benchmark, "f" * 64),
+    )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_validate_diagnostic_rows",
+        lightweight_validator,
+    )
+    run_evaluate(
+        args,
+        config_loader=lambda path: cfg,
+        evaluator=lambda request: replace(
+            bundle,
+            diagnostics=diagnostics,
+            metrics={**bundle.metrics, "threshold": 0.42},
+        ),
+        provenance_collector=lambda *_: {
+            "git_commit": "f" * 40,
+            "git_dirty": False,
+            "environment": _strict_run_environment(),
+            "started_at_utc": "2026-08-07T02:00:00.000000Z",
+            "finished_at_utc": "2026-08-07T02:00:01.000000Z",
+            "duration_seconds": 1.0,
+        },
+    )
+
+    loaded = formal_demo.load_verified_run(
+        output,
+        expected_model="mg_vtod",
+        benchmark=benchmark,
+        benchmark_sha256="f" * 64,
+    )
+
+    assert loaded.run["schema_version"] == 2
+    assert loaded.run["artifact_schema"]["ground-truth.jsonl"] == 3
+    assert len(loaded.diagnostics) == 873
+    assert loaded.ground_truth[0]["schema_version"] == 3
+    assert loaded.threshold == 0.42
+
+
 def test_build_formal_demo_cli_requires_verified_inputs_and_fixed_fps(
     tmp_path,
     monkeypatch,
