@@ -10,7 +10,11 @@ import {
   createStatusSnapshot,
   streamFixedFile,
 } from "./server/status.mjs";
-import { createEvidenceFiles } from "./server/evidence.mjs";
+import {
+  createEvidenceFiles,
+  createFormalEvidenceFiles,
+} from "./server/evidence.mjs";
+import { createFormalStatusSnapshot } from "./server/formal-status.mjs";
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   "00000000-0000-4000-8000-000000000000";
@@ -24,6 +28,9 @@ const readCalibrationStatus = createCachedStatusReader({
 });
 
 const evidenceFiles = createEvidenceFiles({ projectPath, worktreePath });
+const formalRoot =
+  process.env.MOVING_DET_FORMAL_ROOT ??
+  "/home/stu1/Projects/moving_Det/runs/vrud-pilot/formal-20260817-01";
 
 function localReportApi(): Plugin {
   return {
@@ -55,12 +62,52 @@ function localReportApi(): Plugin {
           return;
         }
 
-        if (!pathname.startsWith("/evidence/")) {
+        if (pathname === "/api/formal-status") {
+          if (!["GET", "HEAD"].includes(request.method ?? "GET")) {
+            response.statusCode = 405;
+            response.setHeader("Allow", "GET, HEAD");
+            response.end("Method not allowed");
+            return;
+          }
+          try {
+            const status = await createFormalStatusSnapshot({ formalRoot });
+            response.statusCode = 200;
+            response.setHeader(
+              "Content-Type",
+              "application/json; charset=utf-8",
+            );
+            response.setHeader("Cache-Control", "no-store");
+            response.end(
+              request.method === "HEAD" ? undefined : JSON.stringify(status),
+            );
+          } catch {
+            response.statusCode = 503;
+            response.setHeader("Cache-Control", "no-store");
+            response.end("Formal status is unavailable");
+          }
+          return;
+        }
+
+        if (
+          !pathname.startsWith("/evidence/") &&
+          !pathname.startsWith("/formal-evidence/")
+        ) {
           next();
           return;
         }
 
-        const evidence = evidenceFiles.get(pathname);
+        let evidence = evidenceFiles.get(pathname);
+        if (pathname.startsWith("/formal-evidence/")) {
+          try {
+            evidence = (await createFormalEvidenceFiles({ formalRoot })).get(
+              pathname,
+            );
+          } catch {
+            response.statusCode = 404;
+            response.end("Evidence file is not available");
+            return;
+          }
+        }
         if (!evidence) {
           response.statusCode = 404;
           response.end("Not found");

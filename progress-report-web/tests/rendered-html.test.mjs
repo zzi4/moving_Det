@@ -46,6 +46,13 @@ test("server-renders the complete Chinese progress report", async () => {
   assert.match(html, /id="risks"/);
   assert.match(html, /id="next"/);
   assert.match(html, /id="evidence"/);
+  assert.match(html, /id="formal-report"/);
+  assert.match(html, /Baseline × MG-VTOD 正式比较/);
+  assert.match(html, /训练与评测阶段/);
+  assert.match(html, /9 项门槛/);
+  assert.match(html, /Universal 历史训练来源重叠/);
+  assert.match(html, /这里只评价同域增量/);
+  assert.match(html, /demo\.json 尚未验证/);
   assert.match(html, /src="\/evidence\/comparison\.webp"/);
   assert.match(html, /href="\/evidence\/comparison-original\.png"/);
   assert.match(html, /同一场景，逐步收敛/);

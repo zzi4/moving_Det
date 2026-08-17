@@ -8,3 +8,7 @@ export function createEvidenceFiles(paths: {
   projectPath: string;
   worktreePath: string;
 }): Map<string, EvidenceFile>;
+
+export function createFormalEvidenceFiles(options: {
+  formalRoot: string;
+}): Promise<Map<string, EvidenceFile>>;

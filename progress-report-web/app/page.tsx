@@ -1,5 +1,6 @@
 import { LiveCalibration } from "./components/live-calibration";
 import { EvidenceImage } from "./components/evidence-image";
+import { FormalReportLive } from "./components/formal-report";
 import { PipelineStory } from "./components/pipeline-story";
 import {
   calibrationRows,
@@ -53,6 +54,10 @@ export default function Home() {
               {item.label}
             </a>
           ))}
+          <a href="#formal-report">
+            <span>08</span>
+            正式比较
+          </a>
         </nav>
 
         <div className="side-note">
@@ -441,6 +446,8 @@ export default function Home() {
             </div>
           </div>
         </section>
+
+        <FormalReportLive />
 
         <footer>
           <p>

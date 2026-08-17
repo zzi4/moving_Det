@@ -1,5 +1,7 @@
 import { join } from "node:path";
 
+import { readFormalDemoManifest } from "./formal-status.mjs";
+
 const pipelineImageStems = [
   "alignment-after",
   "alignment-before",
@@ -82,4 +84,15 @@ export function createEvidenceFiles({ projectPath, worktreePath }) {
     }
   }
   return files;
+}
+
+export async function createFormalEvidenceFiles({ formalRoot }) {
+  const manifest = await readFormalDemoManifest({ formalRoot });
+  if (manifest === null) return new Map();
+  return new Map(
+    manifest.files.map(({ route, path, contentType, cacheControl }) => [
+      route,
+      { path, contentType, cacheControl },
+    ]),
+  );
 }
