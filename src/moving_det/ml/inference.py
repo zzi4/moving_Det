@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -340,10 +340,18 @@ def infer_full_frame(
     model: nn.Module,
     clip: Mapping[str, object],
     cfg: object,
+    *,
+    diagnostic_consumer: Callable[
+        [tuple[Tile, ...], Mapping[str, object]],
+        None,
+    ]
+    | None = None,
 ) -> tuple[Detection, ...]:
     """Run one full-frame temporal clip through approved tiled OBB inference."""
     if not isinstance(model, nn.Module):
         raise ValueError("model must be a torch module")
+    if diagnostic_consumer is not None and not callable(diagnostic_consumer):
+        raise ValueError("diagnostic_consumer must be callable or null")
     validated = _validate_clip(clip)
     tile_size = _strict_int(_cfg_value(cfg, "tile_size"), "tile_size", minimum=1)
     overlap = _strict_int(_cfg_value(cfg, "tile_overlap"), "tile_overlap")
@@ -386,11 +394,31 @@ def infer_full_frame(
                     device=device,
                     dtype=dtype,
                 )
-                raw = model(batch)
+                if diagnostic_consumer is None:
+                    raw = model(batch)
+                else:
+                    provider = getattr(model, "forward_with_diagnostics", None)
+                    if callable(provider):
+                        provided = provider(batch)
+                        if (
+                            not isinstance(provided, tuple)
+                            or len(provided) != 2
+                            or not isinstance(provided[1], Mapping)
+                        ):
+                            raise ValueError(
+                                "model diagnostics forward must return "
+                                "(predictions, mapping)"
+                            )
+                        raw, diagnostic = provided
+                    else:
+                        raw = model(batch)
+                        diagnostic = {}
                 checked = _validate_raw_prediction(
                     raw,
                     expected_batch=len(chunk),
                 )
+                if diagnostic_consumer is not None:
+                    diagnostic_consumer(tuple(chunk), diagnostic)
                 rows_by_tile = non_max_suppression(
                     checked,
                     conf_thres=confidence,

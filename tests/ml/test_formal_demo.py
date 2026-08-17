@@ -600,7 +600,7 @@ def _demo_evidence(tmp_path: Path) -> tuple[DemoEvidence, FormalCase]:
                 frame=index,
                 class_id=0,
                 track_id=index,
-                obb=OBB(160.0, 90.0, 40.0, 18.0, 0.1),
+                obb=OBB(150.0, 90.0, 40.0, 18.0, 0.1),
                 pixel_speed=2.0,
                 visible_span=0,
             )
@@ -613,8 +613,8 @@ def _demo_evidence(tmp_path: Path) -> tuple[DemoEvidence, FormalCase]:
                 "frame": index,
                 "class_id": 0,
                 "confidence": 0.9,
-                "obb": [160.0, 90.0, 40.0, 18.0, 0.1],
-                "tile_xywh": [0, 0, 320, 180],
+                "obb": [150.0, 90.0, 40.0, 18.0, 0.1],
+                "tile_xywh": [0, 0, 180, 180],
             }
         )
         common = {
@@ -629,6 +629,10 @@ def _demo_evidence(tmp_path: Path) -> tuple[DemoEvidence, FormalCase]:
             "short_alignment_magnitude": np.zeros((180, 320), dtype=np.float32),
             "diagnostic_tile_xywh": [0, 0, 320, 180],
             "motion_enabled": True,
+            "diagnostic_space": "full-frame-overview",
+            "tile_size": 180,
+            "tile_overlap": 40,
+            "tile_grid_xywh": [[0, 0, 180, 180], [140, 0, 180, 180]],
         }
         baseline_diagnostics.append(
             {**common, "offsets": [0], "support_paths": [str(source)]}
@@ -953,6 +957,148 @@ def test_scene_and_case_rendering_include_required_formal_evidence(
         assert timeline.size[0] == 291
 
 
+def test_real_case_renderer_localizes_nonrepresentative_truth_and_far_fp_tiles(
+    tmp_path,
+):
+    import moving_det.ml.formal_demo as formal_demo
+    from moving_det.ml.human_evaluation import paired_human_transitions
+
+    evidence, _ = _demo_evidence(tmp_path)
+    first_frame = evidence.benchmark.frames[0]
+    source = Path(first_frame.image_path)
+    rgb = np.zeros((180, 320, 3), dtype=np.uint8)
+    rgb[:, :160] = (230, 20, 20)
+    rgb[:, 160:] = (20, 20, 230)
+    Image.fromarray(rgb).save(source, quality=100, subsampling=0)
+    updated_frame = replace(
+        first_frame,
+        image_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    far_truth = HumanTruth(
+        site="site19",
+        sequence="day-a",
+        frame=1,
+        class_id=0,
+        track_id=9,
+        obb=OBB(260.0, 90.0, 30.0, 16.0, 0.0),
+        pixel_speed=3.0,
+        visible_span=0,
+    )
+    benchmark = replace(
+        evidence.benchmark,
+        frames=(updated_frame, *evidence.benchmark.frames[1:]),
+        truths=(*evidence.benchmark.truths, far_truth),
+    )
+    far_prediction = {
+        "schema_version": 1,
+        "site": "site19",
+        "sequence": "day-a",
+        "frame": 1,
+        "class_id": 0,
+        "confidence": 0.95,
+        "obb": [260.0, 90.0, 30.0, 16.0, 0.0],
+        "tile_xywh": [140, 0, 180, 180],
+    }
+    false_positive = {
+        "schema_version": 1,
+        "site": "site19",
+        "sequence": "day-a",
+        "frame": 1,
+        "class_id": 1,
+        "confidence": 0.8,
+        "obb": [50.0, 90.0, 18.0, 12.0, 0.0],
+        "tile_xywh": [0, 0, 180, 180],
+    }
+    ranked = (*evidence.mg_full.ranked_predictions, far_prediction, false_positive)
+    mg_full = replace(
+        evidence.mg_full,
+        predictions=ranked,
+        ranked_predictions=ranked,
+    )
+    paired = paired_human_transitions(
+        (),
+        formal_demo._detection_rows(ranked),
+        benchmark,
+        evidence.baseline.threshold,
+        mg_full.threshold,
+    )
+    truth_index = {
+        (row.site, row.sequence, row.frame, row.track_id, row.visible_span): row
+        for row in benchmark.truths
+    }
+    transition_rows = []
+    for transition in paired["by_identity"]:
+        if transition["state"] not in formal_demo._REQUIRED_STATES:
+            continue
+        identity = tuple(transition["identity"])
+        truth = truth_index[identity]
+        transition_rows.append(
+            {
+                "state": transition["state"],
+                "site": truth.site,
+                "sequence": truth.sequence,
+                "frame": truth.frame,
+                "track_id": truth.track_id,
+                "visible_span": truth.visible_span,
+                "class_id": truth.class_id,
+                "confidence": None,
+                "obb": None,
+                "tile_xywh": None,
+            }
+        )
+    for row in paired["new_false_positives"]:
+        transition_rows.append(
+            {
+                "state": "new_false_positive",
+                "site": row["site"],
+                "sequence": row["sequence"],
+                "frame": row["frame"],
+                "track_id": None,
+                "visible_span": None,
+                "class_id": row["class_id"],
+                "confidence": row["confidence"],
+                "obb": row["obb"],
+                "tile_xywh": row["tile_xywh"],
+            }
+        )
+    transitions = verify_formal_transitions(
+        benchmark,
+        evidence.baseline,
+        mg_full,
+        tuple(transition_rows),
+    )
+    evidence = replace(
+        evidence,
+        benchmark=benchmark,
+        mg_full=mg_full,
+        transitions=transitions,
+    )
+    cases = (
+        FormalCase("site19", "day-a", 1, 9, 0, 0, "rescued"),
+        FormalCase(
+            "site19",
+            "day-a",
+            1,
+            -1,
+            0,
+            1,
+            "new_false_positive",
+            0.8,
+            (50.0, 90.0, 18.0, 12.0, 0.0),
+            (0, 0, 180, 180),
+        ),
+    )
+
+    artifacts = render_case_panels(cases, evidence, tmp_path / "localized-cases")
+
+    with Image.open(artifacts[0]) as selected_truth_panel:
+        selected_truth_rgb = selected_truth_panel.getpixel((208, 97))
+    with Image.open(artifacts[2]) as false_positive_panel:
+        false_positive_rgb = false_positive_panel.getpixel((208, 97))
+    assert selected_truth_rgb[2] > selected_truth_rgb[0]
+    assert false_positive_rgb[0] > false_positive_rgb[2]
+
+
 def test_scene_rendering_decodes_each_unique_snapshot_at_most_twice(
     tmp_path,
     monkeypatch,
@@ -1175,3 +1321,35 @@ def test_atomic_publication_syncs_parent_when_rename_fails_and_rolls_back(
 
     assert (output / "demo.json").read_text(encoding="utf-8") == "old"
     assert directory_syncs >= 2
+
+
+@pytest.mark.parametrize("failing_sync", (1, 2))
+def test_atomic_publication_restores_old_output_after_directory_sync_failure(
+    tmp_path,
+    monkeypatch,
+    failing_sync,
+):
+    import moving_det.ml.formal_demo as formal_demo
+
+    output = tmp_path / "demo"
+    output.mkdir()
+    (output / "demo.json").write_text("old", encoding="utf-8")
+    real_sync = formal_demo._fsync_directory
+    sync_count = 0
+
+    def injected_sync(path):
+        nonlocal sync_count
+        sync_count += 1
+        if sync_count == failing_sync:
+            raise OSError(f"injected sync {failing_sync} failure")
+        return real_sync(path)
+
+    monkeypatch.setattr(formal_demo, "_fsync_directory", injected_sync)
+
+    with pytest.raises(OSError, match=f"sync {failing_sync}"):
+        with atomic_output_stage(output) as stage:
+            (stage / "demo.json").write_text("new", encoding="utf-8")
+
+    assert (output / "demo.json").read_text(encoding="utf-8") == "old"
+    assert not tuple(tmp_path.glob(".demo.staging.*"))
+    assert not tuple(tmp_path.glob(".demo.backup.*"))

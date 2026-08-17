@@ -258,7 +258,10 @@ class MGVTODOBB(BaselineOBB):
                 )
         return current, frames, valid, transforms
 
-    def forward(self, batch: Mapping[str, Any]) -> Any:
+    def forward_with_diagnostics(
+        self,
+        batch: Mapping[str, Any],
+    ) -> tuple[Any, Mapping[str, Tensor]]:
         current, frames, valid, transforms = self._validate_batch(batch)
         rgb_p2 = extract_backbone_features(
             self.detector,
@@ -266,11 +269,20 @@ class MGVTODOBB(BaselineOBB):
             (2,),
         )[2]
         if not self._motion_enabled:
-            return execute_yolo_graph(
+            predictions = execute_yolo_graph(
                 self.detector,
                 current,
                 {2: rgb_p2},
             )
+            motion = torch.zeros(
+                current.shape[0],
+                1,
+                current.shape[2],
+                current.shape[3],
+                dtype=current.dtype,
+                device=current.device,
+            )
+            return predictions, {"motion_map": motion}
         motion = compute_motion_strength(
             frames,
             valid,
@@ -297,11 +309,16 @@ class MGVTODOBB(BaselineOBB):
                 active_motion,
             )
         fused_p2 = self.fusion(rgb_p2, motion_p2)
-        return execute_yolo_graph(
+        predictions = execute_yolo_graph(
             self.detector,
             current,
             {2: fused_p2},
         )
+        return predictions, {"motion_map": motion}
+
+    def forward(self, batch: Mapping[str, Any]) -> Any:
+        predictions, _ = self.forward_with_diagnostics(batch)
+        return predictions
 
     def temporal_parameter_names(self) -> set[str]:
         return {

@@ -78,7 +78,11 @@ _EVALUATION_ARTIFACT_VERSIONS = {
     "diagnostics.jsonl": 1,
 }
 _HUMAN_EVALUATION_ARTIFACT_VERSIONS = {
-    **_EVALUATION_ARTIFACT_VERSIONS,
+    **{
+        name: version
+        for name, version in _EVALUATION_ARTIFACT_VERSIONS.items()
+        if name != "diagnostics.jsonl"
+    },
     "per_pixel_speed.csv": 1,
     "ranked-predictions.jsonl": 1,
     "diagnostics.bin": 1,
@@ -104,6 +108,7 @@ _HUMAN_EVALUATION_REQUIRED_ARTIFACTS = frozenset(
         "per_size.csv",
         "per_pixel_speed.csv",
         "per_track.csv",
+        "diagnostics.bin",
     }
 )
 _FORMAL_HUMAN_BENCHMARK_ARTIFACTS = (
@@ -167,7 +172,13 @@ _DIAGNOSTIC_FIELDS = frozenset(
         "diagnostic_tile_xywh",
     }
 )
-_HUMAN_DIAGNOSTIC_FIELDS = _DIAGNOSTIC_FIELDS | {"motion_enabled"}
+_HUMAN_DIAGNOSTIC_FIELDS = _DIAGNOSTIC_FIELDS | {
+    "motion_enabled",
+    "diagnostic_space",
+    "tile_size",
+    "tile_overlap",
+    "tile_grid_xywh",
+}
 _HUMAN_AUDIT_FIELDS = frozenset(
     {
         "edge_ignore_count",
@@ -328,6 +339,160 @@ def _diagnostic_archive_size_bound(row_count: int) -> int:
         + _DIAGNOSTIC_ARCHIVE_MAX_METADATA_BYTES
         + 2 * _DIAGNOSTIC_ARCHIVE_MAX_COMPRESSED_MAP_BYTES
     )
+
+
+class _FullFrameDiagnosticOverview:
+    """Aggregate same-forward tile diagnostics directly into 180x320 space."""
+
+    def __init__(
+        self,
+        *,
+        frame_shape: tuple[int, int],
+        tiles: Sequence[object],
+        model_name: str,
+        compact: bool,
+    ) -> None:
+        import numpy as np
+
+        from moving_det.vrud.tiling import Tile
+
+        if (
+            not isinstance(frame_shape, tuple)
+            or len(frame_shape) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in frame_shape
+            )
+        ):
+            raise WorkflowError("diagnostic overview frame shape is invalid")
+        normalized_tiles = tuple(tiles)
+        if not normalized_tiles or not all(
+            isinstance(tile, Tile) for tile in normalized_tiles
+        ):
+            raise WorkflowError("diagnostic overview tiles are invalid")
+        if model_name not in _MODEL_NAMES:
+            raise WorkflowError("diagnostic overview model is invalid")
+        if type(compact) is not bool:
+            raise WorkflowError("diagnostic overview compact flag is invalid")
+        self.frame_shape = frame_shape
+        self.tiles = normalized_tiles
+        self.model_name = model_name
+        self.compact = compact
+        self._next_tile = 0
+        self._accumulator = np.zeros(_DIAGNOSTIC_MAP_SHAPE, dtype=np.float32)
+        self._count = np.zeros(_DIAGNOSTIC_MAP_SHAPE, dtype=np.float32)
+
+    def consume(
+        self,
+        tiles: tuple[object, ...],
+        diagnostic: Mapping[str, object],
+    ) -> None:
+        import numpy as np
+        import torch
+        import torch.nn.functional as functional
+
+        chunk = tuple(tiles)
+        expected = self.tiles[self._next_tile : self._next_tile + len(chunk)]
+        if not chunk or chunk != expected:
+            raise WorkflowError("diagnostic overview tile order is invalid")
+        if not isinstance(diagnostic, Mapping):
+            raise WorkflowError("diagnostic overview payload is invalid")
+        field = {
+            "baseline": None,
+            "mg_vtod": "motion_map",
+            "lstfe": "p2_short_offset_magnitude",
+        }[self.model_name]
+        if field is None:
+            values = tuple(
+                np.zeros((tile.height, tile.width), dtype=np.float32)
+                for tile in chunk
+            )
+        else:
+            tensor = diagnostic.get(field)
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or tensor.ndim != 4
+                or tensor.shape[0] != len(chunk)
+                or tensor.shape[1] != 1
+                or tensor.shape[2] <= 0
+                or tensor.shape[3] <= 0
+                or not bool(torch.isfinite(tensor).all())
+                or bool((tensor < 0).any())
+            ):
+                raise WorkflowError(
+                    f"diagnostic overview {field} tensor is invalid"
+                )
+            values = tuple(
+                tensor[index : index + 1].detach()
+                for index in range(len(chunk))
+            )
+        frame_height, frame_width = self.frame_shape
+        overview_height, overview_width = _DIAGNOSTIC_MAP_SHAPE
+        for tile, value in zip(chunk, values, strict=True):
+            left = math.floor(tile.x * overview_width / frame_width)
+            top = math.floor(tile.y * overview_height / frame_height)
+            right = math.ceil(
+                (tile.x + tile.width) * overview_width / frame_width
+            )
+            bottom = math.ceil(
+                (tile.y + tile.height) * overview_height / frame_height
+            )
+            left = max(0, min(left, overview_width - 1))
+            top = max(0, min(top, overview_height - 1))
+            right = max(left + 1, min(right, overview_width))
+            bottom = max(top + 1, min(bottom, overview_height))
+            if isinstance(value, np.ndarray):
+                source = torch.from_numpy(value).reshape(
+                    1,
+                    1,
+                    value.shape[0],
+                    value.shape[1],
+                )
+            else:
+                source = value.to(dtype=torch.float32, device="cpu")
+            resized = functional.interpolate(
+                source,
+                size=(bottom - top, right - left),
+                mode="bilinear",
+                align_corners=False,
+            )[0, 0].numpy()
+            self._accumulator[top:bottom, left:right] += resized
+            self._count[top:bottom, left:right] += np.float32(1.0)
+        self._next_tile += len(chunk)
+
+    def finalize(self) -> tuple[object, object]:
+        import numpy as np
+
+        if self._next_tile != len(self.tiles) or bool((self._count == 0).any()):
+            raise WorkflowError("diagnostic overview does not cover the full frame")
+        overview = np.divide(
+            self._accumulator,
+            self._count,
+            out=np.zeros_like(self._accumulator),
+            where=self._count > 0,
+        )
+        maximum = float(overview.max())
+        if maximum > 0:
+            overview /= np.float32(maximum)
+        overview = np.round(overview, decimals=5).astype(np.float32, copy=False)
+        empty = np.zeros(_DIAGNOSTIC_MAP_SHAPE, dtype=np.float32)
+        motion, alignment = (
+            (overview, empty)
+            if self.model_name == "mg_vtod"
+            else (empty, overview)
+            if self.model_name == "lstfe"
+            else (empty, empty.copy())
+        )
+        if self.compact:
+            return (
+                _compact_diagnostic_map(motion),
+                _compact_diagnostic_map(alignment),
+            )
+        motion.setflags(write=False)
+        alignment.setflags(write=False)
+        return motion, alignment
 
 
 @dataclass(frozen=True)
@@ -3106,7 +3271,11 @@ def _validate_diagnostic_rows(
         selected = raw["selected_long_index"]
         if isinstance(selected, bool) or not isinstance(selected, int):
             raise WorkflowError("diagnostic selected_long_index is invalid")
-        if model_name == "lstfe":
+        if human_benchmark and selected != -1:
+            raise WorkflowError(
+                "full-frame diagnostic must not select a single long-term frame"
+            )
+        elif model_name == "lstfe":
             long_paths = tuple(paths[index] for index in _LSTFE_LONG_SLOTS)
             if selected == -1:
                 selection_valid = all(path is None for path in long_paths)
@@ -3121,11 +3290,55 @@ def _validate_diagnostic_rows(
             raise WorkflowError(
                 "non-LSTFE diagnostic must not select a long-term frame"
             )
-        _validate_tile(
-            raw["diagnostic_tile_xywh"],
-            artifact="diagnostic",
-            frame_shape=(frame_shape[0], frame_shape[1]),
-        )
+        if human_benchmark:
+            from moving_det.vrud.tiling import full_frame_tiles
+
+            if raw["diagnostic_space"] != "full-frame-overview":
+                raise WorkflowError("human diagnostic space is invalid")
+            tile_size = raw["tile_size"]
+            tile_overlap = raw["tile_overlap"]
+            if (
+                isinstance(tile_size, bool)
+                or not isinstance(tile_size, int)
+                or tile_size <= 0
+                or isinstance(tile_overlap, bool)
+                or not isinstance(tile_overlap, int)
+                or tile_overlap < 0
+                or tile_overlap >= tile_size
+            ):
+                raise WorkflowError("human diagnostic tile grid parameters are invalid")
+            try:
+                expected_tiles = full_frame_tiles(
+                    frame_shape[1],
+                    frame_shape[0],
+                    tile_size,
+                    tile_overlap,
+                )
+            except ValueError as exc:
+                raise WorkflowError("human diagnostic tile grid is invalid") from exc
+            expected_grid = [
+                [tile.x, tile.y, tile.width, tile.height]
+                for tile in expected_tiles
+            ]
+            if raw["tile_grid_xywh"] != expected_grid:
+                raise WorkflowError(
+                    "human diagnostic tile grid is not the canonical ordered grid"
+                )
+            if raw["diagnostic_tile_xywh"] != [
+                0,
+                0,
+                frame_shape[1],
+                frame_shape[0],
+            ]:
+                raise WorkflowError(
+                    "human diagnostic crop must cover the complete frame"
+                )
+        else:
+            _validate_tile(
+                raw["diagnostic_tile_xywh"],
+                artifact="diagnostic",
+                frame_shape=(frame_shape[0], frame_shape[1]),
+            )
         normalized.append(dict(raw))
     return tuple(normalized)
 
@@ -3254,6 +3467,20 @@ def _validate_evaluation_artifacts(
         human_benchmark=human,
         expected_motion_enabled=(not request.motion_off if human else None),
     )
+    if human:
+        assert expected_human_frames is not None
+        diagnostic_identities = tuple(
+            _evidence_frame_identity(
+                row,
+                artifact="human diagnostic",
+            )
+            for row in diagnostics
+        )
+        if diagnostic_identities != expected_human_frames:
+            raise WorkflowError(
+                "human diagnostics must contain exactly 873 frames in "
+                "canonical benchmark order"
+            )
     cache_sha256 = value.alignment_cache_sha256
     if request.model_name == "baseline":
         if cache_sha256 is not None:
@@ -3658,7 +3885,7 @@ def _run_evaluate_from_snapshot(
             name: hashlib.sha256(content).hexdigest()
             for name, content in artifact_bytes.items()
         }
-        if artifacts.diagnostics and human_benchmark is not None:
+        if human_benchmark is not None:
             diagnostic_name = "diagnostics.bin"
             artifact_sha256[diagnostic_name] = _write_diagnostic_archive(
                 stage / diagnostic_name,
@@ -3881,13 +4108,21 @@ def _validate_artifact_declarations(
         if human_benchmark
         else _EVALUATION_ARTIFACT_VERSIONS
     )
+    diagnostic_names = names & {"diagnostics.jsonl", "diagnostics.bin"}
+    if human_benchmark and diagnostic_names != {"diagnostics.bin"}:
+        raise WorkflowError(
+            "human evaluation requires only diagnostics.bin"
+        )
     if not required.issubset(names):
         raise WorkflowError("evaluation required artifact declarations are missing")
     if human_benchmark and "per_speed.csv" in names:
         raise WorkflowError(
             "human evaluation must not declare per_speed.csv in m/s units"
         )
-    if {"diagnostics.jsonl", "diagnostics.bin"}.issubset(names):
+    if not human_benchmark and diagnostic_names == {
+        "diagnostics.jsonl",
+        "diagnostics.bin",
+    }:
         raise WorkflowError(
             "evaluation diagnostic artifacts must use exactly one encoding"
         )
@@ -8699,6 +8934,59 @@ def _extract_model_diagnostic(
     return result
 
 
+def _full_frame_overview_diagnostic(
+    clip: Mapping[str, object],
+    cfg: object,
+    overview: _FullFrameDiagnosticOverview,
+    *,
+    motion_enabled: bool,
+) -> dict[str, object]:
+    if type(motion_enabled) is not bool:
+        raise WorkflowError("model motion_enabled diagnostic must be boolean")
+    metadata = clip.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise WorkflowError("diagnostic overview clip metadata is invalid")
+    frame_height, frame_width = overview.frame_shape
+    if metadata.get("frame_shape") != (frame_height, frame_width):
+        raise WorkflowError("diagnostic overview frame metadata is inconsistent")
+    offsets = metadata.get("offsets")
+    support_paths = metadata.get("support_paths")
+    if (
+        isinstance(offsets, (str, bytes))
+        or not isinstance(offsets, Sequence)
+        or isinstance(support_paths, (str, bytes))
+        or not isinstance(support_paths, Sequence)
+        or len(offsets) != len(support_paths)
+    ):
+        raise WorkflowError("diagnostic overview temporal support is invalid")
+    motion_map, alignment_map = overview.finalize()
+    return {
+        "schema_version": 1,
+        "site": metadata["site"],
+        "sequence": metadata["sequence"],
+        "frame": clip["frame"],
+        "frame_shape": [frame_height, frame_width],
+        "image_root": str(Path(getattr(cfg, "image_root")).resolve()),
+        "offsets": list(offsets),
+        "support_paths": [
+            str(Path(value).resolve(strict=False)) if value is not None else None
+            for value in support_paths
+        ],
+        "motion_map": motion_map,
+        "selected_long_index": -1,
+        "short_alignment_magnitude": alignment_map,
+        "diagnostic_tile_xywh": [0, 0, frame_width, frame_height],
+        "motion_enabled": motion_enabled,
+        "diagnostic_space": "full-frame-overview",
+        "tile_size": int(getattr(cfg, "tile_size")),
+        "tile_overlap": int(getattr(cfg, "tile_overlap")),
+        "tile_grid_xywh": [
+            [tile.x, tile.y, tile.width, tile.height]
+            for tile in overview.tiles
+        ],
+    }
+
+
 def _representative_diagnostic_tile(
     corrected: object,
     cfg: object,
@@ -9810,6 +10098,7 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
     from moving_det.ml.training import load_experiment_checkpoint
     from moving_det.vrud.alignment import AlignmentCache
     from moving_det.vrud.index import load_corrected_frame, load_track_index
+    from moving_det.vrud.tiling import full_frame_tiles
 
     cfg = request.cfg
     offsets = _model_offsets(request.model_name, cfg)
@@ -9923,7 +10212,42 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
             "confidence_threshold": 0.0,
             "inference_batch_size": 1,
         }
-        predictions.extend(infer_full_frame(model, clip, inference_cfg))
+        overview = None
+        if human_benchmark is not None:
+            frame_shape = tuple(clip["metadata"]["frame_shape"])
+            if (
+                len(frame_shape) != 2
+                or any(
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or value <= 0
+                    for value in frame_shape
+                )
+            ):
+                raise WorkflowError("human diagnostic frame shape is invalid")
+            frame_height, frame_width = frame_shape
+            overview = _FullFrameDiagnosticOverview(
+                frame_shape=(frame_height, frame_width),
+                tiles=full_frame_tiles(
+                    frame_width,
+                    frame_height,
+                    int(getattr(cfg, "tile_size")),
+                    int(getattr(cfg, "tile_overlap")),
+                ),
+                model_name=request.model_name,
+                compact=True,
+            )
+        frame_predictions = (
+            infer_full_frame(model, clip, inference_cfg)
+            if overview is None
+            else infer_full_frame(
+                model,
+                clip,
+                inference_cfg,
+                diagnostic_consumer=overview.consume,
+            )
+        )
+        predictions.extend(frame_predictions)
 
         corrected = None
         if human_benchmark is None:
@@ -9972,19 +10296,21 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
                         frame_speed_mps=velocities[velocity_key],
                     )
                 )
-        if _capture_evaluation_diagnostic(
-            frame_index,
-            human_benchmark=human_benchmark is not None,
-        ):
-            diagnostic_tile = (
-                _representative_human_diagnostic_tile(
-                    human_benchmark.frames[frame_index],
-                    human_benchmark,
+        if overview is not None:
+            motion_enabled = getattr(model, "_motion_enabled", True)
+            diagnostics.append(
+                _full_frame_overview_diagnostic(
+                    clip,
                     cfg,
+                    overview,
+                    motion_enabled=motion_enabled,
                 )
-                if human_benchmark is not None
-                else _representative_diagnostic_tile(corrected, cfg)
             )
+        elif _capture_evaluation_diagnostic(
+            frame_index,
+            human_benchmark=False,
+        ):
+            diagnostic_tile = _representative_diagnostic_tile(corrected, cfg)
             diagnostics.append(
                 _extract_model_diagnostic(
                     model,
@@ -9992,7 +10318,7 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
                     request.model_name,
                     cfg,
                     diagnostic_tile=diagnostic_tile,
-                    include_motion_enabled=human_benchmark is not None,
+                    include_motion_enabled=False,
                 )
             )
 

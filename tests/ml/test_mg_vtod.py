@@ -486,6 +486,39 @@ def test_motion_off_bypasses_temporal_branch(monkeypatch):
     assert fusion_calls == 1
 
 
+def test_forward_with_diagnostics_reuses_the_prediction_motion_computation(
+    monkeypatch,
+):
+    import moving_det.ml.models.mg_vtod as mg_vtod_module
+
+    model = MGVTODOBB(weights=None).eval()
+    batch = _synthetic_mg_batch(moving=True)
+    motion = torch.full(
+        (
+            batch["frames"].shape[0],
+            1,
+            batch["frames"].shape[-2],
+            batch["frames"].shape[-1],
+        ),
+        0.5,
+    )
+    calls = 0
+
+    def fixed_motion(*args):
+        nonlocal calls
+        calls += 1
+        return motion
+
+    monkeypatch.setattr(mg_vtod_module, "compute_motion_strength", fixed_motion)
+
+    with torch.no_grad():
+        predictions, diagnostics = model.forward_with_diagnostics(batch)
+
+    assert predictions is not None
+    assert calls == 1
+    assert diagnostics == {"motion_map": motion}
+
+
 @pytest.mark.parametrize("invalid", [0, 1, None, "false"])
 def test_motion_switch_requires_bool_and_stays_out_of_state_dict(invalid):
     model = MGVTODOBB(weights=None)

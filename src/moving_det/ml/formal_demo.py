@@ -890,6 +890,7 @@ def atomic_output_stage(output: Path) -> Iterator[Path]:
         )
     )
     backup: Path | None = None
+    published = False
     try:
         yield stage
         if destination.exists():
@@ -903,14 +904,31 @@ def atomic_output_stage(output: Path) -> Iterator[Path]:
             )
             backup.rmdir()
             os.replace(destination, backup)
-            _fsync_directory(destination.parent)
+            try:
+                _fsync_directory(destination.parent)
+            except BaseException:
+                try:
+                    os.replace(backup, destination)
+                    backup = None
+                    _fsync_directory(destination.parent)
+                except BaseException as rollback_error:
+                    raise rollback_error
+                raise
         try:
             os.replace(stage, destination)
+            published = True
             _fsync_directory(destination.parent)
         except BaseException:
-            if backup is not None and backup.exists() and not destination.exists():
-                os.replace(backup, destination)
+            try:
+                if published and destination.exists():
+                    os.replace(destination, stage)
+                    published = False
+                if backup is not None and backup.exists():
+                    os.replace(backup, destination)
+                    backup = None
                 _fsync_directory(destination.parent)
+            except BaseException as rollback_error:
+                raise rollback_error
             raise
         if backup is not None:
             shutil.rmtree(backup)
@@ -919,8 +937,6 @@ def atomic_output_stage(output: Path) -> Iterator[Path]:
     finally:
         if stage.exists():
             shutil.rmtree(stage)
-        if backup is not None and backup.exists():
-            shutil.rmtree(backup)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1530,6 +1546,7 @@ def render_case_panels(
     import numpy as np
     from PIL import Image, ImageDraw
     from moving_det.models import OBB
+    from moving_det.vrud.tiling import Tile, assign_target_tile
 
     if not isinstance(comparison, DemoEvidence):
         raise ValueError("formal case rendering requires verified demo evidence")
@@ -1555,6 +1572,13 @@ def render_case_panels(
             float(geometry.width),
             float(geometry.height),
             float(geometry.theta),
+        )
+
+    def centered_in_tile(row: object, tile: Tile) -> bool:
+        geometry = row.obb
+        return (
+            tile.x <= float(geometry.cx) <= tile.x + tile.width
+            and tile.y <= float(geometry.cy) <= tile.y + tile.height
         )
 
     def matched_rows(
@@ -1640,14 +1664,86 @@ def render_case_panels(
         if len(nonzero) < 4:
             raise ValueError("formal case requires four MG Full support frames")
         long_offsets = nonzero[:4]
-        tile_raw = diagnostic["diagnostic_tile_xywh"]
+        frame_shape = diagnostic.get("frame_shape")
         if (
-            isinstance(tile_raw, (str, bytes))
-            or not isinstance(tile_raw, Sequence)
-            or len(tile_raw) != 4
+            isinstance(frame_shape, (str, bytes))
+            or not isinstance(frame_shape, Sequence)
+            or len(frame_shape) != 2
         ):
-            raise ValueError("formal case diagnostic crop is invalid")
-        tile = tuple(int(value) for value in tile_raw)
+            raise ValueError("formal case diagnostic frame shape is invalid")
+        frame_height, frame_width = (int(frame_shape[0]), int(frame_shape[1]))
+        if diagnostic.get("diagnostic_space") != "full-frame-overview":
+            raise ValueError("formal case requires full-frame overview diagnostics")
+        if diagnostic.get("diagnostic_tile_xywh") != [
+            0,
+            0,
+            frame_width,
+            frame_height,
+        ]:
+            raise ValueError("formal case overview extent is invalid")
+        grid_raw = diagnostic.get("tile_grid_xywh")
+        if (
+            isinstance(grid_raw, (str, bytes))
+            or not isinstance(grid_raw, Sequence)
+            or not grid_raw
+        ):
+            raise ValueError("formal case diagnostic tile grid is invalid")
+        try:
+            tile_grid = tuple(
+                Tile(*(int(value) for value in row))
+                for row in grid_raw
+                if isinstance(row, Sequence)
+                and not isinstance(row, (str, bytes))
+                and len(row) == 4
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("formal case diagnostic tile grid is invalid") from exc
+        if len(tile_grid) != len(grid_raw):
+            raise ValueError("formal case diagnostic tile grid is invalid")
+
+        truth_rows = truth_by_key.get(key, ())
+        selected_center_truth = None
+        if case.state != "new_false_positive":
+            selected_center_truth = next(
+                (
+                    row
+                    for row in truth_rows
+                    if row.track_id == case.track_id
+                    and row.visible_span == case.visible_span
+                    and row.class_id == case.class_id
+                ),
+                None,
+            )
+            if selected_center_truth is None:
+                raise ValueError("formal case truth identity is absent at center")
+            try:
+                selected_tile = assign_target_tile(
+                    selected_center_truth.obb,
+                    tile_grid,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "formal case truth does not fit an approved diagnostic tile"
+                ) from exc
+        else:
+            if case.tile_xywh is None:
+                raise ValueError("formal false-positive case tile identity is missing")
+            try:
+                selected_tile = Tile(*(int(value) for value in case.tile_xywh))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "formal false-positive case tile identity is invalid"
+                ) from exc
+            if selected_tile not in tile_grid:
+                raise ValueError(
+                    "formal false-positive case tile is outside the diagnostic grid"
+                )
+        tile = (
+            selected_tile.x,
+            selected_tile.y,
+            selected_tile.width,
+            selected_tile.height,
+        )
         crop_x = slice(tile[0], tile[0] + tile[2])
         crop_y = slice(tile[1], tile[1] + tile[3])
         current_full = _rgb(
@@ -1663,20 +1759,21 @@ def render_case_panels(
         )
         if any(frame.shape != frames[0].shape for frame in frames):
             raise ValueError("formal case support frame crops differ")
-        truth_rows = truth_by_key.get(key, ())
+        local_truth_rows = tuple(
+            row for row in truth_rows if centered_in_tile(row, selected_tile)
+        )
+        local_baseline_predictions = tuple(
+            row
+            for row in baseline_predictions.get(key, ())
+            if centered_in_tile(row, selected_tile)
+        )
+        local_mg_predictions = tuple(
+            row
+            for row in mg_predictions.get(key, ())
+            if centered_in_tile(row, selected_tile)
+        )
         if case.state != "new_false_positive":
-            selected_center_truth = next(
-                (
-                    row
-                    for row in truth_rows
-                    if row.track_id == case.track_id
-                    and row.visible_span == case.visible_span
-                    and row.class_id == case.class_id
-                ),
-                None,
-            )
-            if selected_center_truth is None:
-                raise ValueError("formal case truth identity is absent at center")
+            assert selected_center_truth is not None
             center_identity = (
                 selected_center_truth.site,
                 selected_center_truth.sequence,
@@ -1708,14 +1805,22 @@ def render_case_panels(
                 match_state="gt",
                 identity=f"track-{row.track_id}",
             )
-            for row in truth_rows
+            for row in local_truth_rows
         )
         motion = np.asarray(diagnostic["motion_map"], dtype=np.float32)
         motion_image = Image.fromarray(motion)
+        overview_height, overview_width = motion.shape
+        overview_box = (
+            selected_tile.x * overview_width / frame_width,
+            selected_tile.y * overview_height / frame_height,
+            (selected_tile.x + selected_tile.width) * overview_width / frame_width,
+            (selected_tile.y + selected_tile.height) * overview_height / frame_height,
+        )
         motion_map = np.asarray(
             motion_image.resize(
                 (frames[0].shape[1], frames[0].shape[0]),
                 Image.Resampling.BILINEAR,
+                box=overview_box,
             ),
             dtype=np.float32,
         ).copy()
@@ -1725,15 +1830,15 @@ def render_case_panels(
             long_candidate_offsets=long_offsets,
             ground_truth=ground_truth,
             baseline=matched_rows(
-                baseline_predictions.get(key, ()),
-                truth_rows,
+                local_baseline_predictions,
+                local_truth_rows,
                 tile,
                 transition_evidence.baseline_true_predictions,
                 transition_evidence.baseline_by_truth,
             ),
             mg_vtod=matched_rows(
-                mg_predictions.get(key, ()),
-                truth_rows,
+                local_mg_predictions,
+                local_truth_rows,
                 tile,
                 transition_evidence.mg_true_predictions,
                 transition_evidence.mg_by_truth,

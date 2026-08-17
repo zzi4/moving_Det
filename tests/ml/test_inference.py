@@ -175,6 +175,67 @@ def test_default_inference_batches_one_tile_at_a_time_to_bound_memory():
     assert len(detections) == 2
 
 
+def test_full_frame_inference_collects_diagnostics_from_same_ordered_forwards():
+    class DiagnosticModel(RecordingModel):
+        def __init__(self):
+            super().__init__(1)
+            self.plain_forward_calls = 0
+            self.diagnostic_forward_calls = 0
+
+        def forward(self, batch):
+            self.plain_forward_calls += 1
+            return super().forward(batch)
+
+        def forward_with_diagnostics(self, batch):
+            self.diagnostic_forward_calls += 1
+            batch_size = batch["img"].shape[0]
+            tile_x = tuple(row["tile_xywh"][0] for row in batch["metadata"])
+            return self.output_factory(batch_size), {
+                "tile_x": tile_x,
+                "motion_map": torch.stack(
+                    [
+                        torch.full(
+                            (1, batch["img"].shape[-2], batch["img"].shape[-1]),
+                            float(value),
+                        )
+                        for value in tile_x
+                    ]
+                ),
+            }
+
+    model = DiagnosticModel()
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1792),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
+    }
+    consumed = []
+
+    infer_full_frame(
+        model,
+        clip,
+        _cfg(),
+        diagnostic_consumer=lambda tiles, diagnostic: consumed.append(
+            (tiles, diagnostic)
+        ),
+    )
+
+    assert model.plain_forward_calls == 0
+    assert model.diagnostic_forward_calls == 2
+    assert tuple(tile for tiles, _ in consumed for tile in tiles) == (
+        Tile(0, 0, 1024, 1024),
+        Tile(768, 0, 1024, 1024),
+    )
+    assert tuple(row["tile_x"] for _, row in consumed) == ((0,), (768,))
+
+
 def test_single_tile_inference_skips_cross_tile_merger(monkeypatch):
     model = RecordingModel(1)
     clip = {

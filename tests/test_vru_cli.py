@@ -3397,6 +3397,79 @@ def test_motion_off_human_diagnostic_skips_motion_strength(tmp_path, monkeypatch
 
 
 @REQUIRES_TORCH
+def test_full_frame_overview_aggregates_ordered_tiles_in_180x320_space():
+    import torch
+
+    from moving_det.vrud.tiling import Tile
+
+    tiles = (
+        Tile(0, 0, 200, 180),
+        Tile(120, 0, 200, 180),
+    )
+    overview = vru_cli_module._FullFrameDiagnosticOverview(
+        frame_shape=(180, 320),
+        tiles=tiles,
+        model_name="mg_vtod",
+        compact=False,
+    )
+    with pytest.raises(WorkflowError, match="tile order"):
+        overview.consume(
+            (tiles[1],),
+            {"motion_map": torch.ones((1, 1, 8, 8))},
+        )
+
+    overview.consume(
+        (tiles[0],),
+        {"motion_map": torch.full((1, 1, 8, 8), 0.25)},
+    )
+    overview.consume(
+        (tiles[1],),
+        {"motion_map": torch.ones((1, 1, 8, 8))},
+    )
+    motion, alignment = overview.finalize()
+
+    assert motion.shape == (180, 320)
+    assert motion.dtype == np.float32
+    assert motion[90, 40] == pytest.approx(0.25)
+    assert motion[90, 160] == pytest.approx(0.625)
+    assert motion[90, 280] == pytest.approx(1.0)
+    assert np.count_nonzero(alignment) == 0
+
+
+@REQUIRES_TORCH
+def test_full_frame_overview_bilinearly_resizes_before_final_quantization():
+    import torch
+
+    from moving_det.vrud.tiling import Tile
+
+    tile = Tile(0, 0, 320, 180)
+    overview = vru_cli_module._FullFrameDiagnosticOverview(
+        frame_shape=(180, 320),
+        tiles=(tile,),
+        model_name="mg_vtod",
+        compact=True,
+    )
+    overview.consume(
+        (tile,),
+        {
+            "motion_map": torch.tensor(
+                [[[[0.0, 1.0], [0.0, 1.0]]]],
+                dtype=torch.float32,
+            )
+        },
+    )
+
+    motion, alignment = overview.finalize()
+    restored = np.asarray(motion)
+
+    assert isinstance(motion, vru_cli_module._CompactDiagnosticMap)
+    assert isinstance(alignment, vru_cli_module._CompactDiagnosticMap)
+    assert restored[90, 0] == 0.0
+    assert restored[90, 160] == pytest.approx(0.50313, abs=2e-5)
+    assert restored[90, -1] == 1.0
+
+
+@REQUIRES_TORCH
 @pytest.mark.parametrize(
     "defect",
     ("missing", "wrong-shape", "nonfinite", "negative"),
@@ -3686,8 +3759,8 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
         load_temporal_config(Path("configs/vrud-temporal-obb.yaml")),
         image_root=tmp_path / "images",
         metadata_root=tmp_path / "metadata",
-        tile_size=1024,
-        tile_overlap=128,
+        tile_size=8,
+        tile_overlap=0,
     )
     threshold = tmp_path / "threshold.json"
     threshold.write_text(
@@ -3785,10 +3858,17 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
         }
 
     monkeypatch.setattr(vru_cli, "_load_full_frame_clip", load_clip)
-    monkeypatch.setattr(
-        inference,
-        "infer_full_frame",
-        lambda *values: (
+
+    def infer_with_same_forward_diagnostic(
+        *values,
+        diagnostic_consumer=None,
+    ):
+        assert diagnostic_consumer is not None
+        diagnostic_consumer(
+            (Tile(0, 0, 8, 8),),
+            {"motion_map": torch.ones((1, 1, 8, 8))},
+        )
+        return (
             Detection(
                 frame=31,
                 obb=OBB(4.0, 4.0, 4.0, 2.0, 0.0),
@@ -3807,7 +3887,12 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
                 site="site19",
                 sequence="sequence_a",
             ),
-        ),
+        )
+
+    monkeypatch.setattr(
+        inference,
+        "infer_full_frame",
+        infer_with_same_forward_diagnostic,
     )
     for old_loader in (
         (index, "load_track_index"),
@@ -3823,7 +3908,9 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
     monkeypatch.setattr(
         vru_cli,
         "_extract_model_diagnostic",
-        lambda *args, **kwargs: {},
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("human overview repeated model diagnostics")
+        ),
     )
     replacement_threshold = json.loads(threshold.read_text(encoding="utf-8"))
     replacement_threshold["threshold"] = 0.99
@@ -3852,6 +3939,12 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
     assert artifacts.ground_truth[0]["visible_span"] == 6
     assert artifacts.detection_frame_keys == artifacts.continuity_frame_keys
     assert model.motion_enabled is True
+    assert len(artifacts.diagnostics) == 1
+    diagnostic = artifacts.diagnostics[0]
+    assert diagnostic["diagnostic_space"] == "full-frame-overview"
+    assert diagnostic["diagnostic_tile_xywh"] == [0, 0, 8, 8]
+    assert diagnostic["tile_grid_xywh"] == [[0, 0, 8, 8]]
+    assert np.allclose(np.asarray(diagnostic["motion_map"]), 1.0)
 
 
 @REQUIRES_TORCH
@@ -6978,6 +7071,27 @@ def test_fixed_human_universe_rejects_nonproduction_counts(
         vru_cli_module._fixed_human_frame_universe(benchmark)
 
 
+def _human_overview_metadata(
+    cfg,
+    *,
+    frame_shape=(2160, 3840),
+):
+    from moving_det.vrud.tiling import full_frame_tiles
+
+    height, width = frame_shape
+    tiles = full_frame_tiles(width, height, cfg.tile_size, cfg.tile_overlap)
+    return {
+        "diagnostic_tile_xywh": [0, 0, width, height],
+        "diagnostic_space": "full-frame-overview",
+        "tile_size": cfg.tile_size,
+        "tile_overlap": cfg.tile_overlap,
+        "tile_grid_xywh": [
+            [tile.x, tile.y, tile.width, tile.height]
+            for tile in tiles
+        ],
+    }
+
+
 def _human_evaluation_request_and_bundle(tmp_path: Path):
     benchmark = _fixed_human_benchmark(tmp_path)
     base = _evaluation_request(tmp_path)
@@ -7013,6 +7127,36 @@ def _human_evaluation_request_and_bundle(tmp_path: Path):
         }
         for row in benchmark.truths
     )
+    compact_zero = vru_cli_module._compact_diagnostic_map(
+        np.zeros((180, 320), dtype=np.float32)
+    )
+    offsets = tuple(request.cfg.mg_offsets)
+    diagnostic_rows = tuple(
+        {
+            "schema_version": 1,
+            "site": frame.site,
+            "sequence": frame.sequence,
+            "frame": frame.frame,
+            "frame_shape": [2160, 3840],
+            "image_root": str(Path(request.cfg.image_root).resolve()),
+            "offsets": list(offsets),
+            "support_paths": [
+                str(
+                    Path(request.cfg.image_root).resolve()
+                    / f"{frame.site}_sequence"
+                    / frame.sequence
+                    / f"{frame.frame + offset:06d}.jpg"
+                )
+                for offset in offsets
+            ],
+            "motion_map": compact_zero,
+            "selected_long_index": -1,
+            "short_alignment_magnitude": compact_zero,
+            "motion_enabled": True,
+            **_human_overview_metadata(request.cfg),
+        }
+        for frame in benchmark.frames
+    )
     bundle = EvaluationArtifacts(
         detection_frame_keys=frame_keys,
         continuity_frame_keys=frame_keys,
@@ -7032,7 +7176,7 @@ def _human_evaluation_request_and_bundle(tmp_path: Path):
             "geometry_error_count": 0,
         },
         threshold_evidence=None,
-        diagnostics=(),
+        diagnostics=diagnostic_rows,
         alignment_cache_sha256="d" * 64,
     )
     return benchmark, request, bundle
@@ -7149,31 +7293,7 @@ def test_human_artifacts_reject_motion_diagnostic_provenance_mismatch(
 
     benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
     request = replace(request, motion_off=True)
-    frame = benchmark.frames[0]
-    offsets = tuple(request.cfg.mg_offsets)
-    diagnostic = {
-        "schema_version": 1,
-        "site": frame.site,
-        "sequence": frame.sequence,
-        "frame": frame.frame,
-        "frame_shape": [2160, 3840],
-        "image_root": str(Path(request.cfg.image_root).resolve()),
-        "offsets": list(offsets),
-        "support_paths": [
-            str(
-                Path(request.cfg.image_root).resolve()
-                / f"{frame.site}_sequence"
-                / frame.sequence
-                / f"{frame.frame + offset:06d}.jpg"
-            )
-            for offset in offsets
-        ],
-        "motion_map": [[0.0] * 320 for _ in range(180)],
-        "selected_long_index": -1,
-        "short_alignment_magnitude": [[0.0] * 320 for _ in range(180)],
-        "diagnostic_tile_xywh": [0, 0, 1024, 1024],
-        "motion_enabled": True,
-    }
+    diagnostic = {**bundle.diagnostics[0], "motion_enabled": True}
     monkeypatch.setattr(
         benchmark_artifacts,
         "load_human_benchmark",
@@ -7263,6 +7383,7 @@ def test_human_artifact_declarations_require_pixel_speed_table(defect):
         "per_size.csv": 1,
         "per_pixel_speed.csv": 1,
         "per_track.csv": 1,
+        "diagnostics.bin": 1,
     }
     names.pop("per_pixel_speed.csv")
     if defect == "legacy-disguise":
@@ -7275,6 +7396,87 @@ def test_human_artifact_declarations_require_pixel_speed_table(defect):
             digests,
             split="test",
             human_benchmark=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ("missing", "jsonl-only", "mixed"),
+)
+def test_human_artifact_declarations_require_only_binary_diagnostics(defect):
+    schema = {
+        "metrics.json": 1,
+        "predictions.jsonl": 1,
+        "ranked-predictions.jsonl": 1,
+        "ground-truth.jsonl": 3,
+        "per_class.csv": 1,
+        "per_size.csv": 1,
+        "per_pixel_speed.csv": 1,
+        "per_track.csv": 1,
+        "diagnostics.bin": 1,
+    }
+    if defect in {"missing", "jsonl-only"}:
+        schema.pop("diagnostics.bin")
+    if defect in {"jsonl-only", "mixed"}:
+        schema["diagnostics.jsonl"] = 1
+    digests = {name: "a" * 64 for name in schema}
+
+    with pytest.raises(WorkflowError, match="diagnostic"):
+        vru_cli_module._validate_artifact_declarations(
+            schema,
+            digests,
+            split="test",
+            human_benchmark=True,
+        )
+
+
+def test_nonhuman_artifact_declarations_keep_legacy_jsonl_diagnostics():
+    schema = {
+        "metrics.json": 1,
+        "predictions.jsonl": 1,
+        "ground-truth.jsonl": 2,
+        "per_class.csv": 1,
+        "per_size.csv": 1,
+        "per_speed.csv": 1,
+        "per_track.csv": 1,
+        "diagnostics.jsonl": 1,
+    }
+
+    normalized, _ = vru_cli_module._validate_artifact_declarations(
+        schema,
+        {name: "a" * 64 for name in schema},
+        split="test",
+        human_benchmark=False,
+    )
+
+    assert normalized["diagnostics.jsonl"] == 1
+
+
+@pytest.mark.parametrize("defect", ("empty", "subset", "reversed"))
+def test_human_artifacts_require_complete_ordered_diagnostics(
+    tmp_path,
+    monkeypatch,
+    defect,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    if defect == "empty":
+        diagnostics = ()
+    elif defect == "subset":
+        diagnostics = bundle.diagnostics[:-1]
+    else:
+        diagnostics = tuple(reversed(bundle.diagnostics))
+
+    with pytest.raises(WorkflowError, match="873|canonical.*order|diagnostic"):
+        _validate_evaluation_artifacts(
+            replace(bundle, diagnostics=diagnostics),
+            request,
         )
 
 
@@ -9479,7 +9681,14 @@ def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
         "obb": [64.0, 48.0, 20.0, 8.0, 0.2],
         "tile_xywh": [0, 0, 1024, 1024],
     }
-    bundle = replace(bundle, predictions=(below_threshold,))
+    bundle = replace(
+        bundle,
+        predictions=(below_threshold,),
+        diagnostics=tuple(
+            {**row, "motion_enabled": False}
+            for row in bundle.diagnostics
+        ),
+    )
 
     run_evaluate(
         args,
@@ -10890,8 +11099,10 @@ def test_compact_diagnostic_archive_round_trips_bounded_official_maps(tmp_path):
             "short_alignment_magnitude": vru_cli_module._compact_diagnostic_map(
                 np.zeros((180, 320), dtype=np.float32)
             ),
-            "diagnostic_tile_xywh": [0, 0, 1024, 1024],
             "motion_enabled": True,
+            **_human_overview_metadata(
+                SimpleNamespace(tile_size=1024, tile_overlap=128)
+            ),
         }
         for site, sequence, frame in identities
     )
@@ -11073,8 +11284,8 @@ def test_formal_demo_loader_consumes_real_v2_human_writer_contract(
             "motion_map": zero_map,
             "selected_long_index": -1,
             "short_alignment_magnitude": zero_map,
-            "diagnostic_tile_xywh": [0, 0, 1024, 1024],
             "motion_enabled": True,
+            **_human_overview_metadata(cfg),
         }
         for frame in benchmark.frames
     )
