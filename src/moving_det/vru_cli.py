@@ -78,6 +78,7 @@ _EVALUATION_ARTIFACT_VERSIONS = {
 _HUMAN_EVALUATION_ARTIFACT_VERSIONS = {
     **_EVALUATION_ARTIFACT_VERSIONS,
     "per_pixel_speed.csv": 1,
+    "ranked-predictions.jsonl": 1,
 }
 _EVALUATION_REQUIRED_ARTIFACTS = frozenset(
     {
@@ -94,6 +95,7 @@ _HUMAN_EVALUATION_REQUIRED_ARTIFACTS = frozenset(
     {
         "metrics.json",
         "predictions.jsonl",
+        "ranked-predictions.jsonl",
         "ground-truth.jsonl",
         "per_class.csv",
         "per_size.csv",
@@ -477,6 +479,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("--output", type=_path_argument, required=True)
 
+    compare_human = subparsers.add_parser(
+        "compare-human",
+        help="strictly compare paired formal human Baseline and MG evidence",
+    )
+    compare_human.add_argument("--baseline", type=_path_argument, required=True)
+    compare_human.add_argument("--mg-full", type=_path_argument, required=True)
+    compare_human.add_argument("--motion-off", type=_path_argument, required=True)
+    compare_human.add_argument("--mg-frozen", type=_path_argument)
+    compare_human.add_argument("--output", type=_path_argument, required=True)
+
     audit = subparsers.add_parser(
         "audit-sample",
         help="freeze a deterministic GT-only independent audit sample",
@@ -554,6 +566,7 @@ def main(
             "evaluate": run_evaluate,
             "visualize": run_visualize,
             "compare": run_compare,
+            "compare-human": run_compare_human,
             "audit-sample": run_audit_sample,
             "diagnose-overfit": run_diagnose_overfit,
         }
@@ -3208,6 +3221,15 @@ def _run_evaluate_from_snapshot(
     if evaluator is None:
         evaluator = _evaluate_real
     artifacts = _validate_evaluation_artifacts(evaluator(request), request)
+    ranked_predictions: tuple[Mapping[str, object], ...] = ()
+    if human_benchmark is not None:
+        ranked_predictions = _validate_prediction_rows(
+            artifacts.predictions,
+            universe=_frame_universe(
+                artifacts.detection_frame_keys,
+                artifacts.continuity_frame_keys,
+            ),
+        )
     if human_benchmark is not None:
         current_fingerprint = human_benchmark_fingerprint(human_benchmark)
         if current_fingerprint != human_benchmark_sha256:
@@ -3257,6 +3279,10 @@ def _run_evaluate_from_snapshot(
             "predictions.jsonl": _jsonl_bytes(artifacts.predictions),
             "ground-truth.jsonl": _jsonl_bytes(artifacts.ground_truth),
         }
+        if human_benchmark is not None:
+            artifact_bytes["ranked-predictions.jsonl"] = _jsonl_bytes(
+                ranked_predictions
+            )
         table_sections = (
             _HUMAN_EVALUATION_TABLES
             if human_benchmark is not None
@@ -3761,6 +3787,10 @@ def _load_verified_evaluation_run(
         universe=universe,
     )
     if "human_benchmark_sha256" in run:
+        _validate_prediction_rows(
+            _read_jsonl(root / "ranked-predictions.jsonl"),
+            universe=universe,
+        )
         benchmark = _load_human_benchmark_from_run(run)
         _validate_human_ground_truth_rows(
             _read_jsonl(root / "ground-truth.jsonl"),
@@ -4762,6 +4792,613 @@ def run_compare(
                 _comparison_table(section, metrics_by_model),
             )
         return Path("metrics.json")
+
+    primary = _replace_directory(output, writer)
+    print(primary.resolve())
+    return 0
+
+
+def _formal_human_run_paths(args: argparse.Namespace) -> dict[str, Path]:
+    paths = {
+        "baseline": Path(args.baseline),
+        "mg_full": Path(args.mg_full),
+        "motion_off": Path(args.motion_off),
+    }
+    if args.mg_frozen is not None:
+        paths["mg_frozen"] = Path(args.mg_frozen)
+    if len({path.resolve(strict=False) for path in paths.values()}) != len(paths):
+        raise WorkflowError("formal human inputs must be distinct run directories")
+    return paths
+
+
+def _read_stable_artifact_bytes(
+    path: Path,
+    *,
+    label: str,
+) -> bytes:
+    source = Path(path)
+    _reject_symlink_components(source)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise WorkflowError(f"{label} is missing or unsafe") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size < 0
+            or opened.st_size > _MAX_EVALUATION_TEXT_ARTIFACT_BYTES
+        ):
+            raise WorkflowError(f"{label} is not a bounded regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read()
+        closed_over = os.fstat(descriptor)
+        if (
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        ) != (
+            closed_over.st_dev,
+            closed_over.st_ino,
+            closed_over.st_size,
+            closed_over.st_mtime_ns,
+            closed_over.st_ctime_ns,
+        ):
+            raise WorkflowError(f"{label} changed while reading")
+    except OSError as exc:
+        raise WorkflowError(f"{label} changed while reading") from exc
+    finally:
+        os.close(descriptor)
+    return content
+
+
+def _read_declared_artifact_bytes(
+    path: Path,
+    expected_sha256: object,
+    *,
+    label: str,
+) -> bytes:
+    if not _is_sha256(expected_sha256):
+        raise WorkflowError(f"{label} declaration is invalid")
+    content = _read_stable_artifact_bytes(path, label=label)
+    if hashlib.sha256(content).hexdigest() != expected_sha256:
+        raise WorkflowError(f"{label} content hash is mismatched")
+    return content
+
+
+def _json_from_declared_bytes(content: bytes, *, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise WorkflowError(f"{label} is malformed") from exc
+    if not isinstance(value, dict):
+        raise WorkflowError(f"{label} must be an object")
+    return value
+
+
+def _jsonl_from_declared_bytes(
+    content: bytes,
+    *,
+    label: str,
+) -> tuple[dict[str, object], ...]:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeError as exc:
+        raise WorkflowError(f"{label} is malformed") from exc
+    rows = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(
+                line,
+                object_pairs_hook=_strict_json_object,
+                parse_constant=_reject_json_constant,
+            )
+        except json.JSONDecodeError as exc:
+            raise WorkflowError(f"{label} row {line_number} is malformed") from exc
+        if not isinstance(value, dict):
+            raise WorkflowError(f"{label} row {line_number} must be an object")
+        rows.append(value)
+    return tuple(rows)
+
+
+def _formal_threshold_value(
+    run: Mapping[str, object],
+    metrics: Mapping[str, object],
+) -> float:
+    source = Path(str(run["threshold_source"]))
+    validation_root = source.parent
+    if (
+        source.name != "threshold.json"
+        or source.is_symlink()
+        or not source.is_file()
+        or (validation_root / "run.json").is_symlink()
+        or not (validation_root / "run.json").is_file()
+    ):
+        raise WorkflowError(
+            "formal human comparison requires available independent frozen "
+            "threshold evidence"
+        )
+    validation_run, _, _ = _load_verified_evaluation_run(
+        validation_root,
+        _revalidate_threshold_source=False,
+    )
+    payload = _json_from_declared_bytes(
+        _read_declared_artifact_bytes(
+            source,
+            run["threshold_sha256"],
+            label="formal threshold evidence",
+        ),
+        label="formal threshold evidence",
+    )
+    validated = _threshold_payload(
+        payload,
+        EvaluationRequest(
+            cfg=None,
+            model_name=str(run["model_name"]),
+            checkpoint=Path("unused"),
+            manifest_dir=Path("unused"),
+            split="validation",
+            threshold_path=None,
+            alignment_cache=None,
+            manifest_sha256=str(run["manifest_sha256"]),
+            checkpoint_sha256=str(run["checkpoint_sha256"]),
+        ),
+    )
+    validation_digests = validation_run.get("artifact_sha256")
+    if (
+        validation_run.get("evaluation_split") != "validation"
+        or validation_run.get("model_name") != run["model_name"]
+        or validation_run.get("manifest_sha256") != run["manifest_sha256"]
+        or validation_run.get("checkpoint_sha256") != run["checkpoint_sha256"]
+        or not isinstance(validation_digests, Mapping)
+        or validation_digests.get("threshold.json") != run["threshold_sha256"]
+    ):
+        raise WorkflowError("formal frozen threshold provenance is mismatched")
+    threshold = float(validated["threshold"])
+    metric_threshold = metrics.get("threshold")
+    if (
+        isinstance(metric_threshold, bool)
+        or not isinstance(metric_threshold, (int, float))
+        or not math.isfinite(float(metric_threshold))
+        or float(metric_threshold) != threshold
+    ):
+        raise WorkflowError(
+            "formal metrics and independent frozen threshold evidence disagree"
+        )
+    return threshold
+
+
+def _formal_predictions(
+    root: Path,
+    run: Mapping[str, object],
+) -> tuple[object, ...]:
+    from moving_det.ml.inference import Detection
+    from moving_det.models import OBB
+    from moving_det.vrud.tiling import Tile
+
+    declarations = run.get("artifact_sha256")
+    if not isinstance(declarations, Mapping):
+        raise WorkflowError("formal prediction declaration is missing")
+    expected_digest = declarations.get("ranked-predictions.jsonl")
+    path = root / "ranked-predictions.jsonl"
+    rows = _jsonl_from_declared_bytes(
+        _read_declared_artifact_bytes(
+            path,
+            expected_digest,
+            label="formal ranked predictions",
+        ),
+        label="formal ranked predictions",
+    )
+    universe = frozenset(
+        (str(row["site"]), str(row["sequence"]), int(row["frame"]))
+        for row in run["detection_frame_keys"]
+    )
+    validated = _validate_prediction_rows(rows, universe=universe)
+    threshold = float(run["_formal_threshold"])
+    threshold_path = root / "predictions.jsonl"
+    threshold_digest = declarations.get("predictions.jsonl")
+    threshold_rows = _validate_prediction_rows(
+        _jsonl_from_declared_bytes(
+            _read_declared_artifact_bytes(
+                threshold_path,
+                threshold_digest,
+                label="formal threshold predictions",
+            ),
+            label="formal threshold predictions",
+        ),
+        universe=universe,
+    )
+    expected_threshold_rows = tuple(
+        row for row in validated if float(row["confidence"]) >= threshold
+    )
+    if threshold_rows != expected_threshold_rows:
+        raise WorkflowError(
+            "formal threshold predictions do not derive from the full ranking"
+        )
+    predictions = tuple(
+        Detection(
+            frame=int(row["frame"]),
+            obb=OBB(*(float(value) for value in row["obb"])),
+            class_id=int(row["class_id"]),
+            confidence=float(row["confidence"]),
+            tile=Tile(*(int(value) for value in row["tile_xywh"])),
+            site=str(row["site"]),
+            sequence=str(row["sequence"]),
+        )
+        for row in validated
+    )
+    return predictions
+
+
+def _load_formal_human_comparison(
+    args: argparse.Namespace,
+) -> tuple[object, object, str]:
+    from moving_det.ml.formal_comparison import (
+        HumanRunEvidence,
+        compare_human_runs,
+    )
+    from moving_det.ml.human_benchmark_artifacts import (
+        human_benchmark_fingerprint,
+        load_human_benchmark,
+    )
+    from moving_det.ml.inference import FrameKey
+
+    paths = _formal_human_run_paths(args)
+    _validate_output(Path(args.output), inputs=tuple(paths.values()))
+    records: dict[str, tuple[dict[str, object], dict[str, object], Path]] = {}
+    for label, path in paths.items():
+        records[label] = _load_verified_evaluation_run(path)
+
+    threshold_sources = tuple(
+        Path(str(records[label][0]["threshold_source"]))
+        for label in sorted(records)
+    )
+    threshold_source_roots = tuple(
+        root
+        for source in threshold_sources
+        for root in (source, source.parent)
+    )
+    _validate_output(
+        Path(args.output),
+        inputs=tuple(paths.values()),
+        source_roots=threshold_source_roots,
+    )
+
+    expected_provenance = {
+        "schema_version",
+        "evaluation_split",
+        "manifest_sha256",
+        "config_sha256",
+        "class_schema",
+        "detection_frame_keys",
+        "continuity_frame_keys",
+        "image_root",
+        "metadata_root",
+        "seed",
+        "human_benchmark_source",
+        "human_benchmark_sha256",
+    }
+    baseline_run = records["baseline"][0]
+    if baseline_run.get("model_name") != "baseline" or baseline_run.get(
+        "motion_off"
+    ) is not False:
+        raise WorkflowError("formal Baseline run provenance is invalid")
+    for label in sorted(set(records) - {"baseline"}):
+        run = records[label][0]
+        if run.get("model_name") != "mg_vtod":
+            raise WorkflowError("formal candidate run must be MG-VTOD")
+        if run.get("motion_off") != (label == "motion_off"):
+            raise WorkflowError("formal Motion-Off label and provenance disagree")
+        for field in expected_provenance:
+            if run.get(field) != baseline_run.get(field):
+                raise WorkflowError(
+                    f"formal human {field.replace('_', ' ')} is incompatible"
+                )
+    if baseline_run.get("evaluation_split") != "test":
+        raise WorkflowError("formal human comparison requires frozen test runs")
+    mg_full_run = records["mg_full"][0]
+    motion_off_run = records["motion_off"][0]
+    for field in (
+        "checkpoint_sha256",
+        "threshold_sha256",
+        "alignment_cache",
+        "alignment_cache_sha256",
+    ):
+        if motion_off_run.get(field) != mg_full_run.get(field):
+            raise WorkflowError(
+                "Motion-Off must use the exact MG Full checkpoint, threshold, "
+                f"and alignment provenance ({field.replace('_', ' ')} differs)"
+            )
+
+    for label, (loaded_run, loaded_metrics, root) in tuple(records.items()):
+        stable_run = _json_from_declared_bytes(
+            _read_stable_artifact_bytes(
+                root / "run.json",
+                label=f"{label} formal run metadata",
+            ),
+            label=f"{label} formal run metadata",
+        )
+        if stable_run != loaded_run:
+            raise WorkflowError(
+                f"{label} formal run metadata changed while strict loading"
+            )
+        declarations = stable_run.get("artifact_sha256")
+        if not isinstance(declarations, Mapping):
+            raise WorkflowError("formal artifact declarations are missing")
+        stable_metrics = _json_from_declared_bytes(
+            _read_declared_artifact_bytes(
+                root / "metrics.json",
+                declarations.get("metrics.json"),
+                label=f"{label} formal metrics",
+            ),
+            label=f"{label} formal metrics",
+        )
+        if stable_metrics != loaded_metrics:
+            raise WorkflowError(
+                f"{label} formal metrics changed while strict loading"
+            )
+        records[label] = (stable_run, stable_metrics, root)
+    baseline_run = records["baseline"][0]
+
+    ground_truth_digests = {}
+    ground_truth_rows = {}
+    for label, (run, _, root) in records.items():
+        declarations = run.get("artifact_sha256")
+        if not isinstance(declarations, Mapping):
+            raise WorkflowError("formal ground-truth declaration is missing")
+        declared = declarations.get("ground-truth.jsonl")
+        content = _read_declared_artifact_bytes(
+            root / "ground-truth.jsonl",
+            declared,
+            label=f"{label} formal ground truth",
+        )
+        ground_truth_digests[label] = hashlib.sha256(content).hexdigest()
+        ground_truth_rows[label] = _jsonl_from_declared_bytes(
+            content,
+            label=f"{label} formal ground truth",
+        )
+    if len(set(ground_truth_digests.values())) != 1:
+        raise WorkflowError(
+            "formal human ground-truth bytes are incompatible across runs"
+        )
+
+    benchmark_source = Path(str(baseline_run["human_benchmark_source"]))
+    try:
+        benchmark = load_human_benchmark(benchmark_source)
+        benchmark_sha256 = human_benchmark_fingerprint(benchmark_source)
+    except (OSError, ValueError) as exc:
+        raise WorkflowError("formal human benchmark cannot be strictly loaded") from exc
+    if benchmark_sha256 != baseline_run["human_benchmark_sha256"]:
+        raise WorkflowError("formal human benchmark fingerprint is mismatched")
+    _fixed_human_frame_universe(benchmark)
+    for label, (run, _, _) in records.items():
+        universe = frozenset(
+            (str(row["site"]), str(row["sequence"]), int(row["frame"]))
+            for row in run["detection_frame_keys"]
+        )
+        _validate_human_ground_truth_rows(
+            ground_truth_rows[label],
+            universe=universe,
+            benchmark=benchmark,
+        )
+    _validate_output(
+        Path(args.output),
+        inputs=tuple(paths.values()),
+        source_roots=(
+            Path(str(baseline_run["image_root"])),
+            Path(str(baseline_run["metadata_root"])),
+            benchmark_source,
+            *threshold_source_roots,
+        ),
+    )
+
+    evidence = {}
+    for label, (run, metrics, root) in records.items():
+        threshold = _formal_threshold_value(run, metrics)
+        run_with_threshold = dict(run)
+        run_with_threshold["_formal_threshold"] = threshold
+        frame_keys = tuple(
+            FrameKey(
+                str(row["site"]),
+                str(row["sequence"]),
+                int(row["frame"]),
+            )
+            for row in run["detection_frame_keys"]
+        )
+        evidence[label] = HumanRunEvidence(
+            label=label,
+            model_name=str(run["model_name"]),
+            motion_off=bool(run["motion_off"]),
+            run_dir=root.resolve(strict=True),
+            checkpoint_sha256=str(run["checkpoint_sha256"]),
+            threshold_sha256=str(run["threshold_sha256"]),
+            threshold=threshold,
+            human_benchmark_sha256=str(run["human_benchmark_sha256"]),
+            frame_keys=frame_keys,
+            metrics=metrics,
+            predictions=_formal_predictions(root, run_with_threshold),
+        )
+    comparison = compare_human_runs(
+        baseline=evidence["baseline"],
+        candidates={
+            label: evidence[label]
+            for label in sorted(set(evidence) - {"baseline"})
+        },
+        benchmark=benchmark,
+    )
+    return comparison, benchmark, benchmark_sha256
+
+
+def _formal_transition_rows(
+    comparison: object,
+    benchmark: object,
+) -> tuple[Mapping[str, object], ...]:
+    truth_classes = {
+        (
+            row.site,
+            row.sequence,
+            row.frame,
+            row.track_id,
+            row.visible_span,
+        ): row.class_id
+        for row in benchmark.truths
+    }
+    rows = []
+    for candidate in sorted(comparison.transitions):
+        transitions = comparison.transitions[candidate]
+        for transition in transitions["by_identity"]:
+            identity = tuple(transition["identity"])
+            if len(identity) != 5 or identity not in truth_classes:
+                raise WorkflowError("formal paired transition identity is invalid")
+            rows.append(
+                {
+                    "schema_version": 1,
+                    "candidate": candidate,
+                    "state": transition["state"],
+                    "site": identity[0],
+                    "sequence": identity[1],
+                    "frame": identity[2],
+                    "track_id": identity[3],
+                    "visible_span": identity[4],
+                    "class_id": truth_classes[identity],
+                    "confidence": None,
+                    "obb": None,
+                    "tile_xywh": None,
+                }
+            )
+        for false_positive in transitions["new_false_positives"]:
+            rows.append(
+                {
+                    "schema_version": 1,
+                    "candidate": candidate,
+                    "state": "new_false_positive",
+                    "site": false_positive["site"],
+                    "sequence": false_positive["sequence"],
+                    "frame": false_positive["frame"],
+                    "track_id": None,
+                    "visible_span": None,
+                    "class_id": false_positive["class_id"],
+                    "confidence": false_positive["confidence"],
+                    "obb": false_positive["obb"],
+                    "tile_xywh": false_positive["tile_xywh"],
+                }
+            )
+    return tuple(rows)
+
+
+def _formal_per_model_csv(comparison: object) -> bytes:
+    fieldnames = (
+        "label",
+        "model_name",
+        "motion_off",
+        "primary_candidate",
+        "threshold",
+        "checkpoint_sha256",
+        "threshold_sha256",
+        "ground_truth_count",
+        "prediction_count",
+        "false_positive_count_riou_025",
+        "recall_riou_025",
+        "small_recall_riou_025",
+        "precision_riou_025",
+        "map50",
+        "map50_95",
+        "median_longest_miss",
+        "gate_passed",
+    )
+    order = ("baseline", *sorted(set(comparison.metrics) - {"baseline"}))
+    rows = []
+    for label in order:
+        metrics = comparison.metrics[label]
+        run = comparison.runs[label]
+        rows.append(
+            {
+                "label": label,
+                "model_name": run["model_name"],
+                "motion_off": run["motion_off"],
+                "primary_candidate": label == comparison.primary_candidate,
+                "threshold": run["threshold"],
+                "checkpoint_sha256": run["checkpoint_sha256"],
+                "threshold_sha256": run["threshold_sha256"],
+                **{
+                    field: metrics.get(field)
+                    for field in fieldnames
+                    if field
+                    not in {
+                        "label",
+                        "model_name",
+                        "motion_off",
+                        "primary_candidate",
+                        "threshold",
+                        "checkpoint_sha256",
+                        "threshold_sha256",
+                        "gate_passed",
+                    }
+                },
+                "gate_passed": (
+                    None if label == "baseline" else comparison.gates[label]["passed"]
+                ),
+            }
+        )
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=fieldnames, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return stream.getvalue().encode("utf-8")
+
+
+def run_compare_human(args: argparse.Namespace) -> int:
+    paths = _formal_human_run_paths(args)
+    output = _validate_output(Path(args.output), inputs=tuple(paths.values()))
+    comparison, benchmark, benchmark_sha256 = _load_formal_human_comparison(args)
+
+    def writer(stage: Path) -> Path:
+        comparison_payload = {
+            "schema_version": comparison.schema_version,
+            "primary_candidate": comparison.primary_candidate,
+            "runs": comparison.runs,
+            "metrics": comparison.metrics,
+            "transitions": comparison.transitions,
+            "gates": comparison.gates,
+            "matched_fp_budget": comparison.matched_fp_budget,
+        }
+        payloads = {
+            "comparison.json": _json_bytes(comparison_payload),
+            "transitions.jsonl": _jsonl_bytes(
+                _formal_transition_rows(comparison, benchmark)
+            ),
+            "per_model.csv": _formal_per_model_csv(comparison),
+        }
+        for name, content in payloads.items():
+            _write_bytes(stage / name, content)
+        run = {
+            "schema_version": 1,
+            "primary_candidate": comparison.primary_candidate,
+            "human_benchmark_sha256": benchmark_sha256,
+            "frame_count": len(benchmark.frames),
+            "ground_truth_count": len(benchmark.truths),
+            "runs": comparison.runs,
+            "artifact_schema": {name: 1 for name in sorted(payloads)},
+            "artifact_sha256": {
+                name: hashlib.sha256(content).hexdigest()
+                for name, content in sorted(payloads.items())
+            },
+        }
+        _write_bytes(stage / "run.json", _json_bytes(run))
+        return Path("comparison.json")
 
     primary = _replace_directory(output, writer)
     print(primary.resolve())
@@ -8838,9 +9475,10 @@ def _evaluate_real(request: EvaluationRequest) -> EvaluationArtifacts:
             tuple(truth),
             evaluation_cfg,
         )
-    artifact_predictions = _predictions_for_artifact(
-        tuple(predictions),
-        request,
+    artifact_predictions = (
+        tuple(predictions)
+        if human_benchmark is not None
+        else _predictions_for_artifact(tuple(predictions), request)
     )
     prediction_rows = tuple(
         _serialize_detection(item)

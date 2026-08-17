@@ -276,6 +276,7 @@ def _average_precision(
     predictions: tuple[Detection, ...],
     ground_truth: tuple[GroundTruth, ...],
     class_id: int,
+    iou_threshold: float,
 ) -> float | None:
     truth_count = sum(row.class_id == class_id for row in ground_truth)
     if truth_count == 0:
@@ -283,7 +284,7 @@ def _average_precision(
     matched = match_detections(
         predictions,
         ground_truth,
-        0.5,
+        iou_threshold,
         class_id=class_id,
     )
     ordered = sorted(
@@ -312,6 +313,64 @@ def _average_precision(
         eligible = precision[recall >= target]
         interpolated.append(float(np.max(eligible)) if eligible.size else 0.0)
     return float(np.mean(interpolated))
+
+
+def _precision_recall_curve(
+    predictions: tuple[Detection, ...],
+    ground_truth: tuple[GroundTruth, ...],
+    class_id: int,
+    iou_threshold: float,
+    frame_count: int,
+) -> list[Mapping[str, float]]:
+    truth_count = sum(row.class_id == class_id for row in ground_truth)
+    ordered = sorted(
+        (
+            (index, row)
+            for index, row in enumerate(predictions)
+            if row.class_id == class_id
+        ),
+        key=_prediction_key,
+    )
+    if truth_count == 0 or not ordered:
+        return []
+    matched = match_detections(
+        predictions,
+        ground_truth,
+        iou_threshold,
+        class_id=class_id,
+    )
+    true_positive = np.asarray(
+        [matched.prediction_is_true_positive[index] for index, _ in ordered],
+        dtype=np.float64,
+    )
+    cumulative_true = np.cumsum(true_positive)
+    cumulative_false = np.cumsum(1.0 - true_positive)
+    recall = cumulative_true / truth_count
+    precision = cumulative_true / np.maximum(
+        cumulative_true + cumulative_false,
+        1.0,
+    )
+    rows = []
+    for target in np.linspace(0.0, 1.0, 101):
+        eligible = np.flatnonzero(recall >= target)
+        if eligible.size:
+            eligible_precision = precision[eligible]
+            best = int(eligible[int(np.argmax(eligible_precision))])
+            precision_value = float(precision[best])
+        else:
+            best = len(ordered) - 1
+            precision_value = 0.0
+        rows.append(
+            {
+                "recall": float(recall[best]),
+                "precision": precision_value,
+                "score": float(ordered[best][1].confidence),
+                "false_positives_per_frame": (
+                    float(cumulative_false[best]) / frame_count
+                ),
+            }
+        )
+    return rows
 
 
 def _recall_row(
@@ -455,15 +514,40 @@ def evaluate_human_predictions(
     gt_count = len(ground_truth)
     prediction_count = len(fixed_rows)
 
-    ap50_by_class = {
-        class_id: _average_precision(
-            unsuppressed_rows,
-            ground_truth,
-            class_id,
-        )
-        for class_id in _CLASS_IDS
+    iou_thresholds = tuple(round(0.50 + 0.05 * index, 2) for index in range(10))
+    ap_by_iou = {
+        iou_threshold: {
+            class_id: _average_precision(
+                unsuppressed_rows,
+                ground_truth,
+                class_id,
+                iou_threshold,
+            )
+            for class_id in _CLASS_IDS
+        }
+        for iou_threshold in iou_thresholds
     }
+    ap50_by_class = ap_by_iou[0.5]
     present_ap = [value for value in ap50_by_class.values() if value is not None]
+    present_ap50_95 = [
+        value
+        for by_class in ap_by_iou.values()
+        for value in by_class.values()
+        if value is not None
+    ]
+    pr_curve = {
+        f"riou_{int(iou_threshold * 100):03d}": {
+            str(class_id): _precision_recall_curve(
+                unsuppressed_rows,
+                ground_truth,
+                class_id,
+                iou_threshold,
+                len(frame_universe),
+            )
+            for class_id in _CLASS_IDS
+        }
+        for iou_threshold in (0.25, 0.50)
+    }
 
     per_class: dict[str, dict[str, float | int | None]] = {}
     for class_id in _CLASS_IDS:
@@ -561,6 +645,10 @@ def evaluate_human_predictions(
     return {
         "threshold": threshold,
         "map50": float(np.mean(present_ap)) if present_ap else None,
+        "map50_95": (
+            float(np.mean(present_ap50_95)) if present_ap50_95 else None
+        ),
+        "pr_curve": pr_curve,
         "precision_riou_025": (
             matched_count / prediction_count if prediction_count else None
         ),
@@ -677,6 +765,34 @@ def paired_human_transitions(
     baseline_matched = match_detections(baseline_fixed, ground_truth, 0.25)
     candidate_matched = match_detections(candidate_fixed, ground_truth, 0.25)
 
+    new_false_positives = tuple(
+        {
+            "site": prediction.site,
+            "sequence": prediction.sequence,
+            "frame": prediction.frame,
+            "class_id": prediction.class_id,
+            "confidence": prediction.confidence,
+            "obb": (
+                prediction.obb.cx,
+                prediction.obb.cy,
+                prediction.obb.width,
+                prediction.obb.height,
+                normalize_theta(prediction.obb.theta),
+            ),
+            "tile_xywh": (
+                prediction.tile.x,
+                prediction.tile.y,
+                prediction.tile.width,
+                prediction.tile.height,
+            ),
+        }
+        for index, prediction in sorted(
+            enumerate(candidate_fixed),
+            key=_prediction_key,
+        )
+        if not candidate_matched.prediction_is_true_positive[index]
+    )
+
     counts = {
         "rescued": 0,
         "regressed": 0,
@@ -708,6 +824,7 @@ def paired_human_transitions(
         "candidate_threshold": candidate_cutoff,
         "transitions": counts,
         "by_identity": tuple(by_identity),
+        "new_false_positives": new_false_positives,
         "baseline_ignore_audit": dict(baseline_ignore_audit),
         "candidate_ignore_audit": dict(candidate_ignore_audit),
         "audit": {

@@ -217,6 +217,83 @@ def test_human_ap_uses_full_ranking_after_ignore_but_fixed_metrics_use_threshold
     assert metrics["audit"]["suppressed_prediction_count"] == 1
 
 
+def test_human_metrics_publish_map50_95_and_full_pr_curve():
+    truths = (
+        _truth(1, cls=0, track=1, cx=100.0),
+        _truth(2, cls=1, track=2, cx=200.0),
+    )
+    ranked_predictions = (
+        _matching_prediction(truths[0], confidence=0.95),
+        _pred(1, cx=300.0, cy=100.0, cls=0, confidence=0.80),
+        _matching_prediction(truths[1], confidence=0.40),
+    )
+
+    metrics = evaluate_human_predictions(
+        ranked_predictions,
+        _benchmark(*truths),
+        {"threshold": 0.5},
+    )
+
+    assert metrics["map50"] == 1.0
+    assert metrics["map50_95"] == 1.0
+    assert set(metrics["pr_curve"]) == {"riou_025", "riou_050"}
+    for threshold_curves in metrics["pr_curve"].values():
+        assert set(threshold_curves) == {"0", "1", "2", "3"}
+        assert threshold_curves["2"] == []
+        assert threshold_curves["3"] == []
+        for class_curve in threshold_curves.values():
+            assert len(class_curve) in {0, 101}
+            assert [row["recall"] for row in class_curve] == sorted(
+                row["recall"] for row in class_curve
+            )
+            assert all(
+                set(row)
+                == {
+                    "recall",
+                    "precision",
+                    "score",
+                    "false_positives_per_frame",
+                }
+                for row in class_curve
+            )
+
+
+def test_human_pr_curve_uses_predictions_below_frozen_operating_threshold():
+    truth = _truth(1, cls=0, track=1, cx=100.0)
+
+    metrics = evaluate_human_predictions(
+        (_matching_prediction(truth, confidence=0.4),),
+        _benchmark(truth),
+        {"threshold": 0.5},
+    )
+
+    assert metrics["prediction_count"] == 0
+    assert metrics["map50_95"] == 1.0
+    assert metrics["pr_curve"]["riou_050"]["0"][-1]["recall"] == 1.0
+
+
+def test_human_map50_95_averages_all_ten_iou_thresholds():
+    truth = _truth(1, cls=0, track=1, cx=100.0, short_side=10.0)
+    partial_overlap = Detection(
+        frame=truth.frame,
+        obb=OBB(105.0, 100.0, 20.0, 10.0, 0.0),
+        class_id=truth.class_id,
+        confidence=0.9,
+        tile=TILE,
+        site=truth.site,
+        sequence=truth.sequence,
+    )
+
+    metrics = evaluate_human_predictions(
+        (partial_overlap,),
+        _benchmark(truth),
+        {"threshold": 0.5},
+    )
+
+    assert metrics["map50"] == 1.0
+    assert metrics["map50_95"] == pytest.approx(0.3)
+
+
 def test_single_model_rejects_canonical_duplicate_before_ignore_suppression():
     truth = _truth(1, cx=100.0)
     ignored = HumanIgnore(
@@ -489,6 +566,31 @@ def test_paired_human_transitions_use_exact_identity_and_each_frozen_threshold()
     )
     assert result["baseline_threshold"] == 0.5
     assert result["candidate_threshold"] == 0.3
+
+
+def test_paired_human_transitions_publish_unmatched_candidate_detections():
+    truth = _truth(1)
+    false_positive = _pred(1, cx=300.0, cy=100.0, confidence=0.8)
+
+    result = paired_human_transitions(
+        (),
+        (false_positive,),
+        _benchmark(truth),
+        baseline_threshold=0.5,
+        candidate_threshold=0.5,
+    )
+
+    assert result["new_false_positives"] == (
+        {
+            "site": "site19",
+            "sequence": "sequence_a",
+            "frame": 1,
+            "class_id": 0,
+            "confidence": 0.8,
+            "obb": (300.0, 100.0, 10.0, 10.0, 0.0),
+            "tile_xywh": (0, 0, 1024, 1024),
+        },
+    )
 
 
 def _gate_metrics(

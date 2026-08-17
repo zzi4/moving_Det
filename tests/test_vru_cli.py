@@ -44,6 +44,7 @@ from moving_det.vru_cli import (
     run_build_manifest,
     run_cache_alignments,
     run_compare,
+    run_compare_human,
     run_evaluate,
     run_formal_preflight,
     run_freeze_p2_init,
@@ -62,6 +63,7 @@ EXPECTED_COMMANDS = {
     "evaluate",
     "visualize",
     "compare",
+    "compare-human",
     "audit-sample",
     "diagnose-overfit",
 }
@@ -102,6 +104,552 @@ def test_vru_cli_exposes_exact_workflow_commands():
     parser = build_parser()
 
     assert set(parser._subparsers._group_actions[0].choices) == EXPECTED_COMMANDS
+
+
+def test_compare_human_cli_writes_canonical_artifact_set(
+    tmp_path,
+    monkeypatch,
+):
+    from moving_det.ml.formal_comparison import FormalComparison
+
+    run_dirs = {
+        label: tmp_path / label
+        for label in ("baseline", "mg_full", "motion_off")
+    }
+    for root in run_dirs.values():
+        root.mkdir()
+    output = tmp_path / "comparison"
+    args = build_parser().parse_args(
+        [
+            "compare-human",
+            "--baseline",
+            str(run_dirs["baseline"]),
+            "--mg-full",
+            str(run_dirs["mg_full"]),
+            "--motion-off",
+            str(run_dirs["motion_off"]),
+            "--output",
+            str(output),
+        ]
+    )
+    comparison = FormalComparison(
+        schema_version=1,
+        primary_candidate="mg_full",
+        runs={
+            label: {
+                "run_dir": str(root.resolve()),
+                "checkpoint_sha256": label[0] * 64,
+                "threshold_sha256": "f" * 64,
+                "threshold": 0.31 if label == "baseline" else 0.27,
+                "model_name": "baseline" if label == "baseline" else "mg_vtod",
+                "motion_off": label == "motion_off",
+            }
+            for label, root in run_dirs.items()
+        },
+        metrics={
+            label: {
+                "map50": 0.5,
+                "map50_95": 0.4,
+                "precision_riou_025": 0.7,
+                "recall_riou_025": 0.6,
+                "small_recall_riou_025": 0.5,
+                "median_longest_miss": 3.0,
+                "ground_truth_count": 1,
+                "prediction_count": 1,
+                "false_positive_count_riou_025": 0,
+            }
+            for label in run_dirs
+        },
+        transitions={
+            label: {
+                "by_identity": (
+                    {
+                        "identity": ("site19", "sequence_a", 1, 7, 0),
+                        "state": "stable_tp",
+                    },
+                ),
+                "new_false_positives": (),
+            }
+            for label in ("mg_full", "motion_off")
+        },
+        gates={
+            label: {"conditions": {"approved": True}, "passed": True}
+            for label in ("mg_full", "motion_off")
+        },
+        matched_fp_budget={
+            label: {
+                "baseline_recall": 0.6,
+                "candidate_recall": 0.7,
+                "recall_delta": 0.1,
+                "false_positives_per_frame_budget": 0.0,
+            }
+            for label in ("mg_full", "motion_off")
+        },
+    )
+    loaded = []
+
+    def fake_loader(parsed):
+        loaded.append(parsed)
+        return comparison, SimpleNamespace(
+            frames=(SimpleNamespace(),),
+            truths=(
+                SimpleNamespace(
+                    site="site19",
+                    sequence="sequence_a",
+                    frame=1,
+                    track_id=7,
+                    visible_span=0,
+                    class_id=0,
+                ),
+            ),
+        ), "9" * 64
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_formal_human_comparison",
+        fake_loader,
+    )
+
+    assert run_compare_human(args) == 0
+    assert loaded == [args]
+    assert {path.name for path in output.iterdir()} == {
+        "comparison.json",
+        "transitions.jsonl",
+        "per_model.csv",
+        "run.json",
+    }
+    run = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    assert run["artifact_schema"] == {
+        "comparison.json": 1,
+        "per_model.csv": 1,
+        "transitions.jsonl": 1,
+    }
+    assert run["artifact_sha256"] == {
+        name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+        for name in run["artifact_schema"]
+    }
+    transition = json.loads(
+        (output / "transitions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert transition == {
+        "candidate": "mg_full",
+        "class_id": 0,
+        "confidence": None,
+        "frame": 1,
+        "obb": None,
+        "schema_version": 1,
+        "sequence": "sequence_a",
+        "site": "site19",
+        "state": "stable_tp",
+        "tile_xywh": None,
+        "track_id": 7,
+        "visible_span": 0,
+    }
+
+
+def test_compare_human_strict_adapter_rejects_manifest_identity_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    roots = {
+        label: tmp_path / label
+        for label in ("baseline", "mg_full", "motion_off")
+    }
+    args = build_parser().parse_args(
+        [
+            "compare-human",
+            "--baseline",
+            str(roots["baseline"]),
+            "--mg-full",
+            str(roots["mg_full"]),
+            "--motion-off",
+            str(roots["motion_off"]),
+            "--output",
+            str(tmp_path / "comparison"),
+        ]
+    )
+    common = {
+        "schema_version": 2,
+        "evaluation_split": "test",
+        "manifest_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "class_schema": {
+            "0": "pedestrian",
+            "1": "bicycle",
+            "2": "tricycle",
+            "3": "motorcycle",
+        },
+        "detection_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "continuity_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "image_root": str((tmp_path / "images").resolve()),
+        "metadata_root": str((tmp_path / "metadata").resolve()),
+        "seed": 20260806,
+        "human_benchmark_source": str((tmp_path / "benchmark").resolve()),
+        "human_benchmark_sha256": "c" * 64,
+        "checkpoint_sha256": "d" * 64,
+        "threshold_sha256": "e" * 64,
+        "threshold_source": str(
+            (tmp_path / "validation" / "threshold.json").resolve()
+        ),
+        "artifact_sha256": {"ground-truth.jsonl": "f" * 64},
+    }
+    records = {
+        "baseline": {**common, "model_name": "baseline", "motion_off": False},
+        "mg_full": {**common, "model_name": "mg_vtod", "motion_off": False},
+        "motion_off": {
+            **common,
+            "model_name": "mg_vtod",
+            "motion_off": True,
+            "manifest_sha256": "0" * 64,
+        },
+    }
+    calls = []
+
+    def strict_loader(path):
+        label = Path(path).name
+        calls.append(label)
+        return records[label], {}, Path(path)
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_verified_evaluation_run",
+        strict_loader,
+    )
+
+    with pytest.raises(WorkflowError, match="manifest"):
+        vru_cli_module._load_formal_human_comparison(args)
+
+    assert calls == ["baseline", "mg_full", "motion_off"]
+
+
+def test_compare_human_publication_failure_preserves_existing_output(
+    tmp_path,
+    monkeypatch,
+):
+    from moving_det.ml.formal_comparison import FormalComparison
+
+    roots = {
+        label: tmp_path / label
+        for label in ("baseline", "mg_full", "motion_off")
+    }
+    for root in roots.values():
+        root.mkdir()
+    output = tmp_path / "comparison"
+    output.mkdir()
+    sentinel = output / "published.txt"
+    sentinel.write_text("previous formal result\n", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "compare-human",
+            "--baseline",
+            str(roots["baseline"]),
+            "--mg-full",
+            str(roots["mg_full"]),
+            "--motion-off",
+            str(roots["motion_off"]),
+            "--output",
+            str(output),
+        ]
+    )
+    invalid = FormalComparison(
+        schema_version=1,
+        primary_candidate="mg_full",
+        runs={},
+        metrics={},
+        transitions={
+            "mg_full": {
+                "by_identity": (
+                    {"identity": ("missing",), "state": "rescued"},
+                ),
+                "new_false_positives": (),
+            }
+        },
+        gates={},
+        matched_fp_budget={},
+    )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_formal_human_comparison",
+        lambda _args: (
+            invalid,
+            SimpleNamespace(frames=(), truths=()),
+            "f" * 64,
+        ),
+    )
+
+    with pytest.raises(WorkflowError, match="transition identity"):
+        run_compare_human(args)
+
+    assert sentinel.read_text(encoding="utf-8") == "previous formal result\n"
+    assert {path.name for path in output.iterdir()} == {"published.txt"}
+    assert not list(tmp_path.glob(".comparison.staging.*"))
+
+
+def test_compare_human_rejects_output_overlapping_validation_threshold_source(
+    tmp_path,
+    monkeypatch,
+):
+    validation_root = tmp_path / "mg-validation"
+    validation_root.mkdir()
+    sentinel = validation_root / "threshold.json"
+    sentinel.write_text("frozen threshold\n", encoding="utf-8")
+    roots = {
+        label: tmp_path / "runs" / label
+        for label in ("baseline", "mg_full", "motion_off")
+    }
+    args = build_parser().parse_args(
+        [
+            "compare-human",
+            "--baseline",
+            str(roots["baseline"]),
+            "--mg-full",
+            str(roots["mg_full"]),
+            "--motion-off",
+            str(roots["motion_off"]),
+            "--output",
+            str(validation_root),
+        ]
+    )
+    common = {
+        "schema_version": 2,
+        "evaluation_split": "test",
+        "manifest_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "class_schema": dict(vru_cli_module._CLASS_SCHEMA),
+        "detection_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "continuity_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "image_root": str((tmp_path / "images").resolve()),
+        "metadata_root": str((tmp_path / "metadata").resolve()),
+        "seed": 20260806,
+        "human_benchmark_source": str((tmp_path / "benchmark").resolve()),
+        "human_benchmark_sha256": "c" * 64,
+        "checkpoint_sha256": "d" * 64,
+        "threshold_sha256": "e" * 64,
+        "threshold_source": str(sentinel.resolve()),
+        "alignment_cache": str((tmp_path / "alignment").resolve()),
+        "alignment_cache_sha256": "9" * 64,
+        "artifact_sha256": {"ground-truth.jsonl": "f" * 64},
+    }
+    records = {
+        "baseline": {
+            **common,
+            "model_name": "baseline",
+            "motion_off": False,
+            "alignment_cache": None,
+            "alignment_cache_sha256": None,
+        },
+        "mg_full": {**common, "model_name": "mg_vtod", "motion_off": False},
+        "motion_off": {**common, "model_name": "mg_vtod", "motion_off": True},
+    }
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_verified_evaluation_run",
+        lambda path: (records[Path(path).name], {}, Path(path)),
+    )
+
+    with pytest.raises(WorkflowError, match="overlap"):
+        vru_cli_module._load_formal_human_comparison(args)
+
+    assert sentinel.read_text(encoding="utf-8") == "frozen threshold\n"
+
+
+def test_compare_human_rejects_motion_off_alignment_cache_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    roots = {
+        label: tmp_path / "runs" / label
+        for label in ("baseline", "mg_full", "motion_off")
+    }
+    truth_bytes = b"same canonical truth\n"
+    truth_sha256 = hashlib.sha256(truth_bytes).hexdigest()
+    for root in roots.values():
+        root.mkdir(parents=True)
+        (root / "ground-truth.jsonl").write_bytes(truth_bytes)
+    threshold_roots = {
+        label: tmp_path / "validation" / label
+        for label in roots
+    }
+    for root in threshold_roots.values():
+        root.mkdir(parents=True)
+        (root / "threshold.json").write_text("{}\n", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "compare-human",
+            "--baseline",
+            str(roots["baseline"]),
+            "--mg-full",
+            str(roots["mg_full"]),
+            "--motion-off",
+            str(roots["motion_off"]),
+            "--output",
+            str(tmp_path / "comparison"),
+        ]
+    )
+    common = {
+        "schema_version": 2,
+        "evaluation_split": "test",
+        "manifest_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "class_schema": dict(vru_cli_module._CLASS_SCHEMA),
+        "detection_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "continuity_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "image_root": str((tmp_path / "images").resolve()),
+        "metadata_root": str((tmp_path / "metadata").resolve()),
+        "seed": 20260806,
+        "human_benchmark_source": str((tmp_path / "benchmark").resolve()),
+        "human_benchmark_sha256": "c" * 64,
+        "checkpoint_sha256": "d" * 64,
+        "threshold_sha256": "e" * 64,
+        "artifact_sha256": {"ground-truth.jsonl": truth_sha256},
+        "alignment_cache": str((tmp_path / "alignment").resolve()),
+        "alignment_cache_sha256": "9" * 64,
+    }
+    records = {
+        "baseline": {
+            **common,
+            "model_name": "baseline",
+            "motion_off": False,
+            "threshold_source": str(
+                (threshold_roots["baseline"] / "threshold.json").resolve()
+            ),
+            "alignment_cache": None,
+            "alignment_cache_sha256": None,
+        },
+        "mg_full": {
+            **common,
+            "model_name": "mg_vtod",
+            "motion_off": False,
+            "threshold_source": str(
+                (threshold_roots["mg_full"] / "threshold.json").resolve()
+            ),
+        },
+        "motion_off": {
+            **common,
+            "model_name": "mg_vtod",
+            "motion_off": True,
+            "threshold_source": str(
+                (threshold_roots["motion_off"] / "threshold.json").resolve()
+            ),
+            "alignment_cache_sha256": "8" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_verified_evaluation_run",
+        lambda path: (records[Path(path).name], {}, Path(path)),
+    )
+
+    with pytest.raises(WorkflowError, match="alignment"):
+        vru_cli_module._load_formal_human_comparison(args)
+
+
+def test_formal_human_evidence_loads_verified_full_ranking_below_threshold(
+    tmp_path,
+):
+    root = tmp_path / "human-run"
+    root.mkdir()
+    ranked_row = {
+        "schema_version": 1,
+        "site": "site19",
+        "sequence": "sequence_a",
+        "frame": 1,
+        "class_id": 0,
+        "confidence": 0.2,
+        "obb": [64.0, 48.0, 20.0, 8.0, 0.2],
+        "tile_xywh": [0, 0, 1024, 1024],
+    }
+    ranked_bytes = (
+        json.dumps(ranked_row, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    (root / "ranked-predictions.jsonl").write_bytes(ranked_bytes)
+    (root / "predictions.jsonl").write_bytes(b"")
+    run = {
+        "artifact_sha256": {
+            "ranked-predictions.jsonl": hashlib.sha256(ranked_bytes).hexdigest(),
+            "predictions.jsonl": hashlib.sha256(b"").hexdigest(),
+        },
+        "detection_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "_formal_threshold": 0.5,
+    }
+
+    predictions = vru_cli_module._formal_predictions(root, run)
+
+    assert len(predictions) == 1
+    assert predictions[0].confidence == 0.2
+
+
+def test_formal_human_evidence_does_not_accept_ranked_path_swap_and_restore(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "human-run"
+    root.mkdir()
+    benign = {
+        "schema_version": 1,
+        "site": "site19",
+        "sequence": "sequence_a",
+        "frame": 1,
+        "class_id": 0,
+        "confidence": 0.2,
+        "obb": [64.0, 48.0, 20.0, 8.0, 0.2],
+        "tile_xywh": [0, 0, 1024, 1024],
+    }
+    malicious = {**benign, "obb": [128.0, 48.0, 20.0, 8.0, 0.2]}
+    benign_bytes = (
+        json.dumps(benign, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    malicious_bytes = (
+        json.dumps(malicious, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    ranked_path = root / "ranked-predictions.jsonl"
+    ranked_path.write_bytes(benign_bytes)
+    threshold_path = root / "predictions.jsonl"
+    threshold_path.write_bytes(b"")
+    run = {
+        "artifact_sha256": {
+            "ranked-predictions.jsonl": hashlib.sha256(benign_bytes).hexdigest(),
+            "predictions.jsonl": hashlib.sha256(b"").hexdigest(),
+        },
+        "detection_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "_formal_threshold": 0.5,
+    }
+    real_read_jsonl = vru_cli_module._read_jsonl
+
+    def swap_while_reading(path):
+        candidate = Path(path)
+        if candidate == ranked_path:
+            candidate.write_bytes(malicious_bytes)
+            try:
+                return real_read_jsonl(candidate)
+            finally:
+                candidate.write_bytes(benign_bytes)
+        return real_read_jsonl(candidate)
+
+    monkeypatch.setattr(vru_cli_module, "_read_jsonl", swap_while_reading)
+
+    predictions = vru_cli_module._formal_predictions(root, run)
+
+    assert predictions[0].obb.cx == 64.0
 
 
 @pytest.mark.parametrize(
@@ -2964,6 +3512,15 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
                 site="site19",
                 sequence="sequence_a",
             ),
+            Detection(
+                frame=31,
+                obb=OBB(7.0, 7.0, 1.0, 1.0, 0.0),
+                class_id=3,
+                confidence=0.25,
+                tile=Tile(0, 0, 8, 8),
+                site="site19",
+                sequence="sequence_a",
+            ),
         ),
     )
     for old_loader in (
@@ -3003,7 +3560,7 @@ def test_human_evaluation_routes_manual_truth_and_nas_image_only(
     assert artifacts.metrics["threshold"] == 0.5
     assert artifacts.metrics["prediction_count"] == 1
     assert artifacts.metrics["recall_riou_025"] == 1.0
-    assert len(artifacts.predictions) == 1
+    assert [row["confidence"] for row in artifacts.predictions] == [0.75, 0.25]
     assert artifacts.ground_truth[0]["class_id"] == 3
     assert artifacts.ground_truth[0]["pixel_speed_per_frame"] == 2.5
     assert artifacts.ground_truth[0]["visible_span"] == 6
@@ -8620,6 +9177,18 @@ def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
         "human_benchmark_fingerprint",
         lambda path: "f" * 64,
     )
+    first_frame = benchmark.frames[0]
+    below_threshold = {
+        "schema_version": 1,
+        "site": first_frame.site,
+        "sequence": first_frame.sequence,
+        "frame": first_frame.frame,
+        "class_id": 0,
+        "confidence": 0.2,
+        "obb": [64.0, 48.0, 20.0, 8.0, 0.2],
+        "tile_xywh": [0, 0, 1024, 1024],
+    }
+    bundle = replace(bundle, predictions=(below_threshold,))
 
     run_evaluate(
         args,
@@ -8647,8 +9216,18 @@ def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
     assert run["motion_off"] is True
     assert run["artifact_schema"]["ground-truth.jsonl"] == 3
     assert run["artifact_schema"]["per_pixel_speed.csv"] == 1
+    assert run["artifact_schema"]["ranked-predictions.jsonl"] == 1
     assert "per_speed.csv" not in run["artifact_schema"]
     assert (output / "per_pixel_speed.csv").is_file()
+    assert (
+        json.loads(
+            (output / "ranked-predictions.jsonl")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        == below_threshold
+    )
+    assert (output / "predictions.jsonl").read_text(encoding="utf-8") == ""
     assert not (output / "per_speed.csv").exists()
     assert truth["schema_version"] == 3
     assert truth["pixel_speed_per_frame"] == 0.5
