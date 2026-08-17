@@ -33,6 +33,7 @@ from moving_det.vru_cli import (
     _select_data_smoke_records,
     _serialize_ground_truth,
     _stage_overfit_manifest,
+    _run_formal_preflight,
     _validate_evaluation_artifacts,
     _validate_evaluation_run_schema,
     _verify_checkpoint_alignment_provenance,
@@ -231,7 +232,7 @@ def test_formal_preflight_cli_publishes_only_canonical_report(
         ),
     )
 
-    assert run_formal_preflight(args, preflight=lambda request: passing) == 0
+    assert _run_formal_preflight(args, preflight=lambda request: passing) == 0
 
     preflight_root = output / "preflight"
     assert {path.name for path in preflight_root.iterdir()} == {"report.json"}
@@ -304,7 +305,7 @@ def test_formal_preflight_create_only_publication_preserves_racing_writer(
     )
 
     with pytest.raises(WorkflowError, match="already exists|concurrent"):
-        run_formal_preflight(args, preflight=lambda _request: passing)
+        _run_formal_preflight(args, preflight=lambda _request: passing)
 
     assert (output / "other-process.txt").read_text(encoding="utf-8") == "foreign"
     assert not (output / "preflight").exists()
@@ -336,7 +337,7 @@ def test_formal_preflight_cli_rejects_nonempty_root_before_preflight(tmp_path):
     )
 
     with pytest.raises(WorkflowError, match="non-empty"):
-        run_formal_preflight(
+        _run_formal_preflight(
             args,
             preflight=lambda _request: pytest.fail(
                 "preflight ran before the non-empty root was rejected"
@@ -344,6 +345,31 @@ def test_formal_preflight_cli_rejects_nonempty_root_before_preflight(tmp_path):
         )
 
     assert sentinel.read_text(encoding="utf-8") == "owned"
+
+
+def test_public_formal_preflight_handler_rejects_preflight_override(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "formal-preflight",
+            "--config",
+            "formal.yaml",
+            "--manifest",
+            "manifest",
+            "--alignment-cache",
+            "alignment-cache",
+            "--human-benchmark",
+            "human-benchmark",
+            "--p2-init",
+            "p2-init.pt",
+            "--expected-git-commit",
+            "a" * 40,
+            "--output",
+            str(tmp_path / "formal-output"),
+        ]
+    )
+
+    with pytest.raises(TypeError, match="preflight"):
+        run_formal_preflight(args, preflight=lambda _request: object())
 
 
 def test_formal_preflight_parser_requires_external_expected_git_commit():

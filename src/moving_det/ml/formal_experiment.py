@@ -115,7 +115,6 @@ class FormalApprovedInputContract:
     config_sha256: str
     manifest_sha256: str
     alignment_cache_sha256: str
-    p2_init_sha256: str
     split_row_counts: tuple[tuple[str, int], ...]
     split_sequences: tuple[tuple[str, tuple[tuple[str, str], ...]], ...]
     alignment_offsets: tuple[int, ...]
@@ -134,7 +133,6 @@ APPROVED_FORMAL_INPUTS = FormalApprovedInputContract(
     alignment_cache_sha256=(
         "07e49ef8766d0f1d85c6c368a9cf34bbd57447386f216ca4d73bfb179d91568e"
     ),
-    p2_init_sha256=APPROVED_P2_SHA256,
     split_row_counts=(
         ("train", 13_998),
         ("validation", 16_575),
@@ -404,7 +402,6 @@ def _validated_contract_maps(
                 contract.config_sha256,
                 contract.manifest_sha256,
                 contract.alignment_cache_sha256,
-                contract.p2_init_sha256,
             )
         )
         or not contract.alignment_offsets
@@ -737,11 +734,12 @@ def probe_free_bytes(path: Path) -> int:
         raise ValueError("formal preflight could not probe output disk") from exc
 
 
-def preflight_formal_experiment(
+def _preflight_formal_experiment(
     request: FormalPreflightRequest,
     *,
-    project_root: Path | None = None,
-    approved_contract: FormalApprovedInputContract = APPROVED_FORMAL_INPUTS,
+    project_root: Path,
+    approved_contract: FormalApprovedInputContract,
+    p2_sha_probe: Callable[[Path], str],
     git_probe: Callable[[], tuple[str, bool]] | None = None,
     gpu_probe: Callable[[], Mapping[str, object]] = probe_gpus,
     disk_probe: Callable[[Path], int] = probe_free_bytes,
@@ -803,7 +801,7 @@ def preflight_formal_experiment(
         or p2_provenance.get("loaded_count") != 427
         or p2_provenance.get("source_weights_sha256")
         != APPROVED_UNIVERSAL_SHA256
-        or sha256_file(request.p2_init) != approved_contract.p2_init_sha256
+        or p2_sha_probe(request.p2_init) != APPROVED_P2_SHA256
     ):
         raise ValueError("formal P2 initialization contract does not match")
 
@@ -849,9 +847,27 @@ def preflight_formal_experiment(
         manifest_sha256=manifest_sha,
         alignment_cache_sha256=snapshot.fingerprint,
         human_benchmark_sha256=benchmark_sha,
-        p2_init_sha256=approved_contract.p2_init_sha256,
+        p2_init_sha256=APPROVED_P2_SHA256,
         train_record_count=train_count,
         gpu_names=(gpu_names[0], gpu_names[1]),
         free_bytes=free_bytes,
         passed=True,
+    )
+
+
+def preflight_formal_experiment(
+    request: FormalPreflightRequest,
+    *,
+    git_probe: Callable[[], tuple[str, bool]] | None = None,
+    gpu_probe: Callable[[], Mapping[str, object]] = probe_gpus,
+    disk_probe: Callable[[Path], int] = probe_free_bytes,
+) -> FormalPreflightReport:
+    return _preflight_formal_experiment(
+        request,
+        project_root=Path(__file__).resolve().parents[3],
+        approved_contract=APPROVED_FORMAL_INPUTS,
+        p2_sha_probe=sha256_file,
+        git_probe=git_probe,
+        gpu_probe=gpu_probe,
+        disk_probe=disk_probe,
     )

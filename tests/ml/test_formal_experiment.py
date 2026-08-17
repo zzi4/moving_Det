@@ -1,4 +1,5 @@
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 import hashlib
@@ -9,12 +10,15 @@ import numpy as np
 import pytest
 import yaml
 
+import moving_det.ml.formal_experiment as formal_experiment_module
 from moving_det.ml.formal_experiment import (
+    APPROVED_FORMAL_INPUTS,
     APPROVED_HUMAN_SHA256,
     APPROVED_P2_SHA256,
     FormalApprovedInputContract,
     FormalExperimentLayout,
     FormalPreflightRequest,
+    _preflight_formal_experiment,
     probe_git,
     preflight_formal_experiment,
 )
@@ -178,7 +182,6 @@ def frozen_formal_inputs(tmp_path, monkeypatch):
     )
     p2_init.parent.mkdir()
     p2_init.write_bytes(b"frozen-p2")
-    p2_sha = hashlib.sha256(p2_init.read_bytes()).hexdigest()
 
     benchmark = SimpleNamespace(
         frames=(None,) * 873,
@@ -214,7 +217,6 @@ def frozen_formal_inputs(tmp_path, monkeypatch):
         config_sha256=config_sha,
         manifest_sha256=manifest_sha,
         alignment_cache_sha256=alignment_sha,
-        p2_init_sha256=p2_sha,
         split_row_counts=(("train", 6), ("validation", 3), ("test", 3)),
         split_sequences=tuple(
             (split, sequences) for split, sequences in FORMAL_SEQUENCES.items()
@@ -251,10 +253,11 @@ def _preflight(frozen_formal_inputs, request=None, **kwargs):
         "approved_contract",
         frozen_formal_inputs["approved_contract"],
     )
-    return preflight_formal_experiment(
+    return _preflight_formal_experiment(
         _request(frozen_formal_inputs) if request is None else request,
         project_root=project_root,
         approved_contract=approved_contract,
+        p2_sha_probe=lambda _: APPROVED_P2_SHA256,
         **kwargs,
     )
 
@@ -284,9 +287,10 @@ def test_formal_layout_uses_exact_nonoverlapping_children(tmp_path):
     assert len(set(layout.artifact_directories())) == 10
 
 
-def test_probe_git_reads_real_clean_repository(tmp_path):
-    repository = tmp_path / "repository"
-    repository.mkdir()
+def test_real_git_probe_enforces_matched_clean_head_and_rejects_wrong_or_dirty(
+    frozen_formal_inputs,
+):
+    repository = frozen_formal_inputs["project_root"]
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
     subprocess.run(
         ["git", "config", "user.email", "formal@example.invalid"],
@@ -300,46 +304,106 @@ def test_probe_git_reads_real_clean_repository(tmp_path):
     )
     tracked = repository / "tracked.txt"
     tracked.write_text("approved\n", encoding="utf-8")
-    subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
     subprocess.run(
         ["git", "commit", "-q", "-m", "approved"],
         cwd=repository,
         check=True,
     )
-    expected = subprocess.run(
+    expected_commit = subprocess.run(
         ["git", "rev-parse", "HEAD"],
         cwd=repository,
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
+    git_probe = partial(probe_git, repository)
+    matched = replace(
+        _request(frozen_formal_inputs),
+        expected_git_commit=expected_commit,
+    )
 
-    assert probe_git(repository) == (expected, False)
+    report = _preflight(
+        frozen_formal_inputs,
+        matched,
+        git_probe=git_probe,
+        gpu_probe=lambda: {
+            "devices": ("NVIDIA RTX A6000", "NVIDIA RTX A6000"),
+            "compute_pids": (),
+        },
+        disk_probe=lambda _: 200 * 1024**3,
+    )
+    assert report.git_commit == expected_commit
+    assert probe_git(repository) == (expected_commit, False)
 
-
-@pytest.mark.parametrize(
-    ("git_result", "message"),
-    [
-        (("a" * 40, True), "clean Git commit"),
-        (("b" * 40, False), "clean Git commit"),
-    ],
-)
-def test_preflight_rejects_dirty_or_unapproved_git_before_output(
-    frozen_formal_inputs,
-    tmp_path,
-    git_result,
-    message,
-):
-    request = _request(frozen_formal_inputs)
-
-    with pytest.raises(ValueError, match=message):
+    wrong = replace(
+        matched,
+        expected_git_commit=("0" * 40 if expected_commit != "0" * 40 else "1" * 40),
+    )
+    with pytest.raises(ValueError, match="clean Git commit"):
         _preflight(
             frozen_formal_inputs,
-            request,
-            git_probe=lambda: git_result,
+            wrong,
+            git_probe=git_probe,
         )
 
-    assert not request.output_root.exists()
+    tracked.write_text("dirty\n", encoding="utf-8")
+    assert probe_git(repository) == (expected_commit, True)
+    with pytest.raises(ValueError, match="clean Git commit"):
+        _preflight(
+            frozen_formal_inputs,
+            matched,
+            git_probe=git_probe,
+        )
+
+    assert not matched.output_root.exists()
+
+
+def test_public_preflight_cannot_override_production_root_or_approved_contract(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+    sentinel = object()
+
+    def capture_private(request, **kwargs):
+        captured["request"] = request
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        formal_experiment_module,
+        "_preflight_formal_experiment",
+        capture_private,
+    )
+    request = FormalPreflightRequest(
+        config=Path("configs/vrud-temporal-obb.yaml"),
+        manifest_dir=Path("runs/vrud-pilot/manifest"),
+        alignment_cache=Path("runs/vrud-pilot/alignment-cache"),
+        benchmark_dir=Path("benchmark"),
+        p2_init=Path("p2-init.pt"),
+        output_root=Path("formal-output"),
+        expected_git_commit="a" * 40,
+        minimum_free_bytes=100 * 1024**3,
+    )
+
+    assert preflight_formal_experiment(request) is sentinel
+    assert captured["project_root"] == Path(
+        formal_experiment_module.__file__
+    ).resolve().parents[3]
+    assert captured["approved_contract"] is APPROVED_FORMAL_INPUTS
+
+    with pytest.raises(TypeError, match="project_root"):
+        preflight_formal_experiment(request, project_root=tmp_path)
+    with pytest.raises(TypeError, match="approved_contract"):
+        preflight_formal_experiment(
+            request,
+            approved_contract=frozen_contract_for_override_test(),
+        )
+
+
+def frozen_contract_for_override_test():
+    return replace(APPROVED_FORMAL_INPUTS, config_sha256="f" * 64)
 
 
 def test_preflight_rejects_busy_gpu_and_never_creates_output(
@@ -379,7 +443,21 @@ def test_preflight_accepts_approved_canonical_mirror_and_reports_config_sha(
     assert report.config_sha256 == hashlib.sha256(
         frozen_formal_inputs["request"]["config"].read_bytes()
     ).hexdigest()
+    assert report.p2_init_sha256 == (
+        "d474b9cc8aa113e72de0352bfe4e45aea6b0b7c7a28f67de889214d495428948"
+    )
     assert not _request(frozen_formal_inputs).output_root.exists()
+
+
+def test_private_mirror_cannot_approve_a_changed_p2_sha(frozen_formal_inputs):
+    with pytest.raises(ValueError, match="P2 initialization contract"):
+        _preflight_formal_experiment(
+            _request(frozen_formal_inputs),
+            project_root=frozen_formal_inputs["project_root"],
+            approved_contract=frozen_formal_inputs["approved_contract"],
+            p2_sha_probe=lambda _: "f" * 64,
+            git_probe=lambda: ("a" * 40, False),
+        )
 
 
 @pytest.mark.parametrize(

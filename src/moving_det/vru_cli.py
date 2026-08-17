@@ -823,15 +823,14 @@ def _publish_formal_preflight_report(output: Path, report: object) -> Path:
             shutil.rmtree(staging)
 
 
-def run_formal_preflight(
+def _run_formal_preflight(
     args: argparse.Namespace,
     *,
-    preflight: Callable[[object], object] | None = None,
+    preflight: Callable[[object], object],
 ) -> int:
     from moving_det.ml.formal_experiment import (
         FormalPreflightReport,
         FormalPreflightRequest,
-        preflight_formal_experiment,
     )
 
     output = Path(args.output)
@@ -853,10 +852,7 @@ def run_formal_preflight(
         expected_git_commit=args.expected_git_commit,
         minimum_free_bytes=_FORMAL_MINIMUM_FREE_BYTES,
     )
-    selected_preflight = (
-        preflight_formal_experiment if preflight is None else preflight
-    )
-    report = selected_preflight(request)
+    report = preflight(request)
     if not isinstance(report, FormalPreflightReport):
         raise WorkflowError("formal preflight returned an invalid report")
     if output.is_symlink() or (output.exists() and not output.is_dir()):
@@ -867,6 +863,12 @@ def run_formal_preflight(
     primary = _publish_formal_preflight_report(output, report)
     print(primary.resolve())
     return 0
+
+
+def run_formal_preflight(args: argparse.Namespace) -> int:
+    from moving_det.ml.formal_experiment import preflight_formal_experiment
+
+    return _run_formal_preflight(args, preflight=preflight_formal_experiment)
 
 
 def _load_config(
