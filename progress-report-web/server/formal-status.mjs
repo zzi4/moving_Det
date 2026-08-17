@@ -931,13 +931,20 @@ function mediaUrl(path) {
     .join("/")}`;
 }
 
-async function requireDeclaredMediaFile(formalRoot, path, label, verifyFile) {
+async function requireDeclaredMediaFile(
+  formalRoot,
+  path,
+  label,
+  expectedVerification,
+  verifyFile,
+) {
   const relative = `demo/${path}`;
   const maximumBytes = mediaMaximumBytes(path);
   const verified = await verifyFile({
     formalRoot,
     relative,
     expectedSha256: label.sha256,
+    expectedVerification,
     maximumBytes,
   });
   if (verified.size > maximumBytes) {
@@ -965,6 +972,7 @@ function mediaMaximumBytes(path) {
 export async function readFormalDemoManifest({
   formalRoot,
   inspectFile = inspectFormalFile,
+  matchFile = matchesFormalFileIdentity,
   verifyFile = verifyFormalFile,
 }) {
   const manifestRecord = await readJsonRecord(
@@ -1099,7 +1107,9 @@ export async function readFormalDemoManifest({
     throw new TypeError("formal demo cases do not cover every required state");
   }
   let inspectedTotalBytes = 0;
-  for (const { path } of mediaDeclarations) {
+  const inspectedDeclarations = [];
+  for (const declaration of mediaDeclarations) {
+    const { path } = declaration;
     const relative = `demo/${path}`;
     const maximumBytes = mediaMaximumBytes(path);
     const inspected = await inspectFile({
@@ -1107,30 +1117,49 @@ export async function readFormalDemoManifest({
       relative,
       maximumBytes,
     });
-    if (inspected.size > maximumBytes) {
+    const boundSize = Number(inspected.verification.identity.size);
+    if (
+      !Number.isSafeInteger(boundSize) ||
+      boundSize < 0 ||
+      inspected.size !== boundSize ||
+      boundSize > maximumBytes
+    ) {
       throw new RangeError(`formal media exceeds size limit: ${relative}`);
     }
-    inspectedTotalBytes += inspected.size;
+    inspectedTotalBytes += boundSize;
     if (inspectedTotalBytes > FORMAL_MEDIA_TOTAL_MAX_BYTES) {
       throw new RangeError(
         `formal demo total media size exceeds limit (${FORMAL_MEDIA_TOTAL_MAX_BYTES} bytes)`,
       );
     }
+    inspectedDeclarations.push({
+      ...declaration,
+      maximumBytes,
+      expectedVerification: inspected.verification,
+    });
+  }
+  for (const declaration of inspectedDeclarations) {
+    await matchFile({
+      formalRoot,
+      relative: `demo/${declaration.path}`,
+      expectedVerification: declaration.expectedVerification,
+      maximumBytes: declaration.maximumBytes,
+    });
   }
   const settledFiles = await Promise.allSettled(
-    mediaDeclarations.map(({ path, media }) =>
-      requireDeclaredMediaFile(formalRoot, path, media, verifyFile),
+    inspectedDeclarations.map(({ path, media, expectedVerification }) =>
+      requireDeclaredMediaFile(
+        formalRoot,
+        path,
+        media,
+        expectedVerification,
+        verifyFile,
+      ),
     ),
   );
   const rejectedFile = settledFiles.find((result) => result.status === "rejected");
   if (rejectedFile !== undefined) throw rejectedFile.reason;
   const files = settledFiles.map((result) => result.value);
-  const totalMediaBytes = files.reduce((total, file) => total + file.size, 0);
-  if (totalMediaBytes > FORMAL_MEDIA_TOTAL_MAX_BYTES) {
-    throw new RangeError(
-      `formal demo total media size exceeds limit (${FORMAL_MEDIA_TOTAL_MAX_BYTES} bytes)`,
-    );
-  }
   return {
     videos,
     cases,

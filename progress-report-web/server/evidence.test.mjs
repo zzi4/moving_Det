@@ -57,6 +57,12 @@ function digest(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function identityChanged(message = "formal identity changed") {
+  const error = new TypeError(message);
+  error.code = "FORMAL_IDENTITY_CHANGED";
+  return error;
+}
+
 async function write(root, relative, contents) {
   const destination = join(root, relative);
   await mkdir(dirname(destination), { recursive: true });
@@ -147,7 +153,10 @@ async function evidenceServer(t, evidence) {
   return `http://127.0.0.1:${address.port}`;
 }
 
-async function evidenceRouteServer(t, { formalRoot, evidenceCache }) {
+async function evidenceRouteServer(
+  t,
+  { formalRoot, evidenceCache, ...routeOptions },
+) {
   const server = createServer(async (request, response) => {
     try {
       await serveFormalEvidenceRoute({
@@ -156,6 +165,7 @@ async function evidenceRouteServer(t, { formalRoot, evidenceCache }) {
         formalRoot,
         route: "/formal-evidence/videos/site19-day.mp4",
         evidenceCache,
+        ...routeOptions,
       });
     } catch {
       if (!response.headersSent) response.statusCode = 404;
@@ -377,6 +387,79 @@ test("formal evidence cache revalidates ctime and manifest identity changes", as
   assert.equal(hashCount, 33);
 });
 
+test("formal evidence cache never publishes an allowlist from a replaced manifest", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const replacement = Buffer.from("replacement-video");
+  await write(formalRoot, "demo/videos/replacement.mp4", replacement);
+  const manifestPath = join(formalRoot, "demo", "demo.json");
+  let manifestReads = 0;
+  let completedHashes = 0;
+  let revoked = false;
+  const evidenceCache = createFormalEvidenceCache({
+    manifestReader: async (options) => {
+      manifestReads += 1;
+      return readFormalDemoManifest({
+        ...options,
+        verifyFile: async (verifyOptions) => {
+          const verified = await verifyFormalFile(verifyOptions);
+          if (!revoked) {
+            completedHashes += 1;
+            if (completedHashes === 11) {
+              revoked = true;
+              const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+              manifest.scenes[0].path = "videos/replacement.mp4";
+              manifest.scenes[0].sha256 = digest(replacement);
+              await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+            }
+          }
+          return verified;
+        },
+      });
+    },
+  });
+  const origin = await evidenceRouteServer(t, { formalRoot, evidenceCache });
+
+  const response = await fetch(`${origin}/video`);
+  const body = await response.text();
+  assert.notEqual(response.status, 200);
+  assert.equal(body.includes("site19-day"), false);
+  assert.equal(manifestReads, 2);
+});
+
+test("formal evidence writes no old response when both manifest barriers change", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  let manifestReads = 0;
+  const evidenceCache = createFormalEvidenceCache({
+    manifestReader: async (options) => {
+      manifestReads += 1;
+      return readFormalDemoManifest(options);
+    },
+  });
+  await evidenceCache.getFiles({ formalRoot });
+  const manifestPath = join(formalRoot, "demo", "demo.json");
+  let barrierCalls = 0;
+  const origin = await evidenceRouteServer(t, {
+    formalRoot,
+    evidenceCache,
+    beforeResponseBarrier: async () => {
+      barrierCalls += 1;
+      const manifest = await readFile(manifestPath);
+      await rename(manifestPath, `${manifestPath}.swap-${barrierCalls}`);
+      await writeFile(manifestPath, manifest);
+    },
+  });
+
+  const response = await fetch(`${origin}/video`);
+  const body = await response.text();
+  assert.equal(response.status, 404);
+  assert.equal(response.headers.get("accept-ranges"), null);
+  assert.equal(response.headers.get("content-type"), null);
+  assert.equal(response.headers.get("etag"), null);
+  assert.equal(body.includes("site19-day"), false);
+  assert.equal(barrierCalls, 2);
+  assert.equal(manifestReads, 2);
+});
+
 test("formal evidence rejects file and parent identity swaps after allowlisting", async (t) => {
   for (const replacement of ["file", "parent"]) {
     const formalRoot = await formalMediaFixture(t);
@@ -454,6 +537,183 @@ test("formal demo applies explicit MP4 and PNG size limits", async (t) => {
   );
   assert.equal(seen[0].maximumBytes, FORMAL_MP4_MAX_BYTES);
   assert.equal(verifyCalls, 0);
+});
+
+test("formal demo binds every hash to its preflight identity", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const inspections = new Map();
+  let matchedFiles = 0;
+
+  const result = await readFormalDemoManifest({
+    formalRoot,
+    inspectFile: async (options) => {
+      const inspected = fakeVerification(options, 1);
+      inspections.set(options.relative, inspected.verification);
+      return inspected;
+    },
+    matchFile: async (options) => {
+      assert.deepEqual(
+        options.expectedVerification,
+        inspections.get(options.relative),
+      );
+      matchedFiles += 1;
+      return true;
+    },
+    verifyFile: async (options) => {
+      assert.deepEqual(
+        options.expectedVerification,
+        inspections.get(options.relative),
+      );
+      return fakeVerification(options, 1);
+    },
+  });
+
+  assert.equal(result.files.length, 11);
+  assert.equal(matchedFiles, 11);
+});
+
+test("formal demo starts no hashes when one file changes after preflight", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const current = new Map();
+  let inspectedFiles = 0;
+  let hashCalls = 0;
+
+  await assert.rejects(
+    readFormalDemoManifest({
+      formalRoot,
+      inspectFile: async (options) => {
+        const inspected = fakeVerification(options, 1);
+        current.set(options.relative, inspected.verification);
+        inspectedFiles += 1;
+        if (inspectedFiles === 11) {
+          const firstRelative = "demo/videos/site19-day.mp4";
+          const previous = current.get(firstRelative);
+          current.set(firstRelative, {
+            ...previous,
+            identity: { ...previous.identity, ctimeNs: 2n },
+          });
+        }
+        return inspected;
+      },
+      matchFile: async (options) => {
+        if (
+          options.expectedVerification.identity.ctimeNs !==
+          current.get(options.relative).identity.ctimeNs
+        ) {
+          throw identityChanged();
+        }
+        return true;
+      },
+      verifyFile: async (options) => {
+        hashCalls += 1;
+        return fakeVerification(options, 1);
+      },
+    }),
+    /identity|ctimeNs/i,
+  );
+  assert.equal(inspectedFiles, 11);
+  assert.equal(hashCalls, 0);
+});
+
+test("formal demo rebuilds a 21-file preflight before hashing a new total", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const manifestPath = join(formalRoot, "demo", "demo.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  for (let index = 4; index < 9; index += 1) {
+    manifest.cases.push({
+      identity: {
+        site: "site19",
+        sequence: "sequence-a",
+        frame: index + 1,
+        track_id: index,
+        visible_span: 0,
+        class_id: index % 4,
+        state: "rescued",
+      },
+      panel: {
+        path: `cases/${index}-panel.png`,
+        sha256: "a".repeat(64),
+        width: 640,
+        height: 360,
+      },
+      timeline: {
+        path: `cases/${index}-timeline.png`,
+        sha256: "b".repeat(64),
+        width: 640,
+        height: 80,
+      },
+    });
+  }
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+
+  const current = new Map();
+  let manifestReads = 0;
+  let hashCalls = 0;
+  let byteReads = 0;
+  const evidenceCache = createFormalEvidenceCache({
+    manifestReader: async (options) => {
+      manifestReads += 1;
+      let inspectedFiles = 0;
+      return readFormalDemoManifest({
+        ...options,
+        inspectFile: async (inspectOptions) => {
+          inspectedFiles += 1;
+          const isVideo = inspectOptions.relative.endsWith(".mp4");
+          const size = isVideo
+            ? FORMAL_MP4_MAX_BYTES
+            : inspectedFiles < 21
+              ? 15 * 1024 ** 2
+              : manifestReads === 1
+                ? 1
+                : 2 * 1024 ** 2;
+          const inspected = fakeVerification(inspectOptions, size);
+          current.set(inspectOptions.relative, inspected.verification);
+          if (manifestReads === 1 && inspectedFiles === 21) {
+            current.set(inspectOptions.relative, {
+              ...inspected.verification,
+              identity: {
+                ...inspected.verification.identity,
+                size: BigInt(2 * 1024 ** 2),
+                ctimeNs: 2n,
+              },
+            });
+          }
+          return inspected;
+        },
+        matchFile: async (matchOptions) => {
+          const observed = current.get(matchOptions.relative);
+          if (
+            matchOptions.expectedVerification.identity.size !==
+              observed.identity.size ||
+            matchOptions.expectedVerification.identity.ctimeNs !==
+              observed.identity.ctimeNs
+          ) {
+            throw identityChanged();
+          }
+          return true;
+        },
+        verifyFile: async (verifyOptions) => {
+          hashCalls += 1;
+          byteReads += 1;
+          return fakeVerification(verifyOptions, 1);
+        },
+      });
+    },
+  });
+
+  await assert.rejects(
+    serveFormalEvidenceRoute({
+      request: { method: "GET", headers: {} },
+      response: { headersSent: false },
+      formalRoot,
+      route: "/formal-evidence/videos/site19-day.mp4",
+      evidenceCache,
+    }),
+    /total.*size/i,
+  );
+  assert.equal(manifestReads, 2);
+  assert.equal(hashCalls, 0);
+  assert.equal(byteReads, 0);
 });
 
 test("formal demo rejects declared media above the total size limit", async (t) => {

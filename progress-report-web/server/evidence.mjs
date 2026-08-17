@@ -119,8 +119,19 @@ export function createFormalEvidenceCache({
 
       const manifest = await manifestReader({ formalRoot });
       if (manifest === null) return new Map();
+      await manifestMatcher({
+        formalRoot,
+        relative: "demo/demo.json",
+        expectedVerification: manifest.manifestVerification,
+      });
       const files = new Map(
-        manifest.files.map(({ route, ...evidence }) => [route, evidence]),
+        manifest.files.map(({ route, ...evidence }) => [
+          route,
+          {
+            ...evidence,
+            manifestVerification: manifest.manifestVerification,
+          },
+        ]),
       );
       entries.set(formalRoot, {
         files,
@@ -177,7 +188,12 @@ function parseRange(value, size) {
   return { start, end: Math.min(requestedEnd, size - 1) };
 }
 
-export async function serveFormalEvidence({ request, response, evidence }) {
+export async function serveFormalEvidence({
+  request,
+  response,
+  evidence,
+  beforeWrite = null,
+}) {
   if (evidence === undefined || evidence === null) {
     throw new TypeError("formal evidence is not allowlisted");
   }
@@ -194,6 +210,7 @@ export async function serveFormalEvidence({ request, response, evidence }) {
     expectedVerification: evidence.verification,
   });
   try {
+    if (beforeWrite !== null) await beforeWrite();
     const etag = `"${evidence.sha256}"`;
     response.setHeader("Content-Type", evidence.contentType);
     response.setHeader("Cache-Control", evidence.cacheControl);
@@ -246,12 +263,28 @@ export async function serveFormalEvidenceRoute({
   formalRoot,
   route,
   evidenceCache = formalEvidenceCache,
+  manifestMatcher = matchesFormalFileIdentity,
+  beforeResponseBarrier = null,
 }) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const evidence = (await evidenceCache.getFiles({ formalRoot })).get(route);
-    if (!evidence) throw new TypeError("formal evidence is not allowlisted");
     try {
-      await serveFormalEvidence({ request, response, evidence });
+      const evidence = (await evidenceCache.getFiles({ formalRoot })).get(route);
+      if (!evidence) throw new TypeError("formal evidence is not allowlisted");
+      await serveFormalEvidence({
+        request,
+        response,
+        evidence,
+        beforeWrite: async () => {
+          if (beforeResponseBarrier !== null) {
+            await beforeResponseBarrier();
+          }
+          await manifestMatcher({
+            formalRoot,
+            relative: "demo/demo.json",
+            expectedVerification: evidence.manifestVerification,
+          });
+        },
+      });
       return;
     } catch (error) {
       const code = error instanceof Error && "code" in error ? error.code : null;

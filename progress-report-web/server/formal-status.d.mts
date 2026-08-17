@@ -102,6 +102,7 @@ export function createCachedFormalStatusReader(options: {
 export function readFormalDemoManifest(options: {
   formalRoot: string;
   inspectFile?: typeof inspectFormalFile;
+  matchFile?: typeof matchesFormalFileIdentity;
   verifyFile?: typeof verifyFormalFile;
 }): Promise<null | {
   videos: readonly Record<string, unknown>[];

@@ -10,6 +10,7 @@ export type FormalEvidenceFile = EvidenceFile & {
   size: number;
   sha256: string;
   verification: import("./formal-status.mjs").FormalFileVerification;
+  manifestVerification: import("./formal-status.mjs").FormalFileVerification;
 };
 
 export type FormalEvidenceCache = {
@@ -37,6 +38,7 @@ export function serveFormalEvidence(options: {
   request: import("node:http").IncomingMessage;
   response: import("node:http").ServerResponse;
   evidence: FormalEvidenceFile;
+  beforeWrite?: (() => Promise<void>) | null;
 }): Promise<void>;
 
 export function serveFormalEvidenceRoute(options: {
@@ -45,4 +47,6 @@ export function serveFormalEvidenceRoute(options: {
   formalRoot: string;
   route: string;
   evidenceCache?: FormalEvidenceCache;
+  manifestMatcher?: typeof import("./formal-status.mjs").matchesFormalFileIdentity;
+  beforeResponseBarrier?: (() => Promise<void>) | null;
 }): Promise<void>;
