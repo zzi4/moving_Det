@@ -1,5 +1,6 @@
 from dataclasses import replace
 from functools import partial
+from inspect import signature
 from pathlib import Path
 from types import SimpleNamespace
 import hashlib
@@ -19,7 +20,9 @@ from moving_det.ml.formal_experiment import (
     FormalExperimentLayout,
     FormalPreflightRequest,
     _preflight_formal_experiment,
+    probe_free_bytes,
     probe_git,
+    probe_gpus,
     preflight_formal_experiment,
 )
 from moving_det.ml.training import manifest_fingerprint
@@ -392,6 +395,11 @@ def test_public_preflight_cannot_override_production_root_or_approved_contract(
         formal_experiment_module.__file__
     ).resolve().parents[3]
     assert captured["approved_contract"] is APPROVED_FORMAL_INPUTS
+    assert isinstance(captured["git_probe"], partial)
+    assert captured["git_probe"].func is probe_git
+    assert captured["git_probe"].args == (captured["project_root"],)
+    assert captured["gpu_probe"] is probe_gpus
+    assert captured["disk_probe"] is probe_free_bytes
 
     with pytest.raises(TypeError, match="project_root"):
         preflight_formal_experiment(request, project_root=tmp_path)
@@ -404,6 +412,29 @@ def test_public_preflight_cannot_override_production_root_or_approved_contract(
 
 def frozen_contract_for_override_test():
     return replace(APPROVED_FORMAL_INPUTS, config_sha256="f" * 64)
+
+
+@pytest.mark.parametrize(
+    ("probe_name", "probe"),
+    [
+        ("git_probe", lambda: ("a" * 40, False)),
+        (
+            "gpu_probe",
+            lambda: {
+                "devices": ("NVIDIA RTX A6000", "NVIDIA RTX A6000"),
+                "compute_pids": (),
+            },
+        ),
+        ("disk_probe", lambda _path: 200 * 1024**3),
+    ],
+)
+def test_public_preflight_rejects_production_gate_probe_overrides(
+    probe_name,
+    probe,
+):
+    assert tuple(signature(preflight_formal_experiment).parameters) == ("request",)
+    with pytest.raises(TypeError, match=probe_name):
+        preflight_formal_experiment(object(), **{probe_name: probe})
 
 
 def test_preflight_rejects_busy_gpu_and_never_creates_output(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 import hashlib
 import json
 import math
@@ -857,17 +858,14 @@ def _preflight_formal_experiment(
 
 def preflight_formal_experiment(
     request: FormalPreflightRequest,
-    *,
-    git_probe: Callable[[], tuple[str, bool]] | None = None,
-    gpu_probe: Callable[[], Mapping[str, object]] = probe_gpus,
-    disk_probe: Callable[[Path], int] = probe_free_bytes,
 ) -> FormalPreflightReport:
+    project_root = Path(__file__).resolve().parents[3]
     return _preflight_formal_experiment(
         request,
-        project_root=Path(__file__).resolve().parents[3],
+        project_root=project_root,
         approved_contract=APPROVED_FORMAL_INPUTS,
         p2_sha_probe=sha256_file,
-        git_probe=git_probe,
-        gpu_probe=gpu_probe,
-        disk_probe=disk_probe,
+        git_probe=partial(probe_git, project_root),
+        gpu_probe=probe_gpus,
+        disk_probe=probe_free_bytes,
     )
