@@ -18,7 +18,7 @@ import subprocess
 import tempfile
 import time
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -102,6 +102,7 @@ Validator = Callable[
 ]
 StepObserver = Callable[[Optimizer, int], None]
 ScalerFactory = Callable[[torch.device], torch.amp.GradScaler]
+TrainScope = Literal["full", "temporal"]
 
 
 @dataclass(frozen=True)
@@ -135,14 +136,59 @@ class TrainResult:
     gate_passed: bool | None
 
 
-def build_optimizer(
+def _configure_train_scope(
+    model_name: str,
     model: nn.Module,
+    train_scope: TrainScope,
+) -> tuple[nn.Parameter, ...]:
+    if train_scope not in ("full", "temporal"):
+        raise ValueError("train_scope must be 'full' or 'temporal'")
+    if train_scope == "temporal" and model_name == "baseline":
+        raise ValueError("temporal scope requires a temporal model")
+    allowed = (
+        _allowed_temporal_parameter_names(model)
+        if train_scope == "temporal"
+        else {name for name, _ in model.named_parameters()}
+    )
+    selected = []
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(name in allowed)
+        if name in allowed:
+            selected.append(parameter)
+    if not selected:
+        raise ValueError("train scope selected no parameters")
+    return tuple(selected)
+
+
+def build_optimizer(
+    model_or_parameters: nn.Module | Iterable[nn.Parameter],
     cfg: TemporalOBBConfig,
+    *,
+    train_scope: TrainScope = "full",
 ) -> torch.optim.AdamW:
     if cfg.optimizer != "AdamW":
         raise ValueError(f"unsupported optimizer: {cfg.optimizer!r}")
+    if isinstance(model_or_parameters, nn.Module):
+        model_name = (
+            "temporal"
+            if callable(
+                getattr(model_or_parameters, "temporal_parameter_names", None)
+            )
+            else "baseline"
+        )
+        parameters = _configure_train_scope(
+            model_name,
+            model_or_parameters,
+            train_scope,
+        )
+    else:
+        if train_scope != "full":
+            raise ValueError(
+                "train_scope is configured before optimizer construction"
+            )
+        parameters = tuple(model_or_parameters)
     return torch.optim.AdamW(
-        model.parameters(),
+        parameters,
         lr=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
     )
@@ -1835,6 +1881,18 @@ def _validate_resume_checkpoint_payload(
     return history
 
 
+def _verify_resume_train_scope(
+    payload: Mapping[str, Any],
+    *,
+    label: str,
+    train_scope: TrainScope,
+) -> None:
+    if payload.get("train_scope") != train_scope:
+        raise ValueError(
+            f"resume {label} checkpoint train scope is incompatible"
+        )
+
+
 def _resume_reproducibility_state(
     payload: Mapping[str, Any],
     distributed_context: DistributedContext | None,
@@ -2131,12 +2189,17 @@ def train_model(
     output_dir: Path,
     max_steps: int | None = None,
     *,
+    train_scope: TrainScope = "full",
     init_checkpoint: Path | None = None,
     resume_checkpoint: Path | None = None,
     hooks: TrainingHooks | None = None,
     distributed_context: DistributedContext | None = None,
 ) -> TrainResult:
     """Train a model with deterministic provenance and internal checkpoints."""
+    if train_scope not in ("full", "temporal"):
+        raise ValueError("train_scope must be 'full' or 'temporal'")
+    if train_scope == "temporal" and model_name == "baseline":
+        raise ValueError("temporal scope requires a temporal model")
     incoming_resume_rng = (
         _capture_global_rng_state()
         if resume_checkpoint is not None
@@ -2183,6 +2246,7 @@ def train_model(
         "manifest_sha256": None,
         "alignment_cache_sha256": None,
         "model_name": model_name,
+        "train_scope": train_scope,
         "pretrained_weights": getattr(cfg, "pretrained_weights", None),
         "load_provenance": load_provenance,
         "amp_enabled": False,
@@ -2316,6 +2380,16 @@ def train_model(
             source = Path(resume_checkpoint)
             resume_payload = _load_checkpoint_payload(source)
             source_best = _load_checkpoint_payload(source.parent / "best.pt")
+            _verify_resume_train_scope(
+                resume_payload,
+                label="last",
+                train_scope=train_scope,
+            )
+            _verify_resume_train_scope(
+                source_best,
+                label="best",
+                train_scope=train_scope,
+            )
 
         train_loader: Any | None = None
         validation_loader: Any | None = None
@@ -2449,6 +2523,11 @@ def train_model(
                 init_source_state,
                 allowed_missing,
             )
+        selected_parameters = _configure_train_scope(
+            model_name,
+            model,
+            train_scope,
+        )
         model = model.to(device)
         history: list[dict[str, Any]] = []
         start_epoch = 0
@@ -2482,7 +2561,7 @@ def train_model(
             }
         run["load_provenance"] = load_provenance
 
-        optimizer = build_optimizer(model, cfg)
+        optimizer = build_optimizer(selected_parameters, cfg)
         if train_loader is None:
             build_loaders()
         assert train_loader is not None
@@ -2820,6 +2899,7 @@ def train_model(
                 )
             checkpoint_state = {
                 "model_name": model_name,
+                "train_scope": train_scope,
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "epoch": epoch,

@@ -1538,6 +1538,91 @@ def test_train_devices_two_launches_normalized_torchrun_command(
     )
 
 
+def test_two_gpu_temporal_scope_reaches_each_worker(tmp_path):
+    args = build_parser().parse_args(
+        [
+            "train",
+            "--model",
+            "mg_vtod",
+            "--manifest",
+            "manifest",
+            "--output",
+            str(tmp_path / "mg-frozen"),
+            "--baseline-init",
+            "baseline/best.pt",
+            "--train-scope",
+            "temporal",
+            "--devices",
+            "2",
+        ]
+    )
+
+    command = vru_cli_module._distributed_training_command(
+        args,
+        manifest=Path("manifest"),
+        checkpoint_output=tmp_path / "mg-frozen" / "checkpoints",
+        alignment_cache=Path("alignment-cache"),
+        init_checkpoint=Path("baseline/best.pt"),
+        resume_checkpoint=None,
+    )
+
+    assert command[-2:] == ["--train-scope", "temporal"]
+
+
+def test_single_gpu_temporal_scope_reaches_trainer(tmp_path):
+    cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
+    manifest = tmp_path / "manifest"
+    manifest.mkdir()
+    output = tmp_path / "mg-frozen"
+    captured = {}
+
+    class Result:
+        best_checkpoint = output / "checkpoints" / "best.pt"
+
+    def trainer(*_args, **kwargs):
+        captured.update(kwargs)
+        return Result()
+
+    args = build_parser().parse_args(
+        [
+            "train",
+            "--model",
+            "mg_vtod",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(output),
+            "--baseline-init",
+            "baseline/best.pt",
+            "--train-scope",
+            "temporal",
+        ]
+    )
+
+    assert run_train(
+        args,
+        config_loader=lambda _path: cfg,
+        trainer=trainer,
+    ) == 0
+    assert captured["train_scope"] == "temporal"
+
+
+def test_train_scope_defaults_full_and_baseline_rejects_temporal(capsys):
+    args = build_parser().parse_args(
+        "train --model baseline --manifest manifest --output run".split()
+    )
+
+    assert args.train_scope == "full"
+    with pytest.raises(SystemExit) as rejected:
+        main(
+            "train --model baseline --manifest manifest --output run "
+            "--train-scope temporal".split(),
+            handlers={"train": lambda _args: pytest.fail("handler ran")},
+        )
+    assert rejected.value.code == 2
+    assert "temporal scope requires" in capsys.readouterr().err
+
+
 def test_train_devices_two_requires_two_visible_cuda_devices(tmp_path):
     cfg = load_temporal_config(Path("configs/vrud-temporal-obb.yaml"))
     manifest = tmp_path / "manifest"
@@ -1814,6 +1899,7 @@ def test_default_train_installs_real_loader_based_task11_validator(
         output_dir,
         *,
         max_steps,
+        train_scope,
         init_checkpoint,
         resume_checkpoint,
         hooks,
@@ -1822,6 +1908,7 @@ def test_default_train_installs_real_loader_based_task11_validator(
             model_name=model_name,
             manifest_dir=manifest_dir,
             output_dir=output_dir,
+            train_scope=train_scope,
             hooks=hooks,
         )
         return types.SimpleNamespace(
@@ -1851,6 +1938,7 @@ def test_default_train_installs_real_loader_based_task11_validator(
     assert captured["model_name"] == "baseline"
     assert captured["manifest_dir"] == manifest
     assert captured["output_dir"] == output / "checkpoints"
+    assert captured["train_scope"] == "full"
     assert isinstance(captured["hooks"], training.TrainingHooks)
     assert captured["hooks"].validator is not None
 

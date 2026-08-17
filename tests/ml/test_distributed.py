@@ -130,3 +130,45 @@ def test_two_rank_collectives_reduce_gather_and_broadcast(tmp_path):
         assert result["metrics"] == pytest.approx((0.25, 0.75))
     assert rank_zero["gathered"] == ({"rank": 0}, {"rank": 1})
     assert rank_one["gathered"] is None
+
+
+def test_distributed_worker_passes_temporal_scope_to_trainer(tmp_path):
+    from moving_det.distributed_train import build_parser, run_worker
+    from moving_det.ml.distributed import DistributedContext
+
+    context = DistributedContext(
+        rank=1,
+        local_rank=1,
+        world_size=2,
+        backend="nccl",
+    )
+    captured = {}
+
+    def trainer(*_args, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "mg_vtod",
+            "--config",
+            "config.yaml",
+            "--manifest",
+            "manifest",
+            "--output",
+            str(tmp_path / "checkpoints"),
+            "--train-scope",
+            "temporal",
+        ]
+    )
+
+    assert run_worker(
+        args,
+        config_loader=lambda _path: object(),
+        trainer=trainer,
+        context_initializer=lambda: context,
+        process_group_destroyer=lambda: None,
+        validator=lambda *_args, **_kwargs: {},
+    ) == 0
+    assert captured["train_scope"] == "temporal"

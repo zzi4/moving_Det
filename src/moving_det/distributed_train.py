@@ -42,6 +42,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-checkpoint", type=Path)
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--max-steps", type=_positive_integer)
+    parser.add_argument(
+        "--train-scope",
+        choices=("full", "temporal"),
+        default="full",
+    )
     return parser
 
 
@@ -141,6 +146,7 @@ def run_worker(
             Path(args.manifest),
             Path(args.output),
             max_steps=args.max_steps,
+            train_scope=args.train_scope,
             init_checkpoint=args.init_checkpoint,
             resume_checkpoint=args.resume_checkpoint,
             hooks=hooks,

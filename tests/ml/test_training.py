@@ -865,6 +865,17 @@ class TinyTemporalOBB(TinyOBB):
         return {"temporal.weight", "temporal.bias"}
 
 
+class TrainableTinyTemporalOBB(TinyTemporalOBB):
+    def loss(
+        self,
+        batch: dict[str, Any],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        self.loss_calls += 1
+        prediction = self.temporal(batch["x"])
+        loss = torch.square(prediction - batch["target"]).mean()
+        return loss, {"tiny_loss": loss.detach()}
+
+
 class DatasetTinyOBB(TinyOBB):
     def loss(
         self,
@@ -1081,6 +1092,160 @@ def test_optimizer_matches_approved_settings(temporal_config):
     assert isinstance(optimizer, torch.optim.AdamW)
     assert optimizer.param_groups[0]["lr"] == pytest.approx(2e-4)
     assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(1e-2)
+
+
+def test_temporal_scope_optimizes_exact_temporal_parameters(temporal_config):
+    model = TinyTemporalOBB()
+    temporal_names = model.temporal_parameter_names()
+
+    optimizer = build_optimizer(
+        model,
+        temporal_config,
+        train_scope="temporal",
+    )
+
+    optimized = {
+        name
+        for name, parameter in model.named_parameters()
+        if any(
+            parameter is item
+            for group in optimizer.param_groups
+            for item in group["params"]
+        )
+    }
+    assert optimized == temporal_names
+    assert all(
+        parameter.requires_grad == (name in temporal_names)
+        for name, parameter in model.named_parameters()
+    )
+
+
+def test_temporal_scope_rejects_baseline_before_optimizer_or_loader(
+    tmp_path,
+    temporal_config,
+    monkeypatch,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("baseline temporal scope reached model or loader setup")
+
+    monkeypatch.setattr(training_module, "build_optimizer", fail_if_called)
+    hooks = TrainingHooks(
+        model_factory=fail_if_called,
+        loader_factory=fail_if_called,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="temporal scope requires"):
+        train_model(
+            "baseline",
+            temporal_config,
+            manifest,
+            tmp_path / "run",
+            train_scope="temporal",
+            hooks=hooks,
+        )
+
+
+def test_temporal_train_scope_is_recorded_in_run_and_checkpoints(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    result = train_model(
+        "mg_vtod",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "temporal-run",
+        train_scope="temporal",
+        hooks=_tiny_hooks(
+            TrainableTinyTemporalOBB(),
+            map50_values=[0.2],
+        ),
+    )
+
+    run = json.loads((result.output_dir / "run.json").read_text())
+    best = torch.load(
+        result.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    last = torch.load(
+        result.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert run["train_scope"] == "temporal"
+    assert best["train_scope"] == "temporal"
+    assert last["train_scope"] == "temporal"
+
+
+def test_resume_rejects_changed_train_scope_before_loader(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    first = train_model(
+        "mg_vtod",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "first",
+        train_scope="temporal",
+        hooks=_tiny_hooks(
+            TrainableTinyTemporalOBB(),
+            map50_values=[0.2],
+        ),
+    )
+
+    def fail_loader(*_args, **_kwargs):
+        pytest.fail("changed train scope reached loader construction")
+
+    with pytest.raises(ValueError, match="train scope"):
+        train_model(
+            "mg_vtod",
+            replace(temporal_config, pilot_epochs=2),
+            manifest,
+            tmp_path / "rejected-resume",
+            train_scope="full",
+            resume_checkpoint=first.last_checkpoint,
+            hooks=replace(
+                _tiny_hooks(
+                    TrainableTinyTemporalOBB(),
+                    map50_values=[0.3],
+                ),
+                loader_factory=fail_loader,
+            ),
+        )
+
+
+def test_default_full_train_scope_is_recorded(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    result = train_model(
+        "baseline",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "full-run",
+        hooks=_tiny_hooks(TinyOBB(), map50_values=[0.2]),
+    )
+
+    run = json.loads((result.output_dir / "run.json").read_text())
+    best = torch.load(
+        result.best_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    last = torch.load(
+        result.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert run["train_scope"] == "full"
+    assert best["train_scope"] == "full"
+    assert last["train_scope"] == "full"
 
 
 def test_manifest_fingerprint_is_creation_order_independent_and_content_bound(
@@ -3704,9 +3869,9 @@ def test_invalid_best_is_rejected_before_model_optimizer_or_loader_mutation(
             self.load_calls = getattr(self, "load_calls", 0) + 1
             return super().load_state_dict(state_dict)
 
-    def tracking_optimizer(model, cfg):
+    def tracking_optimizer(parameters, cfg):
         optimizer = TrackingAdamW(
-            model.parameters(),
+            parameters,
             lr=cfg.learning_rate,
             weight_decay=cfg.weight_decay,
         )

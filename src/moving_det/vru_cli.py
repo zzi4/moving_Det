@@ -424,6 +424,11 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--overfit-samples", type=_positive_integer)
     train.add_argument("--max-steps", type=_positive_integer)
     train.add_argument("--devices", type=int, choices=(1, 2), default=1)
+    train.add_argument(
+        "--train-scope",
+        choices=("full", "temporal"),
+        default="full",
+    )
 
     evaluate = subparsers.add_parser(
         "evaluate",
@@ -513,6 +518,8 @@ def _validate_cross_arguments(
             parser.error("--baseline-init is only valid for temporal models")
         if args.model == "baseline" and args.alignment_cache is not None:
             parser.error("--alignment-cache is only valid for temporal models")
+        if args.model == "baseline" and args.train_scope == "temporal":
+            parser.error("temporal scope requires a temporal model")
     if args.command == "evaluate":
         if args.human_benchmark is not None and args.split != "test":
             parser.error("--human-benchmark is only valid for test evaluation")
@@ -1543,6 +1550,7 @@ def _distributed_training_command(
             command.extend((option, str(Path(value).resolve())))
     if args.max_steps is not None:
         command.extend(("--max-steps", str(args.max_steps)))
+    command.extend(("--train-scope", args.train_scope))
     return command
 
 
@@ -1625,6 +1633,8 @@ def run_train(
     cuda_device_count: Callable[[], int] | None = None,
 ) -> int:
     using_default_trainer = trainer is None
+    if args.model == "baseline" and args.train_scope == "temporal":
+        raise WorkflowError("temporal scope requires a temporal model")
     cfg = _load_config(args.config, config_loader)
     manifest = Path(args.manifest)
     if manifest.is_symlink() or not manifest.is_dir():
@@ -1781,6 +1791,7 @@ def run_train(
         )
     training_arguments: dict[str, object] = {
         "max_steps": args.max_steps,
+        "train_scope": args.train_scope,
         "init_checkpoint": init_checkpoint,
         "resume_checkpoint": resume_checkpoint,
     }
