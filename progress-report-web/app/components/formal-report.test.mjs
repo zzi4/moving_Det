@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -126,12 +127,11 @@ test("formal report renders an honest failed gate and every evidence section", a
     plugins: [react()],
   });
   t.after(() => server.close());
-  const { FormalReportView } = await server.ssrLoadModule(
+  const { FormalReportView, formalRefreshFailure } = await server.ssrLoadModule(
     "/app/components/formal-report.tsx",
   );
-  const html = renderToStaticMarkup(
-    FormalReportView({ report: toFormalReport(completedGateFailedSnapshot()) }),
-  );
+  const report = toFormalReport(completedGateFailedSnapshot());
+  const html = renderToStaticMarkup(FormalReportView({ report }));
 
   assert.match(html, /Baseline/);
   assert.match(html, /MG-VTOD Full/);
@@ -144,8 +144,40 @@ test("formal report renders an honest failed gate and every evidence section", a
     assert.match(html, new RegExp(state, "i"));
   }
   assert.equal((html.match(/<video/g) ?? []).length, 3);
+  assert.equal((html.match(/<video[^>]+aria-label=/g) ?? []).length, 3);
   assert.match(html, new RegExp("a{64}"));
   assert.match(html, new RegExp("c{64}"));
   assert.match(html, /Universal 历史训练来源重叠/);
   assert.match(html, /这里只评价同域增量/);
+
+  const pendingSnapshot = completedGateFailedSnapshot();
+  pendingSnapshot.state = "running";
+  pendingSnapshot.stages = pendingSnapshot.stages.map((stage) => ({
+    ...stage,
+    state: stage.name === "preflight" ? "completed" : "not_started",
+    epoch: null,
+  }));
+  pendingSnapshot.models = { baseline: null, mg_vtod_full: null };
+  pendingSnapshot.human_test = null;
+  pendingSnapshot.metrics = null;
+  pendingSnapshot.gate = null;
+  pendingSnapshot.videos = [];
+  pendingSnapshot.cases = [];
+  const pendingHtml = renderToStaticMarkup(
+    FormalReportView({ report: toFormalReport(pendingSnapshot) }),
+  );
+  assert.match(pendingHtml, /formal-gate-pending/);
+  assert.doesNotMatch(pendingHtml, /formal-gate-failed/);
+
+  const failedRefresh = formalRefreshFailure(report);
+  assert.equal(failedRefresh.report.gate, null);
+  assert.deepEqual(failedRefresh.report.videos, []);
+  assert.deepEqual(failedRefresh.report.cases, []);
+  assert.match(failedRefresh.error, /不展示未经验证的 gate 或媒体/);
+
+  const source = await readFile(
+    resolve(projectRoot, "app/components/formal-report.tsx"),
+    "utf8",
+  );
+  assert.match(source, /<figure key=\{item\.src\}>/);
 });

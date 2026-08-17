@@ -158,3 +158,19 @@ test("typed formal adapter rejects incomplete gates and undeclared case enums", 
   caseState.cases[0].state = "stable_tp";
   assert.throws(() => toFormalReport(caseState), /case state/);
 });
+
+test("typed formal adapter constrains thresholds and probabilities to [0, 1]", () => {
+  const threshold = completedSnapshot();
+  threshold.models.baseline.threshold = -0.01;
+  assert.throws(() => toFormalReport(threshold), /threshold/i);
+
+  const probability = completedSnapshot();
+  probability.metrics.mg_vtod_full.recall = -0.01;
+  assert.throws(() => toFormalReport(probability), /recall/i);
+});
+
+test("typed formal adapter requires every case src to be unique", () => {
+  const duplicate = completedSnapshot();
+  duplicate.cases[1].src = duplicate.cases[0].src;
+  assert.throws(() => toFormalReport(duplicate), /case.*src.*unique/i);
+});

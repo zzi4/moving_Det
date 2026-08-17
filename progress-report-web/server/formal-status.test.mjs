@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  appendFile,
   mkdir,
   mkdtemp,
+  open as openFile,
+  readFile,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -11,7 +15,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
-import { createFormalStatusSnapshot } from "./formal-status.mjs";
+import {
+  collectFormalArtifactSignature,
+  createCachedFormalStatusReader,
+  createFormalStatusSnapshot,
+  readStableBoundedFile,
+} from "./formal-status.mjs";
 
 const NOW = new Date("2026-08-17T02:00:00.000Z");
 const SHA = {
@@ -93,7 +102,7 @@ async function addPreflight(root) {
       human_benchmark_sha256: "4".repeat(64),
       p2_init_sha256: "5".repeat(64),
       train_record_count: 13_998,
-      gpu_names: ["RTX A6000", "RTX A6000"],
+      gpu_names: ["NVIDIA RTX A6000", "NVIDIA RTX A6000"],
       free_bytes: 200 * 1024 ** 3,
       passed: true,
     }),
@@ -211,6 +220,19 @@ async function addComparison(root) {
   );
 }
 
+async function mutateComparison(root, mutation) {
+  const comparisonPath = join(root, "comparison", "comparison.json");
+  const runPath = join(root, "comparison", "run.json");
+  const comparison = JSON.parse(await readFile(comparisonPath, "utf8"));
+  mutation(comparison);
+  const comparisonBytes = jsonBytes(comparison);
+  await writeFile(comparisonPath, comparisonBytes);
+  const run = JSON.parse(await readFile(runPath, "utf8"));
+  run.runs = comparison.runs;
+  run.artifact_sha256["comparison.json"] = sha256(comparisonBytes);
+  await writeFile(runPath, jsonBytes(run));
+}
+
 async function addDemo(root) {
   const states = [
     "rescued",
@@ -311,6 +333,71 @@ test("formal status exposes nine gate conditions only after verified comparison"
   ]));
 });
 
+test("formal status rejects non-canonical producer GPU names", async (t) => {
+  const root = await completedFixture(t);
+  const reportPath = join(root, "preflight", "report.json");
+  const report = JSON.parse(await readFile(reportPath, "utf8"));
+  report.gpu_names = ["RTX A6000", "RTX A6000"];
+  await writeFile(reportPath, jsonBytes(report));
+
+  await assert.rejects(
+    createFormalStatusSnapshot({ formalRoot: root }),
+    /preflight.*invalid/i,
+  );
+});
+
+test("formal status enforces label-specific run provenance", async (t) => {
+  for (const [label, mutation] of [
+    ["baseline", { model_name: "mg_vtod", motion_off: false }],
+    ["mg_full", { model_name: "mg_vtod", motion_off: true }],
+    ["motion_off", { model_name: "mg_vtod", motion_off: false }],
+  ]) {
+    const root = await completedFixture(t);
+    await mutateComparison(root, (comparison) => {
+      Object.assign(comparison.runs[label], mutation);
+    });
+    await assert.rejects(
+      createFormalStatusSnapshot({ formalRoot: root }),
+      new RegExp(`${label}.*provenance|${label}.*values`, "i"),
+    );
+  }
+});
+
+test("formal status binds comparison benchmark to the verified preflight", async (t) => {
+  const root = await completedFixture(t);
+  const runPath = join(root, "comparison", "run.json");
+  const run = JSON.parse(await readFile(runPath, "utf8"));
+  run.human_benchmark_sha256 = "9".repeat(64);
+  await writeFile(runPath, jsonBytes(run));
+
+  await assert.rejects(
+    createFormalStatusSnapshot({ formalRoot: root }),
+    /benchmark.*preflight|preflight.*benchmark/i,
+  );
+});
+
+test("formal status never lets comparison overwrite failed training", async (t) => {
+  const root = await completedFixture(t);
+  await addTraining(root, "baseline", "failed", 12);
+
+  await assert.rejects(
+    createFormalStatusSnapshot({ formalRoot: root, now: NOW }),
+    /comparison.*failed|failed.*comparison|contradict/i,
+  );
+});
+
+test("formal status constrains probability metrics to [0, 1]", async (t) => {
+  const root = await completedFixture(t);
+  await mutateComparison(root, (comparison) => {
+    comparison.metrics.mg_full.recall_riou_025 = 1.01;
+  });
+
+  await assert.rejects(
+    createFormalStatusSnapshot({ formalRoot: root }),
+    /recall/i,
+  );
+});
+
 test("formal status keeps gates and media private until their verified artifacts exist", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "moving-det-formal-status-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -355,6 +442,19 @@ test("formal status fails closed on an undeclared comparison artifact", async (t
   );
 });
 
+test("formal status refuses completion when declared media bytes differ", async (t) => {
+  const root = await completedFixture(t);
+  await writeFile(
+    join(root, "demo", "videos", "site19-day.mp4"),
+    "tampered media",
+  );
+
+  await assert.rejects(
+    createFormalStatusSnapshot({ formalRoot: root }),
+    /media.*hash|hash.*differs/i,
+  );
+});
+
 test("formal status rejects oversized bounded JSON before parsing it", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "moving-det-formal-status-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -365,6 +465,92 @@ test("formal status rejects oversized bounded JSON before parsing it", async (t)
     createFormalStatusSnapshot({ formalRoot: root }),
     /size limit/,
   );
+});
+
+test("stable bounded reads reject a JSON file that grows after fstat", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "moving-det-formal-status-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const relative = "preflight/report.json";
+  const artifactPath = join(root, relative);
+  await write(root, relative, jsonBytes({ schema_version: 1 }));
+  let grew = false;
+
+  await assert.rejects(
+    readStableBoundedFile({
+      formalRoot: root,
+      relative,
+      maximumBytes: 1024,
+      openFile: async (...arguments_) => {
+        const handle = await openFile(...arguments_);
+        return {
+          stat: (...statArguments) => handle.stat(...statArguments),
+          close: () => handle.close(),
+          read: async (...readArguments) => {
+            if (!grew) {
+              grew = true;
+              await appendFile(artifactPath, " ");
+            }
+            return handle.read(...readArguments);
+          },
+        };
+      },
+    }),
+    /changed|grew|stable/i,
+  );
+  assert.equal(grew, true);
+});
+
+test("formal status cache deduplicates in-flight work and invalidates on signatures", async () => {
+  const formalRoot = `/fixture/cache-${process.pid}-${Date.now()}`;
+  let signature = "signature-1";
+  let calls = 0;
+  let release;
+  const firstSnapshot = new Promise((resolve) => {
+    release = resolve;
+  });
+  const readStatus = createCachedFormalStatusReader({
+    formalRoot,
+    ttlMs: 15_000,
+    now: () => 1_000,
+    signatureFactory: async () => signature,
+    snapshotFactory: async () => {
+      calls += 1;
+      if (calls === 1) return firstSnapshot;
+      return { generation: calls };
+    },
+  });
+
+  const first = readStatus();
+  const concurrent = readStatus();
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  release({ generation: 1 });
+  assert.deepEqual(await Promise.all([first, concurrent]), [
+    { generation: 1 },
+    { generation: 1 },
+  ]);
+  assert.equal((await readStatus()).generation, 1);
+  assert.equal(calls, 1);
+
+  signature = "signature-2";
+  assert.equal((await readStatus()).generation, 2);
+  assert.equal(calls, 2);
+});
+
+test("formal artifact signature includes fixed and demo-declared files", async (t) => {
+  const root = await completedFixture(t);
+  const before = await collectFormalArtifactSignature({ formalRoot: root });
+  const videoPath = join(root, "demo", "videos", "site19-day.mp4");
+  await rename(videoPath, `${videoPath}.old`);
+  await writeFile(videoPath, "mp4-site19-day");
+  const afterMediaSwap = await collectFormalArtifactSignature({ formalRoot: root });
+  assert.notEqual(afterMediaSwap, before);
+
+  const historyPath = join(root, "baseline", "checkpoints", "history.json");
+  await rename(historyPath, `${historyPath}.old`);
+  await writeFile(historyPath, jsonBytes([{ epoch: 0, map50: 0.2 }]));
+  const afterFixedSwap = await collectFormalArtifactSignature({ formalRoot: root });
+  assert.notEqual(afterFixedSwap, afterMediaSwap);
 });
 
 test("formal status rejects symlinked declared files", async (t) => {

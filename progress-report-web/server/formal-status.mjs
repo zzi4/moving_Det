@@ -50,6 +50,16 @@ const COMPARISON_ARTIFACTS = Object.freeze({
   "transitions.jsonl": TRANSITIONS_LIMIT,
   "per_model.csv": JSON_LIMIT,
 });
+const FORMAL_SIGNATURE_PATHS = Object.freeze([
+  "preflight/report.json",
+  "baseline/checkpoints/run.json",
+  "baseline/checkpoints/history.json",
+  "mg-vtod-full/checkpoints/run.json",
+  "mg-vtod-full/checkpoints/history.json",
+  "comparison/run.json",
+  ...Object.keys(COMPARISON_ARTIFACTS).map((name) => `comparison/${name}`),
+  "demo/demo.json",
+]);
 const REQUIRED_CASE_STATES = new Set([
   "rescued",
   "regressed",
@@ -87,12 +97,17 @@ function exactFields(value, expected, label) {
   return value;
 }
 
-function finite(value, label, { nullable = false, minimum = -Infinity } = {}) {
+function finite(
+  value,
+  label,
+  { nullable = false, minimum = -Infinity, maximum = Infinity } = {},
+) {
   if (nullable && value === null) return null;
   if (
     typeof value !== "number" ||
     !Number.isFinite(value) ||
-    value < minimum
+    value < minimum ||
+    value > maximum
   ) {
     throw new TypeError(`${label} must be finite`);
   }
@@ -153,55 +168,241 @@ async function readBoundedRegularFile(
   maximumBytes,
   { optional = false } = {},
 ) {
-  const current = await locateRegularFile(formalRoot, relative, { optional });
-  if (current === null) return null;
-
-  const handle = await open(
-    current,
-    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
-  );
-  try {
-    const fileStat = await handle.stat();
-    if (!fileStat.isFile()) {
-      throw new TypeError(`formal artifact is not a regular file: ${relative}`);
-    }
-    if (fileStat.size > maximumBytes) {
-      throw new RangeError(
-        `formal artifact exceeds size limit (${maximumBytes} bytes): ${relative}`,
-      );
-    }
-    return await handle.readFile();
-  } finally {
-    await handle.close();
-  }
+  return readStableBoundedFile({
+    formalRoot,
+    relative,
+    maximumBytes,
+    optional,
+  });
 }
 
-async function locateRegularFile(
+function statIdentity(value) {
+  return {
+    dev: value.dev,
+    ino: value.ino,
+    size: value.size,
+    mtimeNs:
+      value.mtimeNs ?? BigInt(Math.trunc(Number(value.mtimeMs) * 1_000_000)),
+  };
+}
+
+function sameIdentity(left, right) {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs
+  );
+}
+
+async function locateStableRegularFile(
   formalRoot,
   relative,
   { optional = false } = {},
 ) {
   const parts = safeRelativePath(relative, "formal artifact");
+  const parents = [];
   let current = formalRoot;
   try {
+    const rootStat = await lstat(current, { bigint: true });
+    if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+      throw new TypeError("formal root must be a regular directory, not a symlink");
+    }
+    parents.push({ path: current, identity: statIdentity(rootStat) });
     for (const [index, part] of parts.entries()) {
       current = join(current, part);
-      const entry = await lstat(current);
+      const entry = await lstat(current, { bigint: true });
       if (entry.isSymbolicLink()) {
         throw new TypeError(`formal artifact is a symlink: ${relative}`);
       }
-      if (index < parts.length - 1 && !entry.isDirectory()) {
-        throw new TypeError(`formal artifact parent is not a directory: ${relative}`);
-      }
-      if (index === parts.length - 1 && !entry.isFile()) {
+      if (index < parts.length - 1) {
+        if (!entry.isDirectory()) {
+          throw new TypeError(`formal artifact parent is not a directory: ${relative}`);
+        }
+        parents.push({ path: current, identity: statIdentity(entry) });
+      } else if (!entry.isFile()) {
         throw new TypeError(`formal artifact is not a regular file: ${relative}`);
+      } else {
+        return {
+          path: current,
+          identity: statIdentity(entry),
+          parents,
+        };
       }
     }
   } catch (error) {
     if (optional && missing(error)) return null;
     throw error;
   }
-  return current;
+  throw new TypeError(`formal artifact path is invalid: ${relative}`);
+}
+
+async function verifyLocatedIdentity(located, relative) {
+  for (const parent of located.parents) {
+    const current = await lstat(parent.path, { bigint: true });
+    if (
+      current.isSymbolicLink() ||
+      !current.isDirectory() ||
+      !sameIdentity(parent.identity, statIdentity(current))
+    ) {
+      throw new TypeError(`formal artifact parent changed while reading: ${relative}`);
+    }
+  }
+  const current = await lstat(located.path, { bigint: true });
+  if (
+    current.isSymbolicLink() ||
+    !current.isFile() ||
+    !sameIdentity(located.identity, statIdentity(current))
+  ) {
+    throw new TypeError(`formal artifact changed while reading: ${relative}`);
+  }
+}
+
+function sameLocatedIdentity(left, right) {
+  return (
+    left.path === right.path &&
+    sameIdentity(left.identity, right.identity) &&
+    left.parents.length === right.parents.length &&
+    left.parents.every(
+      (parent, index) =>
+        parent.path === right.parents[index].path &&
+        sameIdentity(parent.identity, right.parents[index].identity),
+    )
+  );
+}
+
+async function hashOpenFile(handle, before, relative) {
+  if (before.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new RangeError(`formal artifact is too large to hash safely: ${relative}`);
+  }
+  const hash = createHash("sha256");
+  let total = 0;
+  while (true) {
+    const buffer = Buffer.allocUnsafe(65_536);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, total);
+    if (bytesRead === 0) break;
+    hash.update(buffer.subarray(0, bytesRead));
+    total += bytesRead;
+  }
+  const after = statIdentity(await handle.stat({ bigint: true }));
+  if (!sameIdentity(before, after) || BigInt(total) !== before.size) {
+    throw new TypeError(`formal artifact changed while hashing: ${relative}`);
+  }
+  return hash.digest("hex");
+}
+
+export async function openVerifiedFormalFile({
+  formalRoot,
+  relative,
+  expectedSha256,
+  expectedVerification = null,
+  openFile = open,
+}) {
+  sha256(expectedSha256, `formal media ${relative}`);
+  const located = await locateStableRegularFile(formalRoot, relative);
+  if (
+    expectedVerification !== null &&
+    !sameLocatedIdentity(expectedVerification, located)
+  ) {
+    throw new TypeError(`formal media identity changed: ${relative}`);
+  }
+  const handle = await openFile(
+    located.path,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const beforeStat = await handle.stat({ bigint: true });
+    const before = statIdentity(beforeStat);
+    if (!beforeStat.isFile() || !sameIdentity(before, located.identity)) {
+      throw new TypeError(`formal media identity changed: ${relative}`);
+    }
+    const actualSha256 = await hashOpenFile(handle, before, relative);
+    if (actualSha256 !== expectedSha256) {
+      throw new TypeError(`formal media hash differs: ${relative}`);
+    }
+    await verifyLocatedIdentity(located, relative);
+    return {
+      handle,
+      path: located.path,
+      size: Number(before.size),
+      sha256: actualSha256,
+      verification: located,
+    };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+export async function verifyFormalFile(options) {
+  const verified = await openVerifiedFormalFile(options);
+  await verified.handle.close();
+  return {
+    path: verified.path,
+    size: verified.size,
+    sha256: verified.sha256,
+    verification: verified.verification,
+  };
+}
+
+export async function readStableBoundedFile({
+  formalRoot,
+  relative,
+  maximumBytes,
+  optional = false,
+  openFile = open,
+}) {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+    throw new TypeError("maximumBytes must be a non-negative safe integer");
+  }
+  const located = await locateStableRegularFile(formalRoot, relative, { optional });
+  if (located === null) return null;
+  const handle = await openFile(
+    located.path,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const beforeStat = await handle.stat({ bigint: true });
+    const before = statIdentity(beforeStat);
+    if (!beforeStat.isFile() || !sameIdentity(before, located.identity)) {
+      throw new TypeError(`formal artifact changed before reading: ${relative}`);
+    }
+    if (before.size > BigInt(maximumBytes)) {
+      throw new RangeError(
+        `formal artifact exceeds size limit (${maximumBytes} bytes): ${relative}`,
+      );
+    }
+
+    const chunks = [];
+    let total = 0;
+    while (total <= maximumBytes) {
+      const buffer = Buffer.allocUnsafe(
+        Math.min(65_536, maximumBytes + 1 - total),
+      );
+      if (buffer.length === 0) break;
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, total);
+      if (bytesRead === 0) break;
+      chunks.push(buffer.subarray(0, bytesRead));
+      total += bytesRead;
+    }
+    if (total > maximumBytes) {
+      throw new RangeError(
+        `formal artifact exceeds size limit (${maximumBytes} bytes): ${relative}`,
+      );
+    }
+
+    const after = statIdentity(await handle.stat({ bigint: true }));
+    if (
+      !sameIdentity(before, after) ||
+      BigInt(total) !== before.size
+    ) {
+      throw new TypeError(`formal artifact changed while reading: ${relative}`);
+    }
+    await verifyLocatedIdentity(located, relative);
+    return Buffer.concat(chunks, total);
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readJson(formalRoot, relative, maximumBytes, options) {
@@ -265,7 +466,7 @@ function validatePreflight(value) {
     value.train_record_count !== 13_998 ||
     !Array.isArray(value.gpu_names) ||
     value.gpu_names.length !== 2 ||
-    !value.gpu_names.every((name) => name === "RTX A6000") ||
+    !value.gpu_names.every((name) => name === "NVIDIA RTX A6000") ||
     typeof value.passed !== "boolean"
   ) {
     throw new TypeError("formal preflight report values are invalid");
@@ -345,12 +546,19 @@ function validateRunReference(value, label) {
     ],
     `${label} run reference`,
   );
+  const expectedProvenance = {
+    baseline: { model_name: "baseline", motion_off: false },
+    mg_full: { model_name: "mg_vtod", motion_off: false },
+    motion_off: { model_name: "mg_vtod", motion_off: true },
+    mg_frozen: { model_name: "mg_vtod", motion_off: false },
+  }[label];
   if (
     typeof value.run_dir !== "string" ||
-    !["baseline", "mg_vtod"].includes(value.model_name) ||
-    typeof value.motion_off !== "boolean"
+    expectedProvenance === undefined ||
+    value.model_name !== expectedProvenance.model_name ||
+    value.motion_off !== expectedProvenance.motion_off
   ) {
-    throw new TypeError(`${label} run reference values are invalid`);
+    throw new TypeError(`${label} run reference provenance is invalid`);
   }
   sha256(value.checkpoint_sha256, `${label} checkpoint`);
   sha256(value.threshold_sha256, `${label} threshold`);
@@ -391,19 +599,35 @@ function reportMetric(value, label) {
   const staticMetrics = plainObject(speed.static, `${label} static metrics`);
   const movingMetrics = plainObject(speed.moving, `${label} moving metrics`);
   return {
-    recall: finite(metrics.recall_riou_025, `${label} recall`, { nullable: true }),
+    recall: finite(metrics.recall_riou_025, `${label} recall`, {
+      nullable: true,
+      minimum: 0,
+      maximum: 1,
+    }),
     precision: finite(metrics.precision_riou_025, `${label} precision`, {
       nullable: true,
+      minimum: 0,
+      maximum: 1,
     }),
-    map50: finite(metrics.map50, `${label} map50`, { nullable: true }),
+    map50: finite(metrics.map50, `${label} map50`, {
+      nullable: true,
+      minimum: 0,
+      maximum: 1,
+    }),
     small_recall: finite(metrics.small_recall_riou_025, `${label} small recall`, {
       nullable: true,
+      minimum: 0,
+      maximum: 1,
     }),
     moving_recall: finite(movingMetrics.recall_riou_025, `${label} moving recall`, {
       nullable: true,
+      minimum: 0,
+      maximum: 1,
     }),
     static_recall: finite(staticMetrics.recall_riou_025, `${label} static recall`, {
       nullable: true,
+      minimum: 0,
+      maximum: 1,
     }),
     median_longest_miss: finite(
       metrics.median_longest_miss,
@@ -413,7 +637,7 @@ function reportMetric(value, label) {
   };
 }
 
-async function readVerifiedComparison(formalRoot) {
+async function readVerifiedComparison(formalRoot, expectedBenchmarkSha256) {
   const run = await readJson(
     formalRoot,
     "comparison/run.json",
@@ -439,6 +663,9 @@ async function readVerifiedComparison(formalRoot) {
     throw new TypeError("formal comparison run identity is invalid");
   }
   sha256(run.human_benchmark_sha256, "formal human benchmark");
+  if (run.human_benchmark_sha256 !== expectedBenchmarkSha256) {
+    throw new TypeError("formal comparison benchmark differs from preflight");
+  }
   integer(run.frame_count, "formal human frame count");
   integer(run.ground_truth_count, "formal human ground-truth count");
   if (run.frame_count !== 873) {
@@ -565,11 +792,19 @@ function mediaUrl(path) {
 }
 
 async function requireDeclaredMediaFile(formalRoot, path, label) {
-  const artifactPath = await locateRegularFile(formalRoot, `demo/${path}`);
+  const relative = `demo/${path}`;
+  const verified = await verifyFormalFile({
+    formalRoot,
+    relative,
+    expectedSha256: label.sha256,
+  });
   return {
     route: mediaUrl(path),
-    path: artifactPath,
+    formalRoot,
+    relative,
+    path: verified.path,
     sha256: label.sha256,
+    verification: verified.verification,
     contentType: path.endsWith(".mp4") ? "video/mp4" : "image/png",
     cacheControl: "private, max-age=3600",
   };
@@ -709,6 +944,119 @@ export async function readFormalDemoManifest({ formalRoot }) {
   return { videos, cases, files };
 }
 
+function serializableLocatedIdentity(located) {
+  const identity = (value) => ({
+    dev: String(value.dev),
+    ino: String(value.ino),
+    size: String(value.size),
+    mtimeNs: String(value.mtimeNs),
+  });
+  return {
+    identity: identity(located.identity),
+    parents: located.parents.map((parent) => ({
+      path: parent.path,
+      identity: identity(parent.identity),
+    })),
+  };
+}
+
+function declaredDemoPaths(manifest) {
+  if (manifest === null) return [];
+  exactFields(manifest, ["schema_version", "fps", "scenes", "cases"], "formal demo");
+  if (!Array.isArray(manifest.scenes) || !Array.isArray(manifest.cases)) {
+    throw new TypeError("formal demo declarations are invalid");
+  }
+  const paths = [];
+  for (const [index, scene] of manifest.scenes.entries()) {
+    const record = plainObject(scene, `formal demo scene ${index}`);
+    safeRelativePath(record.path, `formal demo scene ${index}`);
+    paths.push(`demo/${record.path}`);
+  }
+  for (const [index, item] of manifest.cases.entries()) {
+    const record = plainObject(item, `formal demo case ${index}`);
+    for (const kind of ["panel", "timeline"]) {
+      const media = plainObject(record[kind], `formal demo case ${index} ${kind}`);
+      safeRelativePath(media.path, `formal demo case ${index} ${kind}`);
+      paths.push(`demo/${media.path}`);
+    }
+  }
+  return paths;
+}
+
+export async function collectFormalArtifactSignature({ formalRoot }) {
+  const manifest = await readJson(
+    formalRoot,
+    "demo/demo.json",
+    JSON_LIMIT,
+    { optional: true },
+  );
+  const relatives = [
+    ...FORMAL_SIGNATURE_PATHS,
+    ...declaredDemoPaths(manifest),
+  ];
+  const signatures = [];
+  for (const relative of [...new Set(relatives)].sort()) {
+    const located = await locateStableRegularFile(formalRoot, relative, {
+      optional: true,
+    });
+    signatures.push([
+      relative,
+      located === null ? null : serializableLocatedIdentity(located),
+    ]);
+  }
+  return JSON.stringify(signatures);
+}
+
+const formalStatusCache = new Map();
+
+export function createCachedFormalStatusReader({
+  formalRoot,
+  ttlMs = 15_000,
+  now = () => Date.now(),
+  signatureFactory = collectFormalArtifactSignature,
+  snapshotFactory = createFormalStatusSnapshot,
+}) {
+  if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+    throw new TypeError("ttlMs must be a non-negative finite number");
+  }
+  let entry = formalStatusCache.get(formalRoot);
+  if (entry === undefined) {
+    entry = { cached: null, inFlight: null };
+    formalStatusCache.set(formalRoot, entry);
+  }
+
+  return function readFormalStatus() {
+    if (entry.inFlight !== null) return entry.inFlight;
+    const task = (async () => {
+      const beforeSignature = await signatureFactory({ formalRoot });
+      const currentTime = now();
+      if (
+        entry.cached !== null &&
+        currentTime - entry.cached.measuredAt < ttlMs &&
+        entry.cached.signature === beforeSignature
+      ) {
+        return entry.cached.value;
+      }
+      const value = await snapshotFactory({ formalRoot });
+      const afterSignature = await signatureFactory({ formalRoot });
+      if (beforeSignature !== afterSignature) {
+        throw new TypeError("formal artifacts changed while refreshing status");
+      }
+      entry.cached = {
+        measuredAt: now(),
+        signature: afterSignature,
+        value,
+      };
+      return value;
+    })();
+    entry.inFlight = task;
+    void task.finally(() => {
+      if (entry.inFlight === task) entry.inFlight = null;
+    }).catch(() => {});
+    return task;
+  };
+}
+
 function emptyModels() {
   return { baseline: null, mg_vtod_full: null };
 }
@@ -747,7 +1095,7 @@ export async function createFormalStatusSnapshot({ formalRoot, now = new Date() 
   const [baseline, mgFull, comparison] = await Promise.all([
     readTrainingState(formalRoot, "baseline"),
     readTrainingState(formalRoot, "mg-vtod-full"),
-    readVerifiedComparison(formalRoot),
+    readVerifiedComparison(formalRoot, preflight.human_benchmark_sha256),
   ]);
   const demo = comparison === null ? null : await readFormalDemoManifest({ formalRoot });
   const stages = FORMAL_STAGE_NAMES.map((name) => stage(name));
@@ -756,6 +1104,9 @@ export async function createFormalStatusSnapshot({ formalRoot, now = new Date() 
   Object.assign(byName.baseline, baseline);
   Object.assign(byName.mg_vtod_full, mgFull);
   if (comparison !== null) {
+    if (baseline.state === "failed" || mgFull.state === "failed") {
+      throw new TypeError("formal comparison contradicts failed training state");
+    }
     for (const name of [
       "baseline",
       "baseline_validation",

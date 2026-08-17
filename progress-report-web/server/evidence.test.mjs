@@ -4,17 +4,20 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createServer } from "node:http";
 import test from "node:test";
 
 import {
   createEvidenceFiles,
   createFormalEvidenceFiles,
+  serveFormalEvidence,
 } from "./evidence.mjs";
 
 function digest(value) {
@@ -91,6 +94,26 @@ async function formalMediaFixture(t) {
   return root;
 }
 
+async function evidenceServer(t, evidence) {
+  const server = createServer(async (request, response) => {
+    try {
+      await serveFormalEvidence({ request, response, evidence });
+    } catch {
+      if (!response.headersSent) response.statusCode = 404;
+      response.end("Evidence file is not available");
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  assert.notEqual(address, null);
+  assert.equal(typeof address, "object");
+  return `http://127.0.0.1:${address.port}`;
+}
+
 test("exposes generated pipeline visuals through the evidence allowlist", () => {
   const files = createEvidenceFiles({
     projectPath: "/project/report",
@@ -149,7 +172,99 @@ test("formal evidence allowlists only three declared MP4s and declared case imag
   );
   assert.equal(files.has("/formal-evidence/videos/undeclared.mp4"), false);
   assert.equal(files.has("/formal-evidence/checkpoints/best.pt"), false);
+  assert.equal(files.has("/formal-evidence/videos/%2e%2e/site19-day.mp4"), false);
+  assert.equal(files.has("/formal-evidence/videos/../site19-day.mp4"), false);
   assert.ok([...files.values()].every((entry) => !entry.path.endsWith(".pt")));
+});
+
+test("formal evidence serves one byte range and HEAD from the verified FD", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const evidence = (await createFormalEvidenceFiles({ formalRoot })).get(
+    "/formal-evidence/videos/site19-day.mp4",
+  );
+  const origin = await evidenceServer(t, evidence);
+
+  const partial = await fetch(`${origin}/video`, {
+    headers: { Range: "bytes=1-3" },
+  });
+  assert.equal(partial.status, 206);
+  assert.equal(partial.headers.get("accept-ranges"), "bytes");
+  assert.equal(partial.headers.get("content-range"), "bytes 1-3/10");
+  assert.equal(partial.headers.get("content-length"), "3");
+  assert.equal(await partial.text(), "ite");
+
+  const head = await fetch(`${origin}/video`, {
+    method: "HEAD",
+    headers: { Range: "bytes=-4" },
+  });
+  assert.equal(head.status, 206);
+  assert.equal(head.headers.get("content-range"), "bytes 6-9/10");
+  assert.equal(head.headers.get("content-length"), "4");
+  assert.equal(await head.text(), "");
+
+  const invalid = await fetch(`${origin}/video`, {
+    headers: { Range: "bytes=0-1,3-4" },
+  });
+  assert.equal(invalid.status, 416);
+  assert.equal(invalid.headers.get("content-range"), "bytes */10");
+  assert.equal(invalid.headers.get("content-length"), "0");
+});
+
+test("formal evidence rejects file and parent identity swaps after allowlisting", async (t) => {
+  for (const replacement of ["file", "parent"]) {
+    const formalRoot = await formalMediaFixture(t);
+    const evidence = (await createFormalEvidenceFiles({ formalRoot })).get(
+      "/formal-evidence/videos/site19-day.mp4",
+    );
+    const videoPath = join(formalRoot, "demo", "videos", "site19-day.mp4");
+    if (replacement === "file") {
+      await rename(videoPath, `${videoPath}.old`);
+      await writeFile(videoPath, "site19-day");
+    } else {
+      const videosPath = join(formalRoot, "demo", "videos");
+      await rename(videosPath, `${videosPath}.old`);
+      await mkdir(videosPath);
+      await writeFile(videoPath, "site19-day");
+    }
+    const origin = await evidenceServer(t, evidence);
+    const response = await fetch(`${origin}/video`);
+    assert.equal(response.status, 404, replacement);
+  }
+});
+
+test("formal evidence rechecks media bytes and symlinks when serving", async (t) => {
+  for (const replacement of ["bytes", "symlink"]) {
+    const formalRoot = await formalMediaFixture(t);
+    const evidence = (await createFormalEvidenceFiles({ formalRoot })).get(
+      "/formal-evidence/videos/site19-day.mp4",
+    );
+    const videoPath = join(formalRoot, "demo", "videos", "site19-day.mp4");
+    if (replacement === "bytes") {
+      await writeFile(videoPath, "XXXXXXXXXX");
+    } else {
+      await rm(videoPath);
+      await symlink(
+        join(formalRoot, "demo", "videos", "site22-day.mp4"),
+        videoPath,
+      );
+    }
+    const origin = await evidenceServer(t, evidence);
+    const response = await fetch(`${origin}/video`);
+    assert.equal(response.status, 404, replacement);
+  }
+});
+
+test("formal evidence refuses to allowlist media with the wrong bytes", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  await writeFile(
+    join(formalRoot, "demo", "videos", "site19-day.mp4"),
+    "tampered media",
+  );
+
+  await assert.rejects(
+    createFormalEvidenceFiles({ formalRoot }),
+    /media.*hash|hash.*differs/i,
+  );
 });
 
 test("formal evidence rejects traversal, checkpoint declarations, and symlinks", async (t) => {

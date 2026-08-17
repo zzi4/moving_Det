@@ -31,6 +31,13 @@ const emptyReport: FormalReport = Object.freeze({
   limitation,
 });
 
+const formalRefreshError =
+  "正式状态读取失败；当前页面不展示未经验证的 gate 或媒体。";
+
+export function formalRefreshFailure() {
+  return Object.freeze({ report: emptyReport, error: formalRefreshError });
+}
+
 const stageLabels: Readonly<Record<string, string>> = {
   preflight: "输入预检",
   baseline: "Baseline 训练",
@@ -108,6 +115,8 @@ function FormalStateBadge({ state }: { state: FormalState }) {
 }
 
 export function FormalReportView({ report }: { report: FormalReport }) {
+  const gateState =
+    report.gate === null ? "pending" : report.gate.passed ? "passed" : "failed";
   const conclusion =
     report.gate === null
       ? "正式 comparison 尚未验证，gate 暂不公开"
@@ -215,7 +224,7 @@ export function FormalReportView({ report }: { report: FormalReport }) {
         </div>
       </article>
 
-      <article className={`formal-gate formal-gate-${report.gate?.passed ? "passed" : "failed"}`}>
+      <article className={`formal-gate formal-gate-${gateState}`}>
         <header>
           <div>
             <p className="micro-label">PRIMARY DECISION</p>
@@ -275,7 +284,12 @@ export function FormalReportView({ report }: { report: FormalReport }) {
           <div className="formal-video-grid">
             {report.videos.map((video) => (
               <figure key={video.scene}>
-                <video controls preload="metadata" src={video.src}>
+                <video
+                  aria-label={`${video.scene} 本地对比视频`}
+                  controls
+                  preload="metadata"
+                  src={video.src}
+                >
                   浏览器不支持本地 MP4 播放。
                 </video>
                 <figcaption>
@@ -301,7 +315,9 @@ export function FormalReportView({ report }: { report: FormalReport }) {
         ) : (
           <div className="formal-case-grid">
             {report.cases.map((item) => (
-              <figure key={`${item.state}-${item.site}-${item.sequence}-${item.frame}`}>
+              <figure key={item.src}>
+                {/* Local, hash-verified evidence is served without an image optimizer. */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={item.src}
                   alt={`${caseLabels[item.state]}：${item.site} / ${item.sequence} / frame ${item.frame}`}
@@ -328,8 +344,8 @@ export function FormalReportLive() {
   useEffect(() => {
     let active = true;
     let pending: AbortController | null = null;
+    let timer: number | null = null;
     async function refresh() {
-      pending?.abort();
       pending = new AbortController();
       try {
         const response = await fetch("/api/formal-status", {
@@ -344,16 +360,19 @@ export function FormalReportLive() {
         }
       } catch (caught) {
         if (active && !(caught instanceof DOMException && caught.name === "AbortError")) {
-          setError("正式状态读取失败；当前页面不展示未经验证的 gate 或媒体。" );
+          const failure = formalRefreshFailure();
+          setReport(failure.report);
+          setError(failure.error);
         }
+      } finally {
+        if (active) timer = window.setTimeout(refresh, 15_000);
       }
     }
     void refresh();
-    const timer = window.setInterval(refresh, 15_000);
     return () => {
       active = false;
       pending?.abort();
-      window.clearInterval(timer);
+      if (timer !== null) window.clearTimeout(timer);
     };
   }, []);
 

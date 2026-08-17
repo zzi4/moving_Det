@@ -232,7 +232,9 @@ function validateModel(value: unknown, label: string): FormalModelEvidence | nul
     ["threshold", "threshold_sha256", "checkpoint_sha256"],
     label,
   );
-  const threshold = finite(model.threshold, `${label} threshold`) as number;
+  const threshold = finite(model.threshold, `${label} threshold`, {
+    minimum: 0,
+  }) as number;
   if (threshold > 1) throw new TypeError(`${label} threshold is outside [0, 1]`);
   return Object.freeze({
     threshold,
@@ -256,7 +258,10 @@ function validateMetricRow(value: unknown, label: string): FormalMetricRow {
     label,
   );
   const probability = (field: string) => {
-    const result = finite(metric[field], `${label} ${field}`, { nullable: true });
+    const result = finite(metric[field], `${label} ${field}`, {
+      nullable: true,
+      minimum: 0,
+    });
     if (result !== null && result > 1) {
       throw new TypeError(`${label} ${field} is outside [0, 1]`);
     }
@@ -365,6 +370,7 @@ function validateCases(value: unknown, reportState: FormalState): readonly Forma
     throw new TypeError("formal cases are unavailable before completion");
   }
   const observed = new Set<FormalCase["state"]>();
+  const sources = new Set<string>();
   const cases = value.map((item, index) => {
     const row = exact(
       item,
@@ -378,13 +384,18 @@ function validateCases(value: unknown, reportState: FormalState): readonly Forma
     observed.add(caseState);
     const classId = integer(row.classId, `formal case ${index} class`) as 0 | 1 | 2 | 3;
     if (classId > 3) throw new TypeError(`formal case ${index} class is invalid`);
+    const src = mediaUrl(row.src, ".png", `formal case ${index}`);
+    if (sources.has(src)) {
+      throw new TypeError("formal case src values must be unique");
+    }
+    sources.add(src);
     return Object.freeze({
       state: caseState,
       classId,
       site: text(row.site, `formal case ${index} site`),
       sequence: text(row.sequence, `formal case ${index} sequence`),
       frame: integer(row.frame, `formal case ${index} frame`),
-      src: mediaUrl(row.src, ".png", `formal case ${index}`),
+      src,
     });
   });
   if (
