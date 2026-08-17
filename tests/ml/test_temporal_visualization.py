@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from pathlib import Path
 import subprocess
@@ -12,6 +13,7 @@ from moving_det.ml.visualization import (
     PanelOBB,
     PanelSample,
     render_temporal_panel,
+    render_temporal_panel_image,
 )
 from moving_det.models import OBB
 
@@ -127,6 +129,44 @@ def test_temporal_panel_contains_three_aligned_model_columns_and_supports(
     for color in (teal, orange, red):
         distance = np.abs(pixels.astype(np.int16) - color).sum(axis=2)
         assert int(distance.min()) < 90
+
+
+def test_native_two_model_panel_keeps_five_supports_without_lstfe(
+    panel_sample,
+    monkeypatch,
+):
+    import moving_det.ml.visualization as visualization
+
+    keep = (0, 1, 3, 5, 6)
+    sample = replace(
+        panel_sample,
+        frames=tuple(panel_sample.frames[index] for index in keep),
+        frame_offsets=(-30, -15, 0, 15, 30),
+        display_models=("baseline", "mg_vtod"),
+        checkpoint_sha256={
+            "baseline": "b" * 64,
+            "mg_vtod": "c" * 64,
+        },
+    )
+    titles = []
+    real_column = visualization._model_column
+
+    def tracked_column(*args, **kwargs):
+        titles.append(args[1])
+        return real_column(*args, **kwargs)
+
+    monkeypatch.setattr(visualization, "_model_column", tracked_column)
+
+    image = render_temporal_panel_image(sample)
+
+    assert image.size == (1920, 1080)
+    assert titles == ["Baseline", "MG-VTOD-OBB"]
+    pixels = np.asarray(image)
+    support_centers = tuple(
+        tuple(int(value) for value in pixels[95, x])
+        for x in (210, 585, 960, 1335, 1710)
+    )
+    assert len(set(support_centers)) == 5
 
 
 def test_temporal_panel_is_byte_deterministic(tmp_path, panel_sample):

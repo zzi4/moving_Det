@@ -20,7 +20,7 @@ from moving_det.ml.human_benchmark_artifacts import load_human_benchmark
 from moving_det.ml.visualization import (
     PanelOBB,
     PanelSample,
-    render_temporal_panel,
+    render_temporal_panel_image,
 )
 
 
@@ -136,6 +136,10 @@ class FormalTransitionEvidence:
     baseline_by_truth: Mapping[tuple[str, str, int, int, int, int], object]
     mg_by_truth: Mapping[tuple[str, str, int, int, int, int], object]
     mg_false_positives: Mapping[tuple[object, ...], object]
+    baseline_predictions: tuple[object, ...]
+    mg_predictions: tuple[object, ...]
+    baseline_true_predictions: frozenset[tuple[object, ...]]
+    mg_true_predictions: frozenset[tuple[object, ...]]
 
 
 @dataclass(frozen=True)
@@ -172,6 +176,7 @@ def select_formal_cases(
                     -1 if row.get("track_id") is None else int(row["track_id"]),
                     0 if row.get("visible_span") is None else int(row["visible_span"]),
                     int(row["frame"]),
+                    _false_positive_identity(row),
                 )
             )
             winner = pool.pop(0)
@@ -377,6 +382,10 @@ def _validate_transition_row(row: dict[str, object]) -> Mapping[str, object]:
                 or not math.isfinite(float(value))
                 for value in obb
             )
+            or float(obb[2]) <= 0
+            or float(obb[3]) <= 0
+            or float(obb[2]) < float(obb[3])
+            or not -math.pi / 2 <= float(obb[4]) < math.pi / 2
             or isinstance(tile, (str, bytes))
             or not isinstance(tile, Sequence)
             or len(tile) != 4
@@ -402,6 +411,30 @@ def _validate_transition_row(row: dict[str, object]) -> Mapping[str, object]:
         ):
             raise ValueError("formal ground-truth transition is invalid")
     return MappingProxyType(dict(row))
+
+
+def _false_positive_identity(row: Mapping[str, object]) -> tuple[object, ...]:
+    if row.get("state") != "new_false_positive":
+        return ()
+    confidence = row.get("confidence")
+    obb = row.get("obb")
+    tile = row.get("tile_xywh")
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or isinstance(obb, (str, bytes))
+        or not isinstance(obb, Sequence)
+        or len(obb) != 5
+        or isinstance(tile, (str, bytes))
+        or not isinstance(tile, Sequence)
+        or len(tile) != 4
+    ):
+        raise ValueError("formal false-positive identity is invalid")
+    return (
+        float(confidence),
+        *(float(value) for value in obb),
+        *(int(value) for value in tile),
+    )
 
 
 def _validate_comparison_run_reference(
@@ -519,6 +552,7 @@ def load_verified_comparison(path: Path) -> VerifiedComparison:
             row["track_id"],
             row["visible_span"],
             row["class_id"],
+            _false_positive_identity(row),
         )
         for row in rows
     ]
@@ -593,30 +627,21 @@ def load_verified_run(
         split="test",
         human_benchmark=True,
     )
-    if "diagnostics.jsonl" not in schemas:
-        raise ValueError("formal evaluation diagnostics are missing")
+    if "diagnostics.bin" not in schemas or "diagnostics.jsonl" in schemas:
+        raise ValueError(
+            "formal human evaluation requires compact binary diagnostics"
+        )
     expected_names = {"run.json", *schemas}
     if {entry.name for entry in root.iterdir()} != expected_names:
         raise ValueError("formal evaluation artifact set is invalid")
     contents = {}
     for name in sorted(schemas):
+        if name == "diagnostics.bin":
+            continue
         content = _read_stable_bytes(root / name, label=f"formal evaluation {name}")
         if hashlib.sha256(content).hexdigest() != digests[name]:
             raise ValueError(f"formal evaluation artifact hash mismatch: {name}")
         contents[name] = content
-    after = root.stat()
-    if (
-        before.st_dev,
-        before.st_ino,
-        before.st_mtime_ns,
-        before.st_ctime_ns,
-    ) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_mtime_ns,
-        after.st_ctime_ns,
-    ) or {entry.name for entry in root.iterdir()} != expected_names:
-        raise ValueError("formal evaluation directory changed while loading")
     detection_frames = evaluation_contract._normalize_frame_keys(
         run["detection_frame_keys"]
     )
@@ -649,11 +674,14 @@ def load_verified_run(
         universe=universe,
         benchmark=benchmark,
     )
-    diagnostics = evaluation_contract._validate_diagnostic_rows(
-        _jsonl_objects(
-            contents["diagnostics.jsonl"],
-            label="formal diagnostics",
-        ),
+    frozen_identities = tuple(
+        (str(row["site"]), str(row["sequence"]), int(row["frame"]))
+        for row in run["detection_frame_keys"]
+    )
+    diagnostics = evaluation_contract._read_diagnostic_archive(
+        root / "diagnostics.bin",
+        expected_sha256=digests["diagnostics.bin"],
+        expected_identities=frozen_identities,
         universe=universe,
         model_name=expected_model,
         image_root=Path(str(run["image_root"])),
@@ -661,11 +689,20 @@ def load_verified_run(
         human_benchmark=True,
         expected_motion_enabled=True,
     )
+    after = root.stat()
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) or {entry.name for entry in root.iterdir()} != expected_names:
+        raise ValueError("formal evaluation directory changed while loading")
     diagnostic_identities = tuple(_frame_identity(row) for row in diagnostics)
-    frozen_identities = tuple(
-        (str(row["site"]), str(row["sequence"]), int(row["frame"]))
-        for row in run["detection_frame_keys"]
-    )
     if diagnostic_identities != frozen_identities:
         raise ValueError("formal diagnostics are incomplete")
     metrics = _json_object(
@@ -1005,9 +1042,9 @@ def _frame_identity(row: object) -> tuple[str, str, int]:
 
 
 def _group_rows(
-    rows: Sequence[Mapping[str, object]],
-) -> Mapping[tuple[str, str, int], tuple[Mapping[str, object], ...]]:
-    grouped: dict[tuple[str, str, int], list[Mapping[str, object]]] = {}
+    rows: Sequence[object],
+) -> Mapping[tuple[str, str, int], tuple[object, ...]]:
+    grouped: dict[tuple[str, str, int], list[object]] = {}
     for row in rows:
         grouped.setdefault(_frame_identity(row), []).append(row)
     return {key: tuple(value) for key, value in grouped.items()}
@@ -1072,11 +1109,9 @@ def verify_formal_transitions(
     comparison_rows: Sequence[Mapping[str, object]],
 ) -> FormalTransitionEvidence:
     """Recompute comparison cases and preserve the official match assignment."""
-    from moving_det.ml.evaluation import match_detections
     from moving_det.ml.human_evaluation import (
-        _as_ground_truth,
+        assign_human_predictions,
         paired_human_transitions,
-        suppress_ignored_predictions,
     )
 
     if baseline.threshold is None or mg_full.threshold is None:
@@ -1155,22 +1190,15 @@ def verify_formal_transitions(
             "formal comparison transitions differ from verified run predictions"
         )
 
-    ground_truth = _as_ground_truth(tuple(benchmark.truths))
-
-    def matched_evidence(
-        ranked: tuple[object, ...],
-        threshold: float,
-    ) -> tuple[
+    def matched_evidence(assignment: object) -> tuple[
         dict[tuple[str, str, int, int, int, int], object],
-        tuple[object, ...],
-        object,
+        frozenset[tuple[object, ...]],
     ]:
-        unsuppressed, _ = suppress_ignored_predictions(ranked, benchmark.ignores)
-        fixed = tuple(row for row in unsuppressed if row.confidence >= threshold)
-        matched = match_detections(fixed, ground_truth, 0.25)
         by_truth = {}
-        for prediction_index, truth_index in matched.prediction_to_gt.items():
-            truth = benchmark.truths[truth_index]
+        true_predictions = set()
+        for prediction_index, truth_index in assignment.matches.prediction_to_gt.items():
+            truth = assignment.truths[truth_index]
+            prediction = assignment.predictions[prediction_index]
             by_truth[
                 (
                     truth.site,
@@ -1180,26 +1208,39 @@ def verify_formal_transitions(
                     truth.visible_span,
                     truth.class_id,
                 )
-            ] = fixed[prediction_index]
-        return by_truth, fixed, matched
+            ] = prediction
+            true_predictions.add(_detection_identity(prediction))
+        return by_truth, frozenset(true_predictions)
 
-    baseline_by_truth, _, _ = matched_evidence(
+    baseline_assignment = assign_human_predictions(
         baseline_ranked,
+        benchmark,
         baseline.threshold,
+        label="baseline",
     )
-    mg_by_truth, mg_fixed, mg_matched = matched_evidence(
+    mg_assignment = assign_human_predictions(
         mg_ranked,
+        benchmark,
         mg_full.threshold,
+        label="candidate",
     )
+    baseline_by_truth, baseline_true_predictions = matched_evidence(
+        baseline_assignment
+    )
+    mg_by_truth, mg_true_predictions = matched_evidence(mg_assignment)
     mg_false_positives = {
         _detection_identity(row): row
-        for index, row in enumerate(mg_fixed)
-        if not mg_matched.prediction_is_true_positive[index]
+        for index, row in enumerate(mg_assignment.predictions)
+        if not mg_assignment.matches.prediction_is_true_positive[index]
     }
     return FormalTransitionEvidence(
         baseline_by_truth=MappingProxyType(baseline_by_truth),
         mg_by_truth=MappingProxyType(mg_by_truth),
         mg_false_positives=MappingProxyType(mg_false_positives),
+        baseline_predictions=baseline_assignment.predictions,
+        mg_predictions=mg_assignment.predictions,
+        baseline_true_predictions=baseline_true_predictions,
+        mg_true_predictions=mg_true_predictions,
     )
 
 
@@ -1266,19 +1307,25 @@ def _draw_scaled_obbs(
 
 
 def _scene_panel(
-    current_path: Path,
+    current_array: object,
     *,
     key: tuple[str, str, int],
     truths: Sequence[object],
     baseline: Sequence[Mapping[str, object]],
     mg_full: Sequence[Mapping[str, object]],
     diagnostic: Mapping[str, object],
-    image_paths: Mapping[Path, Path],
+    support_thumbnails: Mapping[Path, object],
 ) -> object:
     import numpy as np
     from PIL import Image, ImageDraw
 
-    current_array = _rgb(current_path)
+    if (
+        not isinstance(current_array, np.ndarray)
+        or current_array.ndim != 3
+        or current_array.shape[2] != 3
+        or current_array.dtype != np.dtype(np.uint8)
+    ):
+        raise ValueError("formal current image must be a uint8 RGB array")
     source_height, source_width = current_array.shape[:2]
     current = Image.fromarray(current_array)
     canvas = Image.new("RGB", (1920, 1080), (9, 12, 17))
@@ -1306,9 +1353,10 @@ def _scene_panel(
         support = (
             Image.new("RGB", (support_width, 135), (0, 0, 0))
             if path_value is None
-            else Image.open(_image_for_path(path_value, image_paths)).convert("RGB")
+            else support_thumbnails.get(Path(path_value))
         )
-        support.thumbnail((support_width, 135), Image.Resampling.LANCZOS)
+        if support is None:
+            raise ValueError("formal support thumbnail cache is incomplete")
         x = 24 + index * 232
         canvas.paste(support, (x, 52))
         draw.text((x + 3, 190), "t" if offset == 0 else f"t{int(offset):+d}", fill=(220, 224, 230))
@@ -1389,6 +1437,8 @@ def render_scene_sequences(
     destination: Path,
     image_paths: Mapping[Path, Path] | None = None,
 ) -> Mapping[str, tuple[Path, ...]]:
+    from PIL import Image
+
     if not isinstance(baseline_run, VerifiedRun) or not isinstance(mg_run, VerifiedRun):
         raise ValueError("formal scene rendering requires verified runs")
     if image_paths is None:
@@ -1419,26 +1469,56 @@ def render_scene_sequences(
         seen_names.add(sequence)
         scene_root = root / sequence
         scene_root.mkdir()
+        ordered_frames = tuple(sorted(frames, key=lambda row: int(row.frame)))
+        scene_diagnostics = tuple(
+            diagnostics[(site, sequence, int(frame.frame))]
+            for frame in ordered_frames
+        )
+        support_sources: dict[Path, Path] = {}
+        for diagnostic in scene_diagnostics:
+            support_paths = diagnostic.get("support_paths")
+            if isinstance(support_paths, (str, bytes)) or not isinstance(
+                support_paths,
+                Sequence,
+            ):
+                raise ValueError("formal MG Full support diagnostics are incomplete")
+            for path_value in support_paths[:8]:
+                if path_value is None:
+                    continue
+                source = _image_for_path(path_value, image_paths)
+                support_sources[Path(path_value)] = source
+        if len(set(support_sources.values())) > len(ordered_frames):
+            raise ValueError("formal scene support thumbnail cache exceeds scene frames")
+        thumbnails_by_source = {}
+        for source in sorted(set(support_sources.values()), key=str):
+            thumbnail = Image.fromarray(_rgb(source))
+            thumbnail.thumbnail((220, 135), Image.Resampling.LANCZOS)
+            thumbnails_by_source[source] = thumbnail
+        support_thumbnails = {
+            original: thumbnails_by_source[source]
+            for original, source in support_sources.items()
+        }
         paths = []
-        for index, frame in enumerate(sorted(frames, key=lambda row: int(row.frame))):
+        for index, frame in enumerate(ordered_frames):
             key = (site, sequence, int(frame.frame))
             if key not in diagnostics:
                 raise ValueError("formal MG Full diagnostics are missing a scene frame")
             current_path = _image_for_path(frame.image_path, image_paths)
             panel = _scene_panel(
-                current_path,
+                _rgb(current_path),
                 key=key,
                 truths=truth_index.get(key, ()),
                 baseline=baseline_index.get(key, ()),
                 mg_full=mg_index.get(key, ()),
                 diagnostic=diagnostics[key],
-                image_paths=image_paths,
+                support_thumbnails=support_thumbnails,
             )
             path = scene_root / f"{index:06d}.png"
             panel.save(path, format="PNG", optimize=False, compress_level=9)
             paths.append(path)
         require_contiguous_numbered_frames(paths)
         outputs[sequence] = tuple(paths)
+        support_thumbnails.clear()
     return MappingProxyType(outputs)
 
 
@@ -1449,7 +1529,6 @@ def render_case_panels(
 ) -> tuple[Path, ...]:
     import numpy as np
     from PIL import Image, ImageDraw
-    from moving_det.geometry.obb import rotated_iou
     from moving_det.models import OBB
 
     if not isinstance(comparison, DemoEvidence):
@@ -1459,8 +1538,8 @@ def render_case_panels(
         raise ValueError("formal case rendering requires verified transition evidence")
     transition_evidence = evidence.transitions
     benchmark = evidence.benchmark
-    baseline_predictions = _group_rows(evidence.baseline.predictions)
-    mg_predictions = _group_rows(evidence.mg_full.predictions)
+    baseline_predictions = _group_rows(transition_evidence.baseline_predictions)
+    mg_predictions = _group_rows(transition_evidence.mg_predictions)
     mg_diagnostics = _diagnostic_rows(evidence.mg_full.diagnostics)
     truth_by_key = _group_rows(benchmark.truths)
     frames_by_scene: dict[tuple[str, str], list[object]] = {}
@@ -1479,40 +1558,34 @@ def render_case_panels(
         )
 
     def matched_rows(
-        prediction_rows: Sequence[Mapping[str, object]],
+        prediction_rows: Sequence[object],
         truth_rows: Sequence[object],
         tile: Sequence[int],
+        true_predictions: frozenset[tuple[object, ...]],
+        by_truth: Mapping[tuple[str, str, int, int, int, int], object],
     ) -> tuple[PanelOBB, ...]:
-        matched = set()
         result = []
-        for prediction_index, row in enumerate(
-            sorted(
-                prediction_rows,
-                key=lambda item: (-float(item["confidence"]), int(item["class_id"])),
-            )
-        ):
-            geometry = _obb(row["obb"])
-            candidates = [
-                (index, rotated_iou(geometry, truth.obb))
-                for index, truth in enumerate(truth_rows)
-                if index not in matched and truth.class_id == int(row["class_id"])
-            ]
-            best = max(candidates, key=lambda item: (item[1], -item[0])) if candidates else None
-            state = "fp"
-            if best is not None and best[1] >= 0.25:
-                matched.add(best[0])
-                state = "tp"
+        for row in prediction_rows:
+            identity = _detection_identity(row)
             result.append(
                 PanelOBB(
-                    local_obb(geometry, tile),
-                    class_id=int(row["class_id"]),
-                    confidence=float(row["confidence"]),
-                    match_state=state,
-                    identity=f"prediction-{prediction_index}",
+                    local_obb(row.obb, tile),
+                    class_id=int(row.class_id),
+                    confidence=float(row.confidence),
+                    match_state="tp" if identity in true_predictions else "fp",
+                    identity=f"prediction-{identity!r}",
                 )
             )
-        for index, truth in enumerate(truth_rows):
-            if index not in matched:
+        for truth in truth_rows:
+            identity = (
+                truth.site,
+                truth.sequence,
+                truth.frame,
+                truth.track_id,
+                truth.visible_span,
+                truth.class_id,
+            )
+            if identity not in by_truth:
                 result.append(
                     PanelOBB(
                         local_obb(truth.obb, tile),
@@ -1535,7 +1608,9 @@ def render_case_panels(
             (
                 row
                 for row in truth_by_key.get(key, ())
-                if row.track_id == case.track_id and row.class_id == case.class_id
+                if row.track_id == case.track_id
+                and row.visible_span == case.visible_span
+                and row.class_id == case.class_id
             ),
             None,
         )
@@ -1649,8 +1724,20 @@ def render_case_panels(
             frame_offsets=offsets,
             long_candidate_offsets=long_offsets,
             ground_truth=ground_truth,
-            baseline=matched_rows(baseline_predictions.get(key, ()), truth_rows, tile),
-            mg_vtod=matched_rows(mg_predictions.get(key, ()), truth_rows, tile),
+            baseline=matched_rows(
+                baseline_predictions.get(key, ()),
+                truth_rows,
+                tile,
+                transition_evidence.baseline_true_predictions,
+                transition_evidence.baseline_by_truth,
+            ),
+            mg_vtod=matched_rows(
+                mg_predictions.get(key, ()),
+                truth_rows,
+                tile,
+                transition_evidence.mg_true_predictions,
+                transition_evidence.mg_by_truth,
+            ),
             lstfe=(),
             motion_map=motion_map,
             selected_long_index=-1,
@@ -1662,13 +1749,12 @@ def render_case_panels(
             checkpoint_sha256={
                 "baseline": str(evidence.baseline.run["checkpoint_sha256"]),
                 "mg_vtod": str(evidence.mg_full.run["checkpoint_sha256"]),
-                "lstfe": "0" * 64,
             },
+            display_models=("baseline", "mg_vtod"),
             source_roots=(),
         )
         safe = f"{index:02d}-{case.state}-{case.site}-{case.sequence}-{case.frame:06d}"
-        temporary_panel = root / f".{safe}.jpg"
-        render_temporal_panel(sample, temporary_panel)
+        native_panel = render_temporal_panel_image(sample)
 
         scene_frames = sorted(
             frames_by_scene.get((case.site, case.sequence), ()),
@@ -1717,10 +1803,8 @@ def render_case_panels(
             root / f"{safe}-timeline.png",
             first_frame=first_frame,
         )
-        with Image.open(temporary_panel) as rendered:
-            two_model = rendered.convert("RGB").crop((0, 0, 1280, 890))
-        panel = Image.new("RGB", (1280, 1080), (9, 12, 17))
-        panel.paste(two_model, (0, 0))
+        panel = Image.new("RGB", (1920, 1260), (9, 12, 17))
+        panel.paste(native_panel, (0, 0))
         draw = ImageDraw.Draw(panel)
         selected_truth = next(
             (
@@ -1762,16 +1846,18 @@ def render_case_panels(
             else 0.0
         )
         draw.text(
-            (24, 902),
+            (24, 1090),
             f"{case.state} | class {case.class_id} | track {case.track_id} | confidence {confidence:.3f} | short side {short_side:.1f}px | speed {speed:.3f}px/frame",
             fill=(240, 243, 247),
         )
         with Image.open(timeline) as timeline_image:
-            expanded = timeline_image.convert("RGB").resize((1232, 140), Image.Resampling.NEAREST)
-        panel.paste(expanded, (24, 932))
+            expanded = timeline_image.convert("RGB").resize(
+                (1872, 130),
+                Image.Resampling.NEAREST,
+            )
+        panel.paste(expanded, (24, 1120))
         panel_path = root / f"{safe}-panel.png"
         panel.save(panel_path, format="PNG", optimize=False, compress_level=9)
-        temporary_panel.unlink()
         artifacts.extend((panel_path, timeline))
     return tuple(artifacts)
 

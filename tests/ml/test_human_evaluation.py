@@ -14,6 +14,7 @@ from moving_det.ml.human_benchmark import (
 )
 from moving_det.ml.human_evaluation import (
     CONDITIONS,
+    assign_human_predictions,
     evaluate_human_gate,
     evaluate_human_predictions,
     paired_human_transitions,
@@ -620,6 +621,44 @@ def test_paired_human_transitions_publish_unmatched_candidate_detections():
             "tile_xywh": (0, 0, 1024, 1024),
         },
     )
+
+
+def test_official_assignment_reuses_ignore_suppression_and_one_to_one_matching():
+    truths = (
+        _truth(1, track=1, cx=100.0),
+        _truth(1, track=2, cx=100.0),
+    )
+    ignored = HumanIgnore(
+        site="site19",
+        sequence="sequence_a",
+        frame=1,
+        class_id=0,
+        track_id=99,
+        points=((290.0, 90.0), (310.0, 90.0), (310.0, 110.0), (290.0, 110.0)),
+    )
+    matched = _matching_prediction(truths[0], confidence=0.9)
+    ignored_false_positive = _pred(
+        1,
+        cx=300.0,
+        cy=100.0,
+        confidence=0.8,
+    )
+
+    assignment = assign_human_predictions(
+        (matched, ignored_false_positive),
+        _benchmark(*truths, ignores=(ignored,)),
+        0.5,
+        label="candidate",
+    )
+
+    assert assignment.predictions == (matched,)
+    assert assignment.matches.prediction_is_true_positive == (True,)
+    assert len(assignment.matches.matched_gt) == 1
+    assert len(assignment.matches.prediction_to_gt) == 1
+    assert assignment.ignore_audit == {
+        "edge_ignore_count": 1,
+        "suppressed_prediction_count": 1,
+    }
 
 
 def _gate_metrics(

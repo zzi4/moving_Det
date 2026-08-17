@@ -203,6 +203,7 @@ class PanelSample:
     center_frame: int
     manifest_sha256: str
     checkpoint_sha256: Mapping[str, str]
+    display_models: tuple[str, ...] = _MODEL_KEYS
     source_roots: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
@@ -253,6 +254,14 @@ class PanelSample:
             raise ValueError(
                 "long_candidate_offsets must be four unique increasing "
                 "nonzero frame offsets"
+            )
+
+        if self.display_models not in (
+            _MODEL_KEYS,
+            ("baseline", "mg_vtod"),
+        ):
+            raise ValueError(
+                "display_models must select Baseline/MG-VTOD or all three models"
             )
 
         height, width = shape[:2]
@@ -314,13 +323,13 @@ class PanelSample:
             raise ValueError("manifest SHA-256 is invalid")
         if (
             not isinstance(self.checkpoint_sha256, Mapping)
-            or set(self.checkpoint_sha256) != set(_MODEL_KEYS)
+            or set(self.checkpoint_sha256) != set(self.display_models)
         ):
             raise ValueError(
-                "checkpoint SHA-256 mapping must name all three models"
+                "checkpoint SHA-256 mapping must exactly name displayed models"
             )
         hashes = {}
-        for key in _MODEL_KEYS:
+        for key in self.display_models:
             value = self.checkpoint_sha256[key]
             if not isinstance(value, str) or not _SHA256.fullmatch(value):
                 raise ValueError(f"{key} checkpoint SHA-256 is invalid")
@@ -493,12 +502,12 @@ def _model_column(
 
 def _comparison_crop(sample: PanelSample) -> tuple[int, int, int, int]:
     height, width = sample.frames[0].shape[:2]
-    rows = (
-        *sample.ground_truth,
-        *sample.baseline,
-        *sample.mg_vtod,
-        *sample.lstfe,
+    model_rows = tuple(
+        row
+        for model in sample.display_models
+        for row in getattr(sample, model)
     )
+    rows = (*sample.ground_truth, *model_rows)
     if not rows:
         return (0, 0, width, height)
     points = np.concatenate([obb_to_points(row.obb) for row in rows], axis=0)
@@ -562,23 +571,25 @@ def _render_canvas(sample: PanelSample) -> Image.Image:
 
     gap = 18
     column_width = (
-        _CANVAS_SIZE[0] - 2 * margin - 2 * gap
-    ) // 3
+        _CANVAS_SIZE[0]
+        - 2 * margin
+        - (len(sample.display_models) - 1) * gap
+    ) // len(sample.display_models)
     selected = _selected_long_label(sample)
-    specifications = (
-        (
+    all_specifications = {
+        "baseline": (
             "Baseline",
             sample.baseline,
             None,
             "Current RGB / OBB evidence",
         ),
-        (
+        "mg_vtod": (
             "MG-VTOD-OBB",
             sample.mg_vtod,
             sample.motion_map,
             "MG soft aligned motion map",
         ),
-        (
+        "lstfe": (
             "LSTFE-OBB",
             sample.lstfe,
             sample.short_alignment_magnitude,
@@ -587,6 +598,10 @@ def _render_canvas(sample: PanelSample) -> Image.Image:
                 f"magnitude; selected {selected}"
             ),
         ),
+    }
+    specifications = tuple(
+        all_specifications[model]
+        for model in sample.display_models
     )
     crop_xyxy = _comparison_crop(sample)
     for index, (title, rows, diagnostic, diagnostic_title) in enumerate(
@@ -629,11 +644,10 @@ def _render_canvas(sample: PanelSample) -> Image.Image:
     caption_lines = (
         f"{sample.site}/{sample.sequence} frame {sample.center_frame}",
         f"manifest sha256 {sample.manifest_sha256}",
-        (
-            "checkpoints "
-            f"baseline={sample.checkpoint_sha256['baseline']}  "
-            f"mg_vtod={sample.checkpoint_sha256['mg_vtod']}  "
-            f"lstfe={sample.checkpoint_sha256['lstfe']}"
+        "checkpoints "
+        + "  ".join(
+            f"{model}={sample.checkpoint_sha256[model]}"
+            for model in sample.display_models
         ),
         "OBBs use width>=height and theta in [-pi/2, pi/2); diagnostics are CPU artifacts.",
     )
@@ -645,6 +659,13 @@ def _render_canvas(sample: PanelSample) -> Image.Image:
             font=_font(),
         )
     return canvas
+
+
+def render_temporal_panel_image(sample: PanelSample) -> Image.Image:
+    """Render a deterministic native canvas without filesystem intermediates."""
+    if not isinstance(sample, PanelSample):
+        raise ValueError("sample must be a PanelSample")
+    return _render_canvas(sample)
 
 
 def _path_contains(root: Path, candidate: Path) -> bool:
@@ -706,7 +727,7 @@ def render_temporal_panel(
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        canvas = _render_canvas(sample)
+        canvas = render_temporal_panel_image(sample)
         canvas.save(
             temporary,
             format="JPEG",
@@ -728,4 +749,5 @@ __all__ = [
     "PanelOBB",
     "PanelSample",
     "render_temporal_panel",
+    "render_temporal_panel_image",
 ]

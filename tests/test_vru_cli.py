@@ -3385,6 +3385,14 @@ def test_motion_off_human_diagnostic_skips_motion_strength(tmp_path, monkeypatch
     )
 
     assert diagnostic["motion_enabled"] is False
+    assert isinstance(
+        diagnostic["motion_map"],
+        vru_cli_module._CompactDiagnosticMap,
+    )
+    assert isinstance(
+        diagnostic["short_alignment_magnitude"],
+        vru_cli_module._CompactDiagnosticMap,
+    )
     assert np.count_nonzero(diagnostic["motion_map"]) == 0
 
 
@@ -10844,6 +10852,153 @@ def test_human_evaluation_diagnostic_schedule_covers_all_three_291_frame_scenes(
     ) == (0, 1, 2)
 
 
+def test_compact_diagnostic_archive_round_trips_bounded_official_maps(tmp_path):
+    image_root = (tmp_path / "images").resolve()
+    identities = (("site19", "day-a", 10), ("site19", "day-a", 11))
+    values = np.linspace(
+        0.0,
+        1.0,
+        180 * 320,
+        dtype=np.float32,
+    ).reshape(180, 320)
+    compact = vru_cli_module._compact_diagnostic_map(values)
+    restored = np.asarray(compact)
+    assert restored.shape == (180, 320)
+    assert restored.dtype == np.float32
+    assert float(np.max(np.abs(restored - values))) <= 1.0 / (2 * 65535) + 1e-7
+
+    rows = tuple(
+        {
+            "schema_version": 1,
+            "site": site,
+            "sequence": sequence,
+            "frame": frame,
+            "frame_shape": [2160, 3840],
+            "image_root": str(image_root),
+            "offsets": [-2, -1, 0, 1, 2],
+            "support_paths": [
+                str(
+                    image_root
+                    / f"{site}_sequence"
+                    / sequence
+                    / f"{frame + offset:06d}.jpg"
+                )
+                for offset in (-2, -1, 0, 1, 2)
+            ],
+            "motion_map": compact,
+            "selected_long_index": -1,
+            "short_alignment_magnitude": vru_cli_module._compact_diagnostic_map(
+                np.zeros((180, 320), dtype=np.float32)
+            ),
+            "diagnostic_tile_xywh": [0, 0, 1024, 1024],
+            "motion_enabled": True,
+        }
+        for site, sequence, frame in identities
+    )
+    path = tmp_path / "diagnostics.bin"
+    digest = vru_cli_module._write_diagnostic_archive(path, rows)
+
+    loaded = vru_cli_module._read_diagnostic_archive(
+        path,
+        expected_sha256=digest,
+        expected_identities=identities,
+        universe=frozenset(identities),
+        model_name="mg_vtod",
+        image_root=image_root,
+        expected_offsets=(-2, -1, 0, 1, 2),
+        human_benchmark=True,
+        expected_motion_enabled=True,
+    )
+
+    assert tuple(
+        (row["site"], row["sequence"], row["frame"])
+        for row in loaded
+    ) == identities
+    np.testing.assert_allclose(
+        np.asarray(loaded[0]["motion_map"]),
+        restored,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert path.stat().st_size < 512 * 1024
+    assert vru_cli_module._diagnostic_archive_size_bound(873) < 256 * 1024**2
+
+    pristine = path.read_bytes()
+
+    def read_mutation(name, content, *, expected=identities):
+        mutated = tmp_path / name
+        mutated.write_bytes(content)
+        return vru_cli_module._read_diagnostic_archive(
+            mutated,
+            expected_sha256=hashlib.sha256(content).hexdigest(),
+            expected_identities=expected,
+            universe=frozenset(identities),
+            model_name="mg_vtod",
+            image_root=image_root,
+            expected_offsets=(-2, -1, 0, 1, 2),
+            human_benchmark=True,
+            expected_motion_enabled=True,
+        )
+
+    with pytest.raises(WorkflowError, match="truncated"):
+        read_mutation("truncated.bin", pristine[:-1])
+    with pytest.raises(WorkflowError, match="duplicate or out of order"):
+        read_mutation(
+            "out-of-order.bin",
+            pristine,
+            expected=tuple(reversed(identities)),
+        )
+
+    header_size = vru_cli_module._DIAGNOSTIC_ARCHIVE_HEADER.size
+    record = vru_cli_module._DIAGNOSTIC_ARCHIVE_RECORD
+    first_lengths = record.unpack_from(pristine, header_size)
+    second_record_offset = header_size + record.size + sum(first_lengths)
+    second_metadata_offset = second_record_offset + record.size
+    second_metadata_length = record.unpack_from(pristine, second_record_offset)[0]
+    duplicate = bytearray(pristine)
+    second_metadata = bytes(
+        duplicate[
+            second_metadata_offset : second_metadata_offset + second_metadata_length
+        ]
+    )
+    assert b'"frame":11' in second_metadata
+    duplicate[
+        second_metadata_offset : second_metadata_offset + second_metadata_length
+    ] = second_metadata.replace(b'"frame":11', b'"frame":10')
+    with pytest.raises(WorkflowError, match="duplicate or out of order"):
+        read_mutation("duplicate.bin", bytes(duplicate))
+
+    metadata_length, motion_length, alignment_length = first_lengths
+    first_motion_end = (
+        header_size + record.size + metadata_length + motion_length
+    )
+    zlib_trailing = bytearray(pristine)
+    zlib_trailing[header_size : header_size + record.size] = record.pack(
+        metadata_length,
+        motion_length + 1,
+        alignment_length,
+    )
+    zlib_trailing[first_motion_end:first_motion_end] = b"x"
+    with pytest.raises(WorkflowError, match="zlib framing"):
+        read_mutation("zlib-trailing.bin", bytes(zlib_trailing))
+
+    with path.open("ab") as stream:
+        stream.write(b"undeclared-trailing-byte")
+    trailing_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(WorkflowError, match="trailing"):
+        vru_cli_module._read_diagnostic_archive(
+            path,
+            expected_sha256=trailing_digest,
+            expected_identities=identities,
+            universe=frozenset(identities),
+            model_name="mg_vtod",
+            image_root=image_root,
+            expected_offsets=(-2, -1, 0, 1, 2),
+            human_benchmark=True,
+            expected_motion_enabled=True,
+        )
+
+
 def test_formal_demo_loader_consumes_real_v2_human_writer_contract(
     tmp_path,
     monkeypatch,
@@ -10894,6 +11049,9 @@ def test_formal_demo_loader_consumes_real_v2_human_writer_contract(
         output_root=tmp_path / "runs",
     )
     offsets = tuple(cfg.mg_offsets)
+    zero_map = vru_cli_module._compact_diagnostic_map(
+        np.zeros((180, 320), dtype=np.float32)
+    )
     diagnostics = tuple(
         {
             "schema_version": 1,
@@ -10912,30 +11070,14 @@ def test_formal_demo_loader_consumes_real_v2_human_writer_contract(
                 )
                 for offset in offsets
             ],
-            "motion_map": [[0.0]],
+            "motion_map": zero_map,
             "selected_long_index": -1,
-            "short_alignment_magnitude": [[0.0]],
+            "short_alignment_magnitude": zero_map,
             "diagnostic_tile_xywh": [0, 0, 1024, 1024],
             "motion_enabled": True,
         }
         for frame in benchmark.frames
     )
-    original_diagnostic_validator = vru_cli_module._validate_diagnostic_rows
-
-    def lightweight_validator(rows, **kwargs):
-        if rows and rows[0].get("motion_map") == [[0.0]]:
-            normalized = tuple(dict(row) for row in rows)
-            assert len(normalized) == 873
-            assert tuple(
-                (row["site"], row["sequence"], row["frame"])
-                for row in normalized
-            ) == tuple(
-                (frame.site, frame.sequence, frame.frame)
-                for frame in benchmark.frames
-            )
-            return normalized
-        return original_diagnostic_validator(rows, **kwargs)
-
     monkeypatch.setattr(
         benchmark_artifacts,
         "load_human_benchmark",
@@ -10950,11 +11092,6 @@ def test_formal_demo_loader_consumes_real_v2_human_writer_contract(
         vru_cli_module,
         "_load_stable_human_benchmark",
         lambda path: (benchmark, "f" * 64),
-    )
-    monkeypatch.setattr(
-        vru_cli_module,
-        "_validate_diagnostic_rows",
-        lightweight_validator,
     )
     run_evaluate(
         args,
@@ -10983,6 +11120,8 @@ def test_formal_demo_loader_consumes_real_v2_human_writer_contract(
 
     assert loaded.run["schema_version"] == 2
     assert loaded.run["artifact_schema"]["ground-truth.jsonl"] == 3
+    assert loaded.run["artifact_schema"]["diagnostics.bin"] == 1
+    assert "diagnostics.jsonl" not in loaded.run["artifact_schema"]
     assert len(loaded.diagnostics) == 873
     assert loaded.ground_truth[0]["schema_version"] == 3
     assert loaded.threshold == 0.42

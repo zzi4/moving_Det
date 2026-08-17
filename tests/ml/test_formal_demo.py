@@ -37,7 +37,12 @@ from moving_det.ml.formal_demo import (
     verified_benchmark_snapshot,
     validate_final_demo_tree,
 )
-from moving_det.ml.human_benchmark import HumanBenchmark, HumanFrame, HumanTruth
+from moving_det.ml.human_benchmark import (
+    HumanBenchmark,
+    HumanFrame,
+    HumanIgnore,
+    HumanTruth,
+)
 from moving_det.models import OBB
 
 
@@ -96,6 +101,9 @@ def test_case_selection_is_lexical_and_covers_required_states():
             "visible_span": None,
             "class_id": 1,
             "state": "new_false_positive",
+            "confidence": 0.8,
+            "obb": [8.0, 6.0, 4.0, 2.0, 0.0],
+            "tile_xywh": [0, 0, 16, 12],
         },
     )
 
@@ -121,7 +129,7 @@ def test_case_selection_is_lexical_and_covers_required_states():
         (1, "site22"),
     ]
     false_positive = first[-1]
-    assert false_positive.confidence is None  # legacy rows without FP geometry stay nullable
+    assert false_positive.confidence == 0.8
 
 
 def test_case_selection_preserves_track_zero_and_false_positive_identity():
@@ -313,6 +321,42 @@ def test_verified_comparison_requires_complete_threshold_run_reference(tmp_path)
 
     with pytest.raises(ValueError, match="run reference"):
         load_verified_comparison(root)
+
+
+def test_same_frame_false_positives_have_distinct_deterministic_identities(tmp_path):
+    root = tmp_path / "comparison"
+    _write_verified_comparison(root)
+    transitions_path = root / "transitions.jsonl"
+    rows = tuple(
+        json.loads(line)
+        for line in transitions_path.read_text(encoding="utf-8").splitlines()
+    )
+    original = next(row for row in rows if row["state"] == "new_false_positive")
+    second = {
+        **original,
+        "confidence": 0.7,
+        "obb": [7.0, 6.0, 4.0, 2.0, 0.1],
+        "tile_xywh": [16, 0, 16, 12],
+    }
+    updated = (*rows, second)
+    content = b"".join(_canonical_json(row) for row in updated)
+    transitions_path.write_bytes(content)
+    run_path = root / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    run["artifact_sha256"]["transitions.jsonl"] = hashlib.sha256(
+        content
+    ).hexdigest()
+    run_path.write_bytes(_canonical_json(run))
+
+    comparison = load_verified_comparison(root)
+    forward = select_formal_cases(comparison.case_rows, per_state=1)
+    reverse = select_formal_cases(tuple(reversed(comparison.case_rows)), per_state=1)
+
+    assert forward == reverse
+    selected = next(case for case in forward if case.state == "new_false_positive")
+    assert selected.confidence == 0.7
+    assert selected.obb == (7.0, 6.0, 4.0, 2.0, 0.1)
+    assert selected.tile_xywh == (16, 0, 16, 12)
 
 
 def test_build_rejects_output_overlap_before_loading_inputs(tmp_path, monkeypatch):
@@ -710,6 +754,155 @@ def test_formal_transition_verifier_rejects_tampered_center_state(tmp_path):
         )
 
 
+def test_formal_transition_evidence_preserves_official_ignore_and_one_to_one(
+    tmp_path,
+):
+    evidence, _ = _demo_evidence(tmp_path)
+    overlapping = replace(evidence.benchmark.truths[0], track_id=99)
+    ignored = HumanIgnore(
+        site="site19",
+        sequence="day-a",
+        frame=1,
+        class_id=0,
+        track_id=100,
+        points=((20.0, 20.0), (40.0, 20.0), (40.0, 40.0), (20.0, 40.0)),
+    )
+    ignored_prediction = {
+        "schema_version": 1,
+        "site": "site19",
+        "sequence": "day-a",
+        "frame": 1,
+        "class_id": 0,
+        "confidence": 0.8,
+        "obb": [30.0, 30.0, 10.0, 10.0, 0.0],
+        "tile_xywh": [0, 0, 320, 180],
+    }
+    benchmark = replace(
+        evidence.benchmark,
+        annotation_count=evidence.benchmark.annotation_count + 2,
+        truths=(*evidence.benchmark.truths, overlapping),
+        ignores=(ignored,),
+    )
+    mg_full = replace(
+        evidence.mg_full,
+        ranked_predictions=(*evidence.mg_full.ranked_predictions, ignored_prediction),
+    )
+    rows = tuple(
+        {
+            "state": "stable_fn" if truth.track_id == 99 else "rescued",
+            "site": truth.site,
+            "sequence": truth.sequence,
+            "frame": truth.frame,
+            "track_id": truth.track_id,
+            "visible_span": truth.visible_span,
+            "class_id": truth.class_id,
+            "confidence": None,
+            "obb": None,
+            "tile_xywh": None,
+        }
+        for truth in sorted(
+            benchmark.truths,
+            key=lambda row: (
+                row.site,
+                row.sequence,
+                row.frame,
+                row.track_id,
+                row.visible_span,
+            ),
+        )
+    )
+
+    transitions = verify_formal_transitions(
+        benchmark,
+        evidence.baseline,
+        mg_full,
+        rows,
+    )
+
+    assert len(transitions.mg_predictions) == 3
+    assert len(transitions.mg_true_predictions) == 3
+    assert len(transitions.mg_by_truth) == 3
+    assert not transitions.mg_false_positives
+    overlapping_identity = (
+        overlapping.site,
+        overlapping.sequence,
+        overlapping.frame,
+        overlapping.track_id,
+        overlapping.visible_span,
+        overlapping.class_id,
+    )
+    assert overlapping_identity not in transitions.mg_by_truth
+
+
+def test_case_timeline_does_not_cross_visible_span_boundary(tmp_path, monkeypatch):
+    import moving_det.ml.formal_demo as formal_demo
+
+    evidence, case = _demo_evidence(tmp_path)
+    center_frame = evidence.benchmark.frames[0]
+    later_frame = replace(
+        center_frame,
+        frame=2,
+        annotation_member="2.json",
+    )
+    later_truth = replace(
+        evidence.benchmark.truths[0],
+        frame=2,
+        visible_span=1,
+    )
+    benchmark = replace(
+        evidence.benchmark,
+        annotation_count=evidence.benchmark.annotation_count + 1,
+        frames=(*evidence.benchmark.frames, later_frame),
+        truths=(*evidence.benchmark.truths, later_truth),
+    )
+    rows = tuple(
+        {
+            "state": "stable_fn" if truth is later_truth else "rescued",
+            "site": truth.site,
+            "sequence": truth.sequence,
+            "frame": truth.frame,
+            "track_id": truth.track_id,
+            "visible_span": truth.visible_span,
+            "class_id": truth.class_id,
+            "confidence": None,
+            "obb": None,
+            "tile_xywh": None,
+        }
+        for truth in sorted(
+            benchmark.truths,
+            key=lambda row: (
+                row.site,
+                row.sequence,
+                row.frame,
+                row.track_id,
+                row.visible_span,
+            ),
+        )
+    )
+    transitions = verify_formal_transitions(
+        benchmark,
+        evidence.baseline,
+        evidence.mg_full,
+        rows,
+    )
+    evidence = replace(evidence, benchmark=benchmark, transitions=transitions)
+    captured = {}
+
+    def capture_timeline(baseline, mg_vtod, destination, *, first_frame):
+        captured["baseline"] = tuple(baseline)
+        captured["mg_vtod"] = tuple(mg_vtod)
+        image = Image.new("RGB", (291, 80), (0, 0, 0))
+        image.save(destination)
+        return destination
+
+    monkeypatch.setattr(formal_demo, "render_case_timeline", capture_timeline)
+
+    render_case_panels((case,), evidence, tmp_path / "cases")
+
+    assert captured["baseline"][1] == "not_visible"
+    assert captured["mg_vtod"][1] == "not_visible"
+
+
 def test_scene_and_case_rendering_include_required_formal_evidence(
     tmp_path,
     monkeypatch,
@@ -718,13 +911,17 @@ def test_scene_and_case_rendering_include_required_formal_evidence(
 
     evidence, case = _demo_evidence(tmp_path)
     calls = []
-    real_renderer = formal_demo.render_temporal_panel
+    real_renderer = formal_demo.render_temporal_panel_image
 
-    def tracked_renderer(sample, destination):
+    def tracked_renderer(sample):
         calls.append(sample)
-        return real_renderer(sample, destination)
+        return real_renderer(sample)
 
-    monkeypatch.setattr(formal_demo, "render_temporal_panel", tracked_renderer)
+    monkeypatch.setattr(
+        formal_demo,
+        "render_temporal_panel_image",
+        tracked_renderer,
+    )
 
     scenes = render_scene_sequences(
         benchmark=evidence.benchmark,
@@ -745,10 +942,44 @@ def test_scene_and_case_rendering_include_required_formal_evidence(
         assert image.size == (1920, 1080)
     assert len(calls) == 1
     assert calls[0].lstfe == ()
+    assert calls[0].display_models == ("baseline", "mg_vtod")
+    assert set(calls[0].checkpoint_sha256) == {"baseline", "mg_vtod"}
+    assert len(calls[0].frames) == 5
     assert len(artifacts) == 2
     assert artifacts[0].suffix == ".png"
+    with Image.open(artifacts[0]) as panel:
+        assert panel.size == (1920, 1260)
     with Image.open(artifacts[1]) as timeline:
         assert timeline.size[0] == 291
+
+
+def test_scene_rendering_decodes_each_unique_snapshot_at_most_twice(
+    tmp_path,
+    monkeypatch,
+):
+    evidence, _ = _demo_evidence(tmp_path)
+    snapshot_paths = {Path(path).resolve() for path in evidence.image_paths.values()}
+    counts = {path: 0 for path in snapshot_paths}
+    real_open = Image.open
+
+    def tracked_open(path, *args, **kwargs):
+        candidate = Path(path).resolve() if isinstance(path, (str, Path)) else None
+        if candidate in counts:
+            counts[candidate] += 1
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", tracked_open)
+
+    render_scene_sequences(
+        benchmark=evidence.benchmark,
+        baseline_run=evidence.baseline,
+        mg_run=evidence.mg_full,
+        destination=tmp_path / "frames",
+        image_paths=evidence.image_paths,
+    )
+
+    assert counts
+    assert all(count <= 2 for count in counts.values())
 
 
 def test_failed_ffmpeg_keeps_previous_demo_and_removes_stage(
@@ -776,6 +1007,13 @@ def test_failed_ffmpeg_keeps_previous_demo_and_removes_stage(
             "visible_span": 0,
             "class_id": 0,
             "state": state,
+            "confidence": 0.8 if state == "new_false_positive" else None,
+            "obb": [100.0, 100.0, 20.0, 10.0, 0.0]
+            if state == "new_false_positive"
+            else None,
+            "tile_xywh": [0, 0, 320, 180]
+            if state == "new_false_positive"
+            else None,
         }
         for index, state in enumerate(
             ("rescued", "regressed", "stable_fn", "new_false_positive"),

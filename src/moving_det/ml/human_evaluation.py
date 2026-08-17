@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import math
 from statistics import median
+from types import MappingProxyType
 
 import numpy as np
 from shapely.errors import GEOSException
 from shapely.geometry import Polygon, box
 
 from moving_det.geometry.obb import normalize_theta, obb_to_points
-from moving_det.ml.evaluation import GroundTruth, match_detections
+from moving_det.ml.evaluation import GroundTruth, MatchResult, match_detections
 from moving_det.ml.human_benchmark import (
     HumanBenchmark,
     HumanFrame,
@@ -801,6 +803,41 @@ def _validated_human_predictions(
     return rows
 
 
+@dataclass(frozen=True)
+class HumanMatchAssignment:
+    """Official fixed-threshold human detections and their one-to-one matches."""
+
+    truths: tuple[HumanTruth, ...]
+    predictions: tuple[Detection, ...]
+    matches: MatchResult
+    ignore_audit: Mapping[str, int]
+
+
+def assign_human_predictions(
+    predictions: Sequence[Detection],
+    benchmark: HumanBenchmark,
+    threshold: float,
+    *,
+    label: str = "predictions",
+) -> HumanMatchAssignment:
+    """Validate, suppress ignores, threshold, and match human predictions once."""
+    cutoff = _unit_interval(threshold, f"{label} confidence threshold")
+    truth_rows, frame_universe = _validate_human_benchmark(benchmark)
+    ranked = _validated_human_predictions(predictions, frame_universe, label)
+    unsuppressed, ignore_audit = suppress_ignored_predictions(
+        ranked,
+        benchmark.ignores,
+    )
+    fixed = tuple(row for row in unsuppressed if row.confidence >= cutoff)
+    matches = match_detections(fixed, _as_ground_truth(truth_rows), 0.25)
+    return HumanMatchAssignment(
+        truths=truth_rows,
+        predictions=fixed,
+        matches=matches,
+        ignore_audit=MappingProxyType(dict(ignore_audit)),
+    )
+
+
 def paired_human_transitions(
     baseline: Sequence[Detection],
     candidate: Sequence[Detection],
@@ -817,34 +854,25 @@ def paired_human_transitions(
         candidate_threshold,
         "candidate confidence threshold",
     )
-    truth_rows, frame_universe = _validate_human_benchmark(benchmark)
-    baseline_rows = _validated_human_predictions(
+    baseline_assignment = assign_human_predictions(
         baseline,
-        frame_universe,
-        "baseline",
+        benchmark,
+        baseline_cutoff,
+        label="baseline",
     )
-    candidate_rows = _validated_human_predictions(
+    candidate_assignment = assign_human_predictions(
         candidate,
-        frame_universe,
-        "candidate",
+        benchmark,
+        candidate_cutoff,
+        label="candidate",
     )
-    baseline_unsuppressed, baseline_ignore_audit = suppress_ignored_predictions(
-        baseline_rows,
-        benchmark.ignores,
-    )
-    candidate_unsuppressed, candidate_ignore_audit = suppress_ignored_predictions(
-        candidate_rows,
-        benchmark.ignores,
-    )
-    baseline_fixed = tuple(
-        row for row in baseline_unsuppressed if row.confidence >= baseline_cutoff
-    )
-    candidate_fixed = tuple(
-        row for row in candidate_unsuppressed if row.confidence >= candidate_cutoff
-    )
-    ground_truth = _as_ground_truth(truth_rows)
-    baseline_matched = match_detections(baseline_fixed, ground_truth, 0.25)
-    candidate_matched = match_detections(candidate_fixed, ground_truth, 0.25)
+    truth_rows = baseline_assignment.truths
+    if candidate_assignment.truths != truth_rows:
+        raise ValueError("paired human assignments disagree on benchmark truths")
+    baseline_fixed = baseline_assignment.predictions
+    candidate_fixed = candidate_assignment.predictions
+    baseline_matched = baseline_assignment.matches
+    candidate_matched = candidate_assignment.matches
 
     new_false_positives = tuple(
         {
@@ -906,8 +934,8 @@ def paired_human_transitions(
         "transitions": counts,
         "by_identity": tuple(by_identity),
         "new_false_positives": new_false_positives,
-        "baseline_ignore_audit": dict(baseline_ignore_audit),
-        "candidate_ignore_audit": dict(candidate_ignore_audit),
+        "baseline_ignore_audit": dict(baseline_assignment.ignore_audit),
+        "candidate_ignore_audit": dict(candidate_assignment.ignore_audit),
         "audit": {
             "metadata_error_count": 0,
             "geometry_error_count": 0,

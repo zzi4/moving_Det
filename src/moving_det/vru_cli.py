@@ -20,12 +20,14 @@ from pathlib import Path
 import platform
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 from types import MappingProxyType
 from typing import Any, Iterator
+import zlib
 
 
 _DEFAULT_CONFIG = Path("configs/vrud-temporal-obb.yaml")
@@ -79,6 +81,7 @@ _HUMAN_EVALUATION_ARTIFACT_VERSIONS = {
     **_EVALUATION_ARTIFACT_VERSIONS,
     "per_pixel_speed.csv": 1,
     "ranked-predictions.jsonl": 1,
+    "diagnostics.bin": 1,
 }
 _EVALUATION_REQUIRED_ARTIFACTS = frozenset(
     {
@@ -174,6 +177,15 @@ _HUMAN_AUDIT_FIELDS = frozenset(
     }
 )
 _DIAGNOSTIC_MAP_SHAPE = (180, 320)
+_DIAGNOSTIC_ARCHIVE_MAGIC = b"MVDIAG\x00\x00"
+_DIAGNOSTIC_ARCHIVE_VERSION = 1
+_DIAGNOSTIC_ARCHIVE_ENDIAN = 0x4949
+_DIAGNOSTIC_ARCHIVE_HEADER = struct.Struct("<8sHHHHI")
+_DIAGNOSTIC_ARCHIVE_RECORD = struct.Struct("<III")
+_DIAGNOSTIC_ARCHIVE_MAX_ROWS = 873
+_DIAGNOSTIC_ARCHIVE_MAX_METADATA_BYTES = 64 * 1024
+_DIAGNOSTIC_MAP_RAW_BYTES = 180 * 320 * 2
+_DIAGNOSTIC_ARCHIVE_MAX_COMPRESSED_MAP_BYTES = _DIAGNOSTIC_MAP_RAW_BYTES + 1024
 _LSTFE_LONG_SLOTS = (0, 1, 5, 6)
 _MAX_FULL_FRAME_IMAGE_BYTES = 128 * 1024 * 1024
 _FULL_FRAME_READ_CHUNK_BYTES = 1024 * 1024
@@ -230,6 +242,92 @@ _AUDIT_FIELDS = (
 
 class WorkflowError(ValueError):
     """A deterministic operational error reported by the CLI with exit code 2."""
+
+
+@dataclass(frozen=True)
+class _CompactDiagnosticMap:
+    """One independently compressed visualization-only uint16 diagnostic map."""
+
+    payload: bytes
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.payload, bytes)
+            or not self.payload
+            or len(self.payload) > _DIAGNOSTIC_ARCHIVE_MAX_COMPRESSED_MAP_BYTES
+        ):
+            raise WorkflowError("compact diagnostic map payload is invalid")
+        self._raw_bytes()
+
+    def _raw_bytes(self) -> bytes:
+        decoder = zlib.decompressobj()
+        try:
+            raw = decoder.decompress(
+                self.payload,
+                _DIAGNOSTIC_MAP_RAW_BYTES + 1,
+            )
+        except zlib.error as exc:
+            raise WorkflowError("compact diagnostic map is malformed") from exc
+        if (
+            len(raw) != _DIAGNOSTIC_MAP_RAW_BYTES
+            or not decoder.eof
+            or decoder.unused_data
+            or decoder.unconsumed_tail
+        ):
+            raise WorkflowError(
+                "compact diagnostic map length or zlib framing is invalid"
+            )
+        return raw
+
+    def to_array(self) -> object:
+        import numpy as np
+
+        quantized = np.frombuffer(self._raw_bytes(), dtype="<u2").reshape(
+            _DIAGNOSTIC_MAP_SHAPE
+        )
+        restored = quantized.astype(np.float32) / np.float32(65535.0)
+        restored.setflags(write=False)
+        return restored
+
+    def __array__(self, dtype: object = None, copy: bool | None = None) -> object:
+        array = self.to_array()
+        if dtype is not None:
+            array = array.astype(dtype, copy=False)
+        if copy:
+            array = array.copy()
+        return array
+
+
+def _compact_diagnostic_map(value: object) -> _CompactDiagnosticMap:
+    import numpy as np
+
+    array = np.asarray(value, dtype=np.float32)
+    if (
+        array.shape != _DIAGNOSTIC_MAP_SHAPE
+        or not np.isfinite(array).all()
+        or bool((array < 0).any())
+        or bool((array > 1).any())
+    ):
+        raise WorkflowError(
+            "diagnostic map must be finite unit-interval 180x320 values"
+        )
+    quantized = np.rint(array * np.float32(65535.0)).astype("<u2")
+    payload = zlib.compress(quantized.tobytes(order="C"), level=9)
+    return _CompactDiagnosticMap(payload)
+
+
+def _diagnostic_archive_size_bound(row_count: int) -> int:
+    if (
+        isinstance(row_count, bool)
+        or not isinstance(row_count, int)
+        or not 0 <= row_count <= _DIAGNOSTIC_ARCHIVE_MAX_ROWS
+    ):
+        raise WorkflowError("diagnostic archive row count is invalid")
+    return _DIAGNOSTIC_ARCHIVE_HEADER.size + row_count * (
+        _DIAGNOSTIC_ARCHIVE_RECORD.size
+        + _DIAGNOSTIC_ARCHIVE_MAX_METADATA_BYTES
+        + 2 * _DIAGNOSTIC_ARCHIVE_MAX_COMPRESSED_MAP_BYTES
+    )
 
 
 @dataclass(frozen=True)
@@ -678,6 +776,228 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _diagnostic_metadata_bytes(row: Mapping[str, object]) -> bytes:
+    metadata = {
+        key: value
+        for key, value in row.items()
+        if key not in {"motion_map", "short_alignment_magnitude"}
+    }
+    try:
+        content = json.dumps(
+            metadata,
+            allow_nan=False,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise WorkflowError("diagnostic archive metadata is invalid") from exc
+    if not content or len(content) > _DIAGNOSTIC_ARCHIVE_MAX_METADATA_BYTES:
+        raise WorkflowError("diagnostic archive metadata length is invalid")
+    return content
+
+
+def _write_diagnostic_archive(
+    path: Path,
+    rows: Sequence[Mapping[str, object]],
+) -> str:
+    normalized = tuple(rows)
+    if len(normalized) > _DIAGNOSTIC_ARCHIVE_MAX_ROWS:
+        raise WorkflowError("diagnostic archive contains too many rows")
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    try:
+        with destination.open("xb") as stream:
+            def emit(content: bytes) -> None:
+                stream.write(content)
+                digest.update(content)
+
+            emit(
+                _DIAGNOSTIC_ARCHIVE_HEADER.pack(
+                    _DIAGNOSTIC_ARCHIVE_MAGIC,
+                    _DIAGNOSTIC_ARCHIVE_VERSION,
+                    _DIAGNOSTIC_ARCHIVE_ENDIAN,
+                    _DIAGNOSTIC_MAP_SHAPE[0],
+                    _DIAGNOSTIC_MAP_SHAPE[1],
+                    len(normalized),
+                )
+            )
+            for row in normalized:
+                if not isinstance(row, Mapping):
+                    raise WorkflowError("diagnostic archive rows must be mappings")
+                metadata = _diagnostic_metadata_bytes(row)
+                motion = row.get("motion_map")
+                alignment = row.get("short_alignment_magnitude")
+                compact_motion = (
+                    motion
+                    if isinstance(motion, _CompactDiagnosticMap)
+                    else _compact_diagnostic_map(motion)
+                )
+                compact_alignment = (
+                    alignment
+                    if isinstance(alignment, _CompactDiagnosticMap)
+                    else _compact_diagnostic_map(alignment)
+                )
+                emit(
+                    _DIAGNOSTIC_ARCHIVE_RECORD.pack(
+                        len(metadata),
+                        len(compact_motion.payload),
+                        len(compact_alignment.payload),
+                    )
+                )
+                emit(metadata)
+                emit(compact_motion.payload)
+                emit(compact_alignment.payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise WorkflowError("failed to write diagnostic archive") from exc
+    return digest.hexdigest()
+
+
+def _read_diagnostic_archive(
+    path: Path,
+    *,
+    expected_sha256: str,
+    expected_identities: Sequence[tuple[str, str, int]],
+    universe: frozenset[tuple[str, str, int]],
+    model_name: str,
+    image_root: Path,
+    expected_offsets: tuple[int, ...] | None,
+    human_benchmark: bool,
+    expected_motion_enabled: bool | None,
+) -> tuple[dict[str, object], ...]:
+    if not _is_sha256(expected_sha256):
+        raise WorkflowError("diagnostic archive hash declaration is invalid")
+    identities = tuple(expected_identities)
+    if (
+        len(identities) > _DIAGNOSTIC_ARCHIVE_MAX_ROWS
+        or len(identities) != len(set(identities))
+    ):
+        raise WorkflowError("diagnostic archive expected identities are invalid")
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise WorkflowError("diagnostic archive is missing or unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source, flags)
+    except OSError as exc:
+        raise WorkflowError("diagnostic archive is missing or unsafe") from exc
+    digest = hashlib.sha256()
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size < _DIAGNOSTIC_ARCHIVE_HEADER.size
+            or before.st_size > _diagnostic_archive_size_bound(
+                _DIAGNOSTIC_ARCHIVE_MAX_ROWS
+            )
+        ):
+            raise WorkflowError("diagnostic archive size is invalid")
+
+        def read_exact(length: int) -> bytes:
+            chunks = []
+            remaining = length
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    raise WorkflowError("diagnostic archive is truncated")
+                chunks.append(chunk)
+                digest.update(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
+        header = read_exact(_DIAGNOSTIC_ARCHIVE_HEADER.size)
+        magic, version, endian, height, width, row_count = (
+            _DIAGNOSTIC_ARCHIVE_HEADER.unpack(header)
+        )
+        if (
+            magic != _DIAGNOSTIC_ARCHIVE_MAGIC
+            or version != _DIAGNOSTIC_ARCHIVE_VERSION
+            or endian != _DIAGNOSTIC_ARCHIVE_ENDIAN
+            or (height, width) != _DIAGNOSTIC_MAP_SHAPE
+            or row_count != len(identities)
+        ):
+            raise WorkflowError("diagnostic archive header is invalid")
+        rows = []
+        for index in range(row_count):
+            record = read_exact(_DIAGNOSTIC_ARCHIVE_RECORD.size)
+            metadata_length, motion_length, alignment_length = (
+                _DIAGNOSTIC_ARCHIVE_RECORD.unpack(record)
+            )
+            if (
+                not 0 < metadata_length <= _DIAGNOSTIC_ARCHIVE_MAX_METADATA_BYTES
+                or not 0 < motion_length
+                <= _DIAGNOSTIC_ARCHIVE_MAX_COMPRESSED_MAP_BYTES
+                or not 0 < alignment_length
+                <= _DIAGNOSTIC_ARCHIVE_MAX_COMPRESSED_MAP_BYTES
+            ):
+                raise WorkflowError("diagnostic archive record lengths are invalid")
+            metadata_content = read_exact(metadata_length)
+            try:
+                metadata = json.loads(
+                    metadata_content.decode("utf-8"),
+                    object_pairs_hook=_strict_json_object,
+                    parse_constant=_reject_json_constant,
+                )
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise WorkflowError("diagnostic archive metadata is malformed") from exc
+            if (
+                not isinstance(metadata, dict)
+                or _diagnostic_metadata_bytes(metadata) != metadata_content
+            ):
+                raise WorkflowError("diagnostic archive metadata is non-canonical")
+            identity = _evidence_frame_identity(
+                metadata,
+                artifact="diagnostic archive",
+            )
+            if identity != identities[index]:
+                raise WorkflowError(
+                    "diagnostic archive identities are duplicate or out of order"
+                )
+            rows.append(
+                {
+                    **metadata,
+                    "motion_map": _CompactDiagnosticMap(
+                        read_exact(motion_length)
+                    ),
+                    "short_alignment_magnitude": _CompactDiagnosticMap(
+                        read_exact(alignment_length)
+                    ),
+                }
+            )
+        trailing = os.read(descriptor, 1)
+        if trailing:
+            raise WorkflowError("diagnostic archive contains trailing bytes")
+        after = os.fstat(descriptor)
+        signature = lambda value: (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if signature(before) != signature(after):
+            raise WorkflowError("diagnostic archive changed while reading")
+        if digest.hexdigest() != expected_sha256:
+            raise WorkflowError("diagnostic archive hash mismatch")
+    except OSError as exc:
+        raise WorkflowError("diagnostic archive changed while reading") from exc
+    finally:
+        os.close(descriptor)
+    return _validate_diagnostic_rows(
+        rows,
+        universe=universe,
+        model_name=model_name,
+        image_root=image_root,
+        expected_offsets=expected_offsets,
+        human_benchmark=human_benchmark,
+        expected_motion_enabled=expected_motion_enabled,
+    )
 
 
 def _manifest_fingerprint(manifest_dir: Path) -> str:
@@ -2633,6 +2953,9 @@ def _validate_human_run_audit(value: object) -> dict[str, int]:
 
 
 def _validate_diagnostic_map(value: object, *, field: str) -> None:
+    if isinstance(value, _CompactDiagnosticMap):
+        value.to_array()
+        return
     if not isinstance(value, list) or len(value) != _DIAGNOSTIC_MAP_SHAPE[0]:
         raise WorkflowError(f"diagnostic {field} shape is invalid")
     for row in value:
@@ -3311,7 +3634,7 @@ def _run_evaluate_from_snapshot(
             artifact_bytes["threshold.json"] = _json_bytes(
                 dict(artifacts.threshold_evidence)
             )
-        if artifacts.diagnostics:
+        if artifacts.diagnostics and human_benchmark is None:
             artifact_bytes["diagnostics.jsonl"] = _jsonl_bytes(
                 artifacts.diagnostics
             )
@@ -3335,6 +3658,13 @@ def _run_evaluate_from_snapshot(
             name: hashlib.sha256(content).hexdigest()
             for name, content in artifact_bytes.items()
         }
+        if artifacts.diagnostics and human_benchmark is not None:
+            diagnostic_name = "diagnostics.bin"
+            artifact_sha256[diagnostic_name] = _write_diagnostic_archive(
+                stage / diagnostic_name,
+                artifacts.diagnostics,
+            )
+            artifact_schema[diagnostic_name] = artifact_versions[diagnostic_name]
         run = {
             "schema_version": 2,
             "model_name": request.model_name,
@@ -3556,6 +3886,10 @@ def _validate_artifact_declarations(
     if human_benchmark and "per_speed.csv" in names:
         raise WorkflowError(
             "human evaluation must not declare per_speed.csv in m/s units"
+        )
+    if {"diagnostics.jsonl", "diagnostics.bin"}.issubset(names):
+        raise WorkflowError(
+            "evaluation diagnostic artifacts must use exactly one encoding"
         )
     if not names.issubset(supported):
         raise WorkflowError("evaluation artifact declaration is unknown")
@@ -3849,6 +4183,21 @@ def _load_verified_evaluation_run(
                 if "human_benchmark_sha256" in run
                 else None
             ),
+        )
+    if "diagnostics.bin" in schema:
+        _read_diagnostic_archive(
+            root / "diagnostics.bin",
+            expected_sha256=digests["diagnostics.bin"],
+            expected_identities=tuple(
+                (str(row["site"]), str(row["sequence"]), int(row["frame"]))
+                for row in run["detection_frame_keys"]
+            ),
+            universe=universe,
+            model_name=str(run["model_name"]),
+            image_root=Path(str(run["image_root"])),
+            expected_offsets=None,
+            human_benchmark=True,
+            expected_motion_enabled=not bool(run["motion_off"]),
         )
     if "threshold.json" in schema:
         threshold = _read_json(root / "threshold.json")
@@ -8166,7 +8515,11 @@ def _serialize_human_truth(value: object) -> dict[str, object]:
     }
 
 
-def _downsample_diagnostic(tensor: object) -> list[list[float]]:
+def _downsample_diagnostic(
+    tensor: object,
+    *,
+    compact: bool = False,
+) -> object:
     import torch
     import torch.nn.functional as functional
 
@@ -8186,14 +8539,14 @@ def _downsample_diagnostic(tensor: object) -> list[list[float]]:
     maximum = float(resized.max())
     if maximum > 0:
         resized = resized / maximum
-    return (
+    array = (
         resized.detach()
         .cpu()
         .clamp(0, 1)
         .numpy()
         .round(5)
-        .tolist()
     )
+    return _compact_diagnostic_map(array) if compact else array.tolist()
 
 
 def _learned_p2_offset_magnitude(diagnostic: Mapping[str, object]) -> object:
@@ -8233,6 +8586,7 @@ def _extract_model_diagnostic(
     diagnostic_tile: object | None = None,
     include_motion_enabled: bool = False,
 ) -> dict[str, object]:
+    import numpy as np
     import torch
 
     from moving_det.ml.inference import (
@@ -8263,14 +8617,17 @@ def _extract_model_diagnostic(
         device=device,
         dtype=dtype,
     )
-    motion_map = [
-        [0.0] * _DIAGNOSTIC_MAP_SHAPE[1]
-        for _ in range(_DIAGNOSTIC_MAP_SHAPE[0])
-    ]
-    alignment_map = [
-        [0.0] * _DIAGNOSTIC_MAP_SHAPE[1]
-        for _ in range(_DIAGNOSTIC_MAP_SHAPE[0])
-    ]
+    empty_map = np.zeros(_DIAGNOSTIC_MAP_SHAPE, dtype=np.float32)
+    motion_map = (
+        _compact_diagnostic_map(empty_map)
+        if include_motion_enabled
+        else empty_map.tolist()
+    )
+    alignment_map = (
+        _compact_diagnostic_map(empty_map)
+        if include_motion_enabled
+        else empty_map.tolist()
+    )
     selected_long_index = -1
     motion_enabled = getattr(model, "_motion_enabled", True)
     if type(motion_enabled) is not bool:
@@ -8288,7 +8645,10 @@ def _extract_model_diagnostic(
                     batch["valid"],
                     batch["transforms"],
                 )
-                motion_map = _downsample_diagnostic(motion)
+                motion_map = _downsample_diagnostic(
+                    motion,
+                    compact=include_motion_enabled,
+                )
             elif model_name == "lstfe":
                 provider = getattr(model, "forward_with_diagnostics", None)
                 if not callable(provider):
@@ -8300,7 +8660,8 @@ def _extract_model_diagnostic(
                     diagnostic["selected_long_index"].item()
                 )
                 alignment_map = _downsample_diagnostic(
-                    _learned_p2_offset_magnitude(diagnostic)
+                    _learned_p2_offset_magnitude(diagnostic),
+                    compact=include_motion_enabled,
                 )
     finally:
         for module, state in module_states:
