@@ -27,6 +27,8 @@ from typing import Any, Iterator
 
 
 _DEFAULT_CONFIG = Path("configs/vrud-temporal-obb.yaml")
+_FORMAL_EXPECTED_GIT_COMMIT = "5205f4640d90771750274519f0860fb3e482f198"
+_FORMAL_MINIMUM_FREE_BYTES = 100 * 1024**3
 _MODEL_NAMES = ("baseline", "mg_vtod", "lstfe")
 _CLASS_SCHEMA = {
     "0": "pedestrian",
@@ -337,6 +339,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    formal_preflight = subparsers.add_parser(
+        "formal-preflight",
+        help="verify immutable formal inputs and publish the canonical preflight report",
+    )
+    formal_preflight.add_argument("--config", type=_path_argument, required=True)
+    formal_preflight.add_argument("--manifest", type=_path_argument, required=True)
+    formal_preflight.add_argument(
+        "--alignment-cache",
+        type=_path_argument,
+        required=True,
+    )
+    formal_preflight.add_argument(
+        "--human-benchmark",
+        type=_path_argument,
+        required=True,
+    )
+    formal_preflight.add_argument("--p2-init", type=_path_argument, required=True)
+    formal_preflight.add_argument("--output", type=_path_argument, required=True)
+
     human_benchmark = subparsers.add_parser(
         "build-human-benchmark",
         help="parse and atomically freeze the approved human OBB benchmark",
@@ -501,6 +522,7 @@ def main(
     _validate_cross_arguments(parser, args)
     selected = (
         {
+            "formal-preflight": run_formal_preflight,
             "build-human-benchmark": run_build_human_benchmark,
             "freeze-p2-init": run_freeze_p2_init,
             "build-manifest": run_build_manifest,
@@ -727,6 +749,57 @@ def _write_bytes(path: Path, content: bytes) -> None:
         stream.write(content)
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def run_formal_preflight(
+    args: argparse.Namespace,
+    *,
+    preflight: Callable[[object], object] | None = None,
+) -> int:
+    from moving_det.ml.formal_experiment import (
+        FormalPreflightReport,
+        FormalPreflightRequest,
+        preflight_formal_experiment,
+    )
+
+    output = Path(args.output)
+    _reject_symlink_components(output)
+    if output.is_symlink() or (output.exists() and not output.is_dir()):
+        raise WorkflowError(
+            "formal output root must be a directory, not a file or symlink"
+        )
+    if output.exists() and next(output.iterdir(), None) is not None:
+        raise WorkflowError("formal output root must not be non-empty")
+
+    request = FormalPreflightRequest(
+        config=Path(args.config),
+        manifest_dir=Path(args.manifest),
+        alignment_cache=Path(args.alignment_cache),
+        benchmark_dir=Path(args.human_benchmark),
+        p2_init=Path(args.p2_init),
+        output_root=output,
+        expected_git_commit=_FORMAL_EXPECTED_GIT_COMMIT,
+        minimum_free_bytes=_FORMAL_MINIMUM_FREE_BYTES,
+    )
+    selected_preflight = (
+        preflight_formal_experiment if preflight is None else preflight
+    )
+    report = selected_preflight(request)
+    if not isinstance(report, FormalPreflightReport):
+        raise WorkflowError("formal preflight returned an invalid report")
+    if output.is_symlink() or (output.exists() and not output.is_dir()):
+        raise WorkflowError("formal output root changed during preflight")
+    if output.exists() and next(output.iterdir(), None) is not None:
+        raise WorkflowError("formal output root became non-empty during preflight")
+
+    def writer(stage: Path) -> Path:
+        relative = Path("preflight") / "report.json"
+        _write_bytes(stage / relative, _json_bytes(asdict(report)))
+        return relative
+
+    primary = _replace_directory(output, writer)
+    print(primary.resolve())
+    return 0
 
 
 def _load_config(

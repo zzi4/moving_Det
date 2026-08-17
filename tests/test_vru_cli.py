@@ -16,6 +16,7 @@ from PIL import Image
 import pytest
 
 import moving_det.vru_cli as vru_cli_module
+from moving_det.ml.formal_experiment import FormalPreflightReport
 from moving_det.temporal_config import load_temporal_config
 from moving_det.vru_cli import (
     EvaluationArtifacts,
@@ -43,6 +44,7 @@ from moving_det.vru_cli import (
     run_cache_alignments,
     run_compare,
     run_evaluate,
+    run_formal_preflight,
     run_freeze_p2_init,
     run_train,
     run_visualize,
@@ -50,6 +52,7 @@ from moving_det.vru_cli import (
 
 
 EXPECTED_COMMANDS = {
+    "formal-preflight",
     "build-human-benchmark",
     "freeze-p2-init",
     "build-manifest",
@@ -103,6 +106,14 @@ def test_vru_cli_exposes_exact_workflow_commands():
 @pytest.mark.parametrize(
     "arguments",
     [
+        (
+            "formal-preflight --config configs/vrud-temporal-obb.yaml "
+            "--manifest runs/vrud-pilot/manifest "
+            "--alignment-cache runs/vrud-pilot/alignment-cache "
+            "--human-benchmark runs/vrud-pilot/human-benchmark-20260816 "
+            "--p2-init runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt "
+            "--output runs/formal-20260817-01"
+        ),
         (
             "build-human-benchmark --zip manual.zip --image-root /data/images "
             "--output runs/human-benchmark"
@@ -172,6 +183,90 @@ def test_task12_and_task13_command_forms_parse_without_ambiguity(arguments):
     args = build_parser().parse_args(arguments.split())
 
     assert args.command in EXPECTED_COMMANDS
+
+
+def test_formal_preflight_cli_publishes_only_canonical_report(tmp_path):
+    output = tmp_path / "formal-20260817-01"
+    args = build_parser().parse_args(
+        [
+            "formal-preflight",
+            "--config",
+            str(tmp_path / "formal.yaml"),
+            "--manifest",
+            str(tmp_path / "manifest"),
+            "--alignment-cache",
+            str(tmp_path / "alignment-cache"),
+            "--human-benchmark",
+            str(tmp_path / "human-benchmark"),
+            "--p2-init",
+            str(tmp_path / "p2-init.pt"),
+            "--output",
+            str(output),
+        ]
+    )
+    passing = FormalPreflightReport(
+        schema_version=1,
+        git_commit="a" * 40,
+        manifest_sha256="b" * 64,
+        alignment_cache_sha256="c" * 64,
+        human_benchmark_sha256="d" * 64,
+        p2_init_sha256="e" * 64,
+        train_record_count=13_998,
+        gpu_names=("NVIDIA RTX A6000", "NVIDIA RTX A6000"),
+        free_bytes=200 * 1024**3,
+        passed=True,
+    )
+
+    assert run_formal_preflight(args, preflight=lambda request: passing) == 0
+
+    preflight_root = output / "preflight"
+    assert {path.name for path in preflight_root.iterdir()} == {"report.json"}
+    assert json.loads((preflight_root / "report.json").read_text()) == {
+        "alignment_cache_sha256": "c" * 64,
+        "free_bytes": 200 * 1024**3,
+        "git_commit": "a" * 40,
+        "gpu_names": ["NVIDIA RTX A6000", "NVIDIA RTX A6000"],
+        "human_benchmark_sha256": "d" * 64,
+        "manifest_sha256": "b" * 64,
+        "p2_init_sha256": "e" * 64,
+        "passed": True,
+        "schema_version": 1,
+        "train_record_count": 13_998,
+    }
+
+
+def test_formal_preflight_cli_rejects_nonempty_root_before_preflight(tmp_path):
+    output = tmp_path / "formal-20260817-01"
+    output.mkdir()
+    sentinel = output / "keep.txt"
+    sentinel.write_text("owned", encoding="utf-8")
+    args = build_parser().parse_args(
+        [
+            "formal-preflight",
+            "--config",
+            "formal.yaml",
+            "--manifest",
+            "manifest",
+            "--alignment-cache",
+            "alignment-cache",
+            "--human-benchmark",
+            "human-benchmark",
+            "--p2-init",
+            "p2-init.pt",
+            "--output",
+            str(output),
+        ]
+    )
+
+    with pytest.raises(WorkflowError, match="non-empty"):
+        run_formal_preflight(
+            args,
+            preflight=lambda _request: pytest.fail(
+                "preflight ran before the non-empty root was rejected"
+            ),
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "owned"
 
 
 def test_diagnose_overfit_parser_preserves_all_frozen_inputs():
