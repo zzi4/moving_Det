@@ -103,6 +103,13 @@ _HUMAN_EVALUATION_REQUIRED_ARTIFACTS = frozenset(
         "per_track.csv",
     }
 )
+_FORMAL_HUMAN_BENCHMARK_ARTIFACTS = (
+    "benchmark.json",
+    "frames.jsonl",
+    "ground-truth.jsonl",
+    "ignore.jsonl",
+    "vehicle-audit.json",
+)
 _PREDICTION_FIELDS = frozenset(
     {
         "schema_version",
@@ -2562,22 +2569,11 @@ def _validate_human_ground_truth_rows(
 
 
 def _load_human_benchmark_from_run(run: Mapping[str, object]) -> object:
-    from moving_det.ml.human_benchmark_artifacts import (
-        human_benchmark_fingerprint,
-        load_human_benchmark,
-    )
-
     source = _absolute_resolved_path(
         run.get("human_benchmark_source"),
         field="human benchmark source",
     )
-    try:
-        benchmark = load_human_benchmark(source)
-        fingerprint = human_benchmark_fingerprint(source)
-    except (OSError, ValueError) as exc:
-        raise WorkflowError(
-            "human benchmark provenance cannot be strictly loaded"
-        ) from exc
+    benchmark, fingerprint = _load_stable_human_benchmark(source)
     if fingerprint != run.get("human_benchmark_sha256"):
         raise WorkflowError("human benchmark provenance fingerprint is mismatched")
     _fixed_human_frame_universe(benchmark)
@@ -5043,6 +5039,137 @@ def _formal_predictions(
     return predictions
 
 
+@contextmanager
+def _snapshot_formal_human_benchmark(
+    source: Path,
+) -> Iterator[tuple[Path, str]]:
+    source_flags, directory_flags, destination_flags = (
+        _evaluation_snapshot_open_flags()
+    )
+    snapshot_root = Path(tempfile.mkdtemp(prefix="moving-det-human-benchmark-"))
+    registry = _EvaluationFileDescriptorRegistry()
+    budget = _EvaluationSnapshotBudget()
+    primary_error: BaseException | None = None
+    try:
+        os.chmod(snapshot_root, 0o700)
+        source_fd, _ = _open_evaluation_directory(
+            Path(source),
+            label="formal human benchmark",
+            flags=directory_flags,
+            registry=registry,
+        )
+        names, directory_identity, directory_signature = (
+            _list_stable_evaluation_directory(
+                source_fd,
+                label="formal human benchmark",
+            )
+        )
+        expected_names = set(_FORMAL_HUMAN_BENCHMARK_ARTIFACTS)
+        _require_evaluation_artifact_set(
+            names,
+            expected_names,
+            label="formal human benchmark",
+        )
+        identities = set()
+        digests = {}
+        for name in _FORMAL_HUMAN_BENCHMARK_ARTIFACTS:
+            digest, identity = _copy_evaluation_regular_file(
+                name,
+                snapshot_root / name,
+                label=f"formal human benchmark artifact {name}",
+                source_flags=source_flags,
+                destination_flags=destination_flags,
+                registry=registry,
+                source_directory_fd=source_fd,
+                artifact_kind="text",
+                budget=budget,
+            )
+            if identity in identities:
+                raise WorkflowError(
+                    "formal human benchmark artifacts contain path aliases"
+                )
+            identities.add(identity)
+            digests[name] = digest
+        final_names, _, _ = _list_stable_evaluation_directory(
+            source_fd,
+            label="formal human benchmark",
+            expected_identity=directory_identity,
+            expected_signature=directory_signature,
+        )
+        _require_evaluation_artifact_set(
+            final_names,
+            expected_names,
+            label="formal human benchmark",
+        )
+        _close_evaluation_descriptor(registry, source_fd)
+        yield snapshot_root, digests["benchmark.json"]
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        try:
+            _cleanup_evaluation_descriptors(registry, primary_error)
+        except BaseException as exc:
+            cleanup_error = exc
+        try:
+            shutil.rmtree(snapshot_root)
+        except BaseException as exc:
+            if primary_error is not None:
+                primary_error.add_note(
+                    "formal human benchmark snapshot cleanup error: "
+                    f"exception={type(exc).__name__}, message={exc}"
+                )
+            elif cleanup_error is not None:
+                cleanup_error.add_note(
+                    "formal human benchmark snapshot cleanup error: "
+                    f"exception={type(exc).__name__}, message={exc}"
+                )
+            else:
+                raise
+        if primary_error is None and cleanup_error is not None:
+            raise cleanup_error
+
+
+def _load_approved_formal_human_benchmark(
+    source: Path,
+) -> tuple[object, str]:
+    from moving_det.ml.formal_experiment import APPROVED_HUMAN_SHA256
+    from moving_det.ml.human_benchmark_artifacts import load_human_benchmark
+
+    with _snapshot_formal_human_benchmark(source) as (
+        snapshot_root,
+        benchmark_sha256,
+    ):
+        if benchmark_sha256 != APPROVED_HUMAN_SHA256:
+            raise WorkflowError(
+                "formal comparison requires the approved human benchmark"
+            )
+        try:
+            benchmark = load_human_benchmark(snapshot_root)
+        except (OSError, ValueError) as exc:
+            raise WorkflowError(
+                "formal human benchmark cannot be strictly loaded"
+            ) from exc
+    return benchmark, benchmark_sha256
+
+
+def _load_stable_human_benchmark(source: Path) -> tuple[object, str]:
+    from moving_det.ml.human_benchmark_artifacts import load_human_benchmark
+
+    with _snapshot_formal_human_benchmark(source) as (
+        snapshot_root,
+        benchmark_sha256,
+    ):
+        try:
+            benchmark = load_human_benchmark(snapshot_root)
+        except (OSError, ValueError) as exc:
+            raise WorkflowError(
+                "human benchmark provenance cannot be strictly loaded"
+            ) from exc
+    return benchmark, benchmark_sha256
+
+
 def _load_formal_human_comparison(
     args: argparse.Namespace,
 ) -> tuple[object, object, str]:
@@ -5050,10 +5177,7 @@ def _load_formal_human_comparison(
         HumanRunEvidence,
         compare_human_runs,
     )
-    from moving_det.ml.human_benchmark_artifacts import (
-        human_benchmark_fingerprint,
-        load_human_benchmark,
-    )
+    from moving_det.ml.formal_experiment import APPROVED_HUMAN_SHA256
     from moving_det.ml.inference import FrameKey
 
     paths = _formal_human_run_paths(args)
@@ -5109,6 +5233,10 @@ def _load_formal_human_comparison(
                 )
     if baseline_run.get("evaluation_split") != "test":
         raise WorkflowError("formal human comparison requires frozen test runs")
+    if baseline_run.get("human_benchmark_sha256") != APPROVED_HUMAN_SHA256:
+        raise WorkflowError(
+            "formal comparison requires the approved human benchmark"
+        )
     mg_full_run = records["mg_full"][0]
     motion_off_run = records["motion_off"][0]
     for field in (
@@ -5122,6 +5250,18 @@ def _load_formal_human_comparison(
                 "Motion-Off must use the exact MG Full checkpoint, threshold, "
                 f"and alignment provenance ({field.replace('_', ' ')} differs)"
             )
+    mg_threshold_source = _absolute_resolved_path(
+        mg_full_run.get("threshold_source"),
+        field="MG Full threshold source",
+    )
+    motion_off_threshold_source = _absolute_resolved_path(
+        motion_off_run.get("threshold_source"),
+        field="Motion-Off threshold source",
+    )
+    if motion_off_threshold_source != mg_threshold_source:
+        raise WorkflowError(
+            "Motion-Off must use the same threshold source as MG Full"
+        )
 
     for label, (loaded_run, loaded_metrics, root) in tuple(records.items()):
         stable_run = _json_from_declared_bytes(
@@ -5176,11 +5316,9 @@ def _load_formal_human_comparison(
         )
 
     benchmark_source = Path(str(baseline_run["human_benchmark_source"]))
-    try:
-        benchmark = load_human_benchmark(benchmark_source)
-        benchmark_sha256 = human_benchmark_fingerprint(benchmark_source)
-    except (OSError, ValueError) as exc:
-        raise WorkflowError("formal human benchmark cannot be strictly loaded") from exc
+    benchmark, benchmark_sha256 = _load_approved_formal_human_benchmark(
+        benchmark_source
+    )
     if benchmark_sha256 != baseline_run["human_benchmark_sha256"]:
         raise WorkflowError("formal human benchmark fingerprint is mismatched")
     _fixed_human_frame_universe(benchmark)

@@ -255,61 +255,136 @@ def test_compare_human_runs_rebuilds_metrics_from_ranked_predictions(
         )
 
 
-def test_recall_at_common_fp_budget_selects_each_model_independently():
-    baseline = {
-        "0": [
-            {"recall": 0.4, "false_positives_per_frame": 0.1},
-            {"recall": 0.8, "false_positives_per_frame": 0.3},
-        ],
-        "1": [],
-        "2": [],
-        "3": [],
-    }
-    candidate = {
-        "0": [
-            {"recall": 0.5, "false_positives_per_frame": 0.1},
-            {"recall": 0.9, "false_positives_per_frame": 0.4},
-        ],
-        "1": [],
-        "2": [],
-        "3": [],
-    }
-
-    assert recall_at_common_fp_budget(baseline, candidate, budget=0.3) == {
-        "baseline_recall": 0.8,
-        "candidate_recall": 0.5,
-        "recall_delta": pytest.approx(-0.3),
-        "false_positives_per_frame_budget": 0.3,
-    }
-
-
-def test_recall_at_common_fp_budget_uses_same_class_budgets_and_gt_weights():
-    baseline = {
-        "0": [{"recall": 0.9, "false_positives_per_frame": 0.1}],
-        "1": [{"recall": 0.2, "false_positives_per_frame": 0.1}],
-        "2": [],
-        "3": [],
-    }
-    candidate = {
-        "0": [{"recall": 0.4, "false_positives_per_frame": 0.1}],
-        "1": [{"recall": 0.8, "false_positives_per_frame": 0.1}],
-        "2": [],
-        "3": [],
-    }
+def test_recall_at_common_fp_budget_preserves_low_fp_ranked_prefix():
+    frames = tuple(
+        HumanFrame(
+            site="site19",
+            sequence="sequence_a",
+            frame=frame,
+            image_path=Path(f"/images/{frame}.jpg"),
+            annotation_member=f"{frame}.json",
+            image_sha256=f"{frame:064x}",
+        )
+        for frame in range(1, 11)
+    )
+    truths = tuple(
+        HumanTruth(
+            site=row.site,
+            sequence=row.sequence,
+            frame=row.frame,
+            class_id=0,
+            track_id=1,
+            obb=OBB(100.0, 100.0, 20.0, 12.0, 0.0),
+            pixel_speed=2.0,
+            visible_span=0,
+        )
+        for row in frames
+    )
+    benchmark = HumanBenchmark(
+        source_zip=Path("/human.zip"),
+        source_zip_sha256="a" * 64,
+        annotation_count=10,
+        frames=frames,
+        truths=truths,
+        ignores=(),
+        vehicle_counts={},
+    )
+    baseline = (
+        _prediction(1, confidence=0.99, cx=400.0),
+        _prediction(1, confidence=0.98),
+        _prediction(2, confidence=0.97, cx=400.0),
+        *(
+            _prediction(frame, confidence=0.90 - frame / 1000)
+            for frame in range(2, 11)
+        ),
+    )
 
     diagnostic = recall_at_common_fp_budget(
         baseline,
-        candidate,
-        budget=0.2,
-        class_budgets={"0": 0.1, "1": 0.1, "2": 0.0, "3": 0.0},
-        class_ground_truth_counts={"0": 1, "1": 3, "2": 0, "3": 0},
+        (),
+        benchmark=benchmark,
+        budget=0.1,
+        class_budgets={"0": 0.1, "1": 0.0, "2": 0.0, "3": 0.0},
     )
 
     assert diagnostic == {
-        "baseline_recall": pytest.approx(0.375),
-        "candidate_recall": pytest.approx(0.7),
-        "recall_delta": pytest.approx(0.325),
-        "false_positives_per_frame_budget": 0.2,
+        "baseline_recall": pytest.approx(0.1),
+        "candidate_recall": 0.0,
+        "recall_delta": pytest.approx(-0.1),
+        "false_positives_per_frame_budget": 0.1,
+    }
+
+
+def test_recall_at_common_fp_budget_never_mixes_class_budgets():
+    frames = tuple(
+        HumanFrame(
+            site="site19",
+            sequence="sequence_a",
+            frame=frame,
+            image_path=Path(f"/images/{frame}.jpg"),
+            annotation_member=f"{frame}.json",
+            image_sha256=f"{frame:064x}",
+        )
+        for frame in range(1, 5)
+    )
+    truths = tuple(
+        HumanTruth(
+            site=row.site,
+            sequence=row.sequence,
+            frame=row.frame,
+            class_id=0 if row.frame <= 3 else 1,
+            track_id=row.frame,
+            obb=OBB(100.0, 100.0, 20.0, 12.0, 0.0),
+            pixel_speed=2.0,
+            visible_span=0,
+        )
+        for row in frames
+    )
+    benchmark = HumanBenchmark(
+        source_zip=Path("/human.zip"),
+        source_zip_sha256="a" * 64,
+        annotation_count=4,
+        frames=frames,
+        truths=truths,
+        ignores=(),
+        vehicle_counts={},
+    )
+    candidate = (
+        _prediction(1, confidence=0.99, cx=400.0),
+        *(_prediction(frame, confidence=0.9 - frame / 100) for frame in range(1, 4)),
+        Detection(
+            frame=4,
+            obb=OBB(400.0, 100.0, 20.0, 12.0, 0.0),
+            class_id=1,
+            confidence=0.80,
+            tile=_TILE,
+            site="site19",
+            sequence="sequence_a",
+        ),
+        Detection(
+            frame=4,
+            obb=truths[3].obb,
+            class_id=1,
+            confidence=0.79,
+            tile=_TILE,
+            site="site19",
+            sequence="sequence_a",
+        ),
+    )
+
+    diagnostic = recall_at_common_fp_budget(
+        (),
+        candidate,
+        benchmark=benchmark,
+        budget=0.25,
+        class_budgets={"0": 0.25, "1": 0.0, "2": 0.0, "3": 0.0},
+    )
+
+    assert diagnostic == {
+        "baseline_recall": 0.0,
+        "candidate_recall": pytest.approx(0.75),
+        "recall_delta": pytest.approx(0.75),
+        "false_positives_per_frame_budget": 0.25,
     }
 
 

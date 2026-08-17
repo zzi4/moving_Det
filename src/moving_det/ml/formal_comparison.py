@@ -11,6 +11,7 @@ from moving_det.ml.human_evaluation import (
     evaluate_human_gate,
     evaluate_human_predictions,
     paired_human_transitions,
+    ranked_recall_at_class_fp_budgets,
 )
 from moving_det.ml.inference import Detection, FrameKey
 
@@ -18,7 +19,14 @@ from moving_det.ml.inference import Detection, FrameKey
 _CANDIDATE_LABELS = frozenset({"mg_full", "motion_off", "mg_frozen"})
 _CLASS_KEYS = frozenset({"0", "1", "2", "3"})
 _PR_FIELDS = frozenset(
-    {"recall", "precision", "score", "false_positives_per_frame"}
+    {
+        "recall_target",
+        "operating_recall",
+        "operating_precision",
+        "interpolated_precision",
+        "score",
+        "false_positives_per_frame",
+    }
 )
 
 
@@ -90,26 +98,59 @@ def _validate_pr_curve(metrics: Mapping[str, object], label: str) -> None:
                 raise ValueError(
                     f"{label} {group_name} class {class_id} PR curve is invalid"
                 )
-            previous_recall = -1.0
-            for row in raw_rows:
+            for index, row in enumerate(raw_rows):
                 if not isinstance(row, Mapping) or set(row) != _PR_FIELDS:
                     raise ValueError(
                         f"{label} {group_name} class {class_id} PR row is invalid"
                     )
-                recall = _unit_interval(row["recall"], "PR recall")
-                _unit_interval(row["precision"], "PR precision")
-                _unit_interval(row["score"], "PR score")
-                fp_per_frame = row["false_positives_per_frame"]
+                recall_target = _unit_interval(
+                    row["recall_target"],
+                    "PR recall target",
+                )
+                if not math.isclose(
+                    recall_target,
+                    index / 100,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ):
+                    raise ValueError("PR recall targets must be canonical")
+                interpolated = _unit_interval(
+                    row["interpolated_precision"],
+                    "PR interpolated precision",
+                )
+                actual = (
+                    row["operating_recall"],
+                    row["operating_precision"],
+                    row["score"],
+                    row["false_positives_per_frame"],
+                )
+                if all(value is None for value in actual):
+                    if interpolated != 0.0:
+                        raise ValueError(
+                            "unreachable PR target must have zero interpolation"
+                        )
+                    continue
+                if any(value is None for value in actual):
+                    raise ValueError("PR operating point must be complete")
+                operating_recall = _unit_interval(
+                    actual[0],
+                    "PR operating recall",
+                )
+                operating_precision = _unit_interval(
+                    actual[1],
+                    "PR operating precision",
+                )
+                _unit_interval(actual[2], "PR score")
+                fp_per_frame = actual[3]
                 if (
                     isinstance(fp_per_frame, bool)
                     or not isinstance(fp_per_frame, (int, float))
                     or not math.isfinite(float(fp_per_frame))
                     or float(fp_per_frame) < 0
+                    or operating_recall < recall_target
+                    or interpolated != operating_precision
                 ):
-                    raise ValueError("PR false_positives_per_frame is invalid")
-                if recall < previous_recall:
-                    raise ValueError("PR recall must be ordered")
-                previous_recall = recall
+                    raise ValueError("PR operating point is invalid")
 
 
 def _validate_metrics(
@@ -213,12 +254,12 @@ def run_reference(evidence: HumanRunEvidence) -> Mapping[str, object]:
 
 
 def recall_at_common_fp_budget(
-    baseline_curve: Mapping[str, object],
-    candidate_curve: Mapping[str, object],
+    baseline_predictions: Sequence[Detection],
+    candidate_predictions: Sequence[Detection],
     *,
+    benchmark: HumanBenchmark,
     budget: float,
-    class_budgets: Mapping[str, float] | None = None,
-    class_ground_truth_counts: Mapping[str, int] | None = None,
+    class_budgets: Mapping[str, float],
 ) -> Mapping[str, float | None]:
     if (
         isinstance(budget, bool)
@@ -228,74 +269,36 @@ def recall_at_common_fp_budget(
     ):
         raise ValueError("false-positive budget must be finite and non-negative")
     converted_budget = float(budget)
-    if class_budgets is None:
-        normalized_budgets = {
-            class_id: converted_budget for class_id in _CLASS_KEYS
-        }
-    else:
-        if not isinstance(class_budgets, Mapping) or set(
-            class_budgets
-        ) != _CLASS_KEYS:
-            raise ValueError("per-class false-positive budgets are invalid")
-        normalized_budgets = {}
-        for class_id, value in class_budgets.items():
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or float(value) < 0
-            ):
-                raise ValueError("per-class false-positive budget is invalid")
-            normalized_budgets[class_id] = float(value)
-    if class_ground_truth_counts is None:
-        normalized_counts = {
-            class_id: int(
-                bool(baseline_curve.get(class_id))
-                or bool(candidate_curve.get(class_id))
-            )
-            for class_id in _CLASS_KEYS
-        }
-    else:
-        if not isinstance(class_ground_truth_counts, Mapping) or set(
-            class_ground_truth_counts
-        ) != _CLASS_KEYS:
-            raise ValueError("per-class ground-truth counts are invalid")
-        normalized_counts = {}
-        for class_id, value in class_ground_truth_counts.items():
-            if type(value) is not int or value < 0:
-                raise ValueError("per-class ground-truth count is invalid")
-            normalized_counts[class_id] = value
+    if not isinstance(benchmark, HumanBenchmark):
+        raise ValueError("benchmark must be a HumanBenchmark")
+    normalized_counts = {
+        class_id: sum(
+            truth.class_id == int(class_id) for truth in benchmark.truths
+        )
+        for class_id in _CLASS_KEYS
+    }
     total_truth = sum(normalized_counts.values())
     if total_truth <= 0:
         raise ValueError("matched-FP diagnostic requires ground truth")
+    baseline_by_class = ranked_recall_at_class_fp_budgets(
+        baseline_predictions,
+        benchmark,
+        class_budgets,
+    )
+    candidate_by_class = ranked_recall_at_class_fp_budgets(
+        candidate_predictions,
+        benchmark,
+        class_budgets,
+    )
 
-    def weighted_recall(curve: Mapping[str, object], label: str) -> float:
-        if not isinstance(curve, Mapping) or set(curve) != _CLASS_KEYS:
-            raise ValueError(f"{label} PR class schema is invalid")
-        weighted = 0.0
-        for class_id, rows in curve.items():
-            if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
-                raise ValueError(f"{label} PR curve is invalid")
-            eligible: list[float] = []
-            for row in rows:
-                if not isinstance(row, Mapping):
-                    raise ValueError(f"{label} PR row is invalid")
-                recall = _unit_interval(row.get("recall"), "PR recall")
-                false_positives = row.get("false_positives_per_frame")
-                if (
-                    isinstance(false_positives, bool)
-                    or not isinstance(false_positives, (int, float))
-                    or not math.isfinite(float(false_positives))
-                    or float(false_positives) < 0
-                ):
-                    raise ValueError("PR false_positives_per_frame is invalid")
-                if float(false_positives) <= normalized_budgets[class_id]:
-                    eligible.append(recall)
-            weighted += max(eligible, default=0.0) * normalized_counts[class_id]
-        return weighted / total_truth
+    def weighted_recall(values: Mapping[str, float | None]) -> float:
+        return sum(
+            (values[class_id] or 0.0) * normalized_counts[class_id]
+            for class_id in _CLASS_KEYS
+        ) / total_truth
 
-    baseline_recall = weighted_recall(baseline_curve, "baseline")
-    candidate_recall = weighted_recall(candidate_curve, "candidate")
+    baseline_recall = weighted_recall(baseline_by_class)
+    candidate_recall = weighted_recall(candidate_by_class)
     return {
         "baseline_recall": baseline_recall,
         "candidate_recall": candidate_recall,
@@ -379,8 +382,9 @@ def compare_human_runs(
             paired,
         )
         matched_fp_budget[label] = recall_at_common_fp_budget(
-            baseline.metrics["pr_curve"]["riou_025"],
-            candidate.metrics["pr_curve"]["riou_025"],
+            baseline.predictions,
+            candidate.predictions,
+            benchmark=benchmark,
             budget=baseline_budget_count / len(benchmark_frames),
             class_budgets={
                 class_id: (
@@ -388,10 +392,6 @@ def compare_human_runs(
                     - int(row["matched_count"])
                 )
                 / len(benchmark_frames)
-                for class_id, row in baseline.metrics["per_class"].items()
-            },
-            class_ground_truth_counts={
-                class_id: int(row["gt_count"])
                 for class_id, row in baseline.metrics["per_class"].items()
             },
         )

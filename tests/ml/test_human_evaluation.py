@@ -243,14 +243,18 @@ def test_human_metrics_publish_map50_95_and_full_pr_curve():
         assert threshold_curves["3"] == []
         for class_curve in threshold_curves.values():
             assert len(class_curve) in {0, 101}
-            assert [row["recall"] for row in class_curve] == sorted(
-                row["recall"] for row in class_curve
-            )
+            if not class_curve:
+                continue
+            assert [row["recall_target"] for row in class_curve] == [
+                pytest.approx(index / 100) for index in range(101)
+            ]
             assert all(
                 set(row)
                 == {
-                    "recall",
-                    "precision",
+                    "recall_target",
+                    "operating_recall",
+                    "operating_precision",
+                    "interpolated_precision",
                     "score",
                     "false_positives_per_frame",
                 }
@@ -269,7 +273,32 @@ def test_human_pr_curve_uses_predictions_below_frozen_operating_threshold():
 
     assert metrics["prediction_count"] == 0
     assert metrics["map50_95"] == 1.0
-    assert metrics["pr_curve"]["riou_050"]["0"][-1]["recall"] == 1.0
+    assert (
+        metrics["pr_curve"]["riou_050"]["0"][-1]["operating_recall"]
+        == 1.0
+    )
+
+
+def test_human_pr_curve_single_tp_distinguishes_targets_from_operating_point():
+    truth = _truth(1, cls=0, track=1, cx=100.0)
+
+    metrics = evaluate_human_predictions(
+        (_matching_prediction(truth, confidence=0.4),),
+        _benchmark(truth),
+        {"threshold": 0.5},
+    )
+
+    curve = metrics["pr_curve"]["riou_025"]["0"]
+    assert len(curve) == 101
+    assert curve[0] == {
+        "recall_target": 0.0,
+        "operating_recall": 1.0,
+        "operating_precision": 1.0,
+        "interpolated_precision": 1.0,
+        "score": 0.4,
+        "false_positives_per_frame": 0.0,
+    }
+    assert curve[-1] == {**curve[0], "recall_target": 1.0}
 
 
 def test_human_map50_95_averages_all_ten_iou_thresholds():

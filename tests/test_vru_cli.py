@@ -71,6 +71,22 @@ REQUIRES_TORCH = pytest.mark.skipif(
     importlib.util.find_spec("torch") is None,
     reason="requires the separate moving-det-vru Torch environment",
 )
+_APPROVED_FORMAL_HUMAN_SHA256 = (
+    "90c00eadb50d38cc3be0ffd8e30399041855f8be81804e83288304160178b851"
+)
+_HUMAN_BENCHMARK_SHELL_ARTIFACTS = (
+    "frames.jsonl",
+    "ground-truth.jsonl",
+    "ignore.jsonl",
+    "vehicle-audit.json",
+)
+
+
+def _human_benchmark_shell(root: Path, manifest: bytes) -> None:
+    root.mkdir()
+    (root / "benchmark.json").write_bytes(manifest)
+    for name in _HUMAN_BENCHMARK_SHELL_ARTIFACTS:
+        (root / name).write_bytes(b"")
 
 
 def _manifest_children(root: Path, train_rows: list[dict[str, object]]) -> None:
@@ -291,7 +307,7 @@ def test_compare_human_strict_adapter_rejects_manifest_identity_mismatch(
         "metadata_root": str((tmp_path / "metadata").resolve()),
         "seed": 20260806,
         "human_benchmark_source": str((tmp_path / "benchmark").resolve()),
-        "human_benchmark_sha256": "c" * 64,
+        "human_benchmark_sha256": _APPROVED_FORMAL_HUMAN_SHA256,
         "checkpoint_sha256": "d" * 64,
         "threshold_sha256": "e" * 64,
         "threshold_source": str(
@@ -326,6 +342,179 @@ def test_compare_human_strict_adapter_rejects_manifest_identity_mismatch(
         vru_cli_module._load_formal_human_comparison(args)
 
     assert calls == ["baseline", "mg_full", "motion_off"]
+
+
+def test_compare_human_rejects_unapproved_common_benchmark_declaration(
+    tmp_path,
+    monkeypatch,
+):
+    roots = {
+        label: tmp_path / label
+        for label in ("baseline", "mg_full", "motion_off")
+    }
+    args = build_parser().parse_args(
+        [
+            "compare-human",
+            "--baseline",
+            str(roots["baseline"]),
+            "--mg-full",
+            str(roots["mg_full"]),
+            "--motion-off",
+            str(roots["motion_off"]),
+            "--output",
+            str(tmp_path / "comparison"),
+        ]
+    )
+    common = {
+        "schema_version": 2,
+        "evaluation_split": "test",
+        "manifest_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "class_schema": dict(vru_cli_module._CLASS_SCHEMA),
+        "detection_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "continuity_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "image_root": str((tmp_path / "images").resolve()),
+        "metadata_root": str((tmp_path / "metadata").resolve()),
+        "seed": 20260806,
+        "human_benchmark_source": str((tmp_path / "benchmark").resolve()),
+        "human_benchmark_sha256": "c" * 64,
+        "checkpoint_sha256": "d" * 64,
+        "threshold_sha256": "e" * 64,
+        "threshold_source": str(
+            (tmp_path / "validation" / "threshold.json").resolve()
+        ),
+        "alignment_cache": str((tmp_path / "alignment").resolve()),
+        "alignment_cache_sha256": "9" * 64,
+        "artifact_sha256": {"ground-truth.jsonl": "f" * 64},
+    }
+    records = {
+        "baseline": {
+            **common,
+            "model_name": "baseline",
+            "motion_off": False,
+            "alignment_cache": None,
+            "alignment_cache_sha256": None,
+        },
+        "mg_full": {**common, "model_name": "mg_vtod", "motion_off": False},
+        "motion_off": {**common, "model_name": "mg_vtod", "motion_off": True},
+    }
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_verified_evaluation_run",
+        lambda path: (records[Path(path).name], {}, Path(path)),
+    )
+
+    with pytest.raises(WorkflowError, match="approved human benchmark"):
+        vru_cli_module._load_formal_human_comparison(args)
+
+    assert not Path(args.output).exists()
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    (
+        b'{"schema_version":1,"value":2}\n',
+        b'{\n  "schema_version": 1,\n  "value": 2\n}\n',
+    ),
+)
+def test_approved_human_benchmark_identity_is_raw_bytes_not_json_formatting(
+    tmp_path,
+    manifest,
+):
+    root = tmp_path / "benchmark"
+    _human_benchmark_shell(root, manifest)
+
+    with pytest.raises(WorkflowError, match="approved human benchmark"):
+        vru_cli_module._load_approved_formal_human_benchmark(root)
+
+
+def test_formal_benchmark_swap_and_restore_fails_before_output(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "benchmark"
+    _human_benchmark_shell(root, b'{"schema_version":1}\n')
+    manifest = root / "benchmark.json"
+    moved = root / "benchmark-opened.json"
+    replacement = tmp_path / "benchmark-replacement.json"
+    replacement.write_bytes(b'{"schema_version":2}\n')
+    output = tmp_path / "comparison"
+    real_open = vru_cli_module.os.open
+    swapped = False
+
+    def open_then_swap_restore(path, flags, *args, **kwargs):
+        nonlocal swapped
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if not swapped and path == "benchmark.json" and kwargs.get("dir_fd"):
+            manifest.rename(moved)
+            replacement.rename(manifest)
+            manifest.rename(replacement)
+            moved.rename(manifest)
+            directory_stat = root.stat()
+            vru_cli_module.os.utime(
+                root,
+                ns=(
+                    directory_stat.st_atime_ns,
+                    directory_stat.st_mtime_ns + 1_000_000_000,
+                ),
+            )
+            swapped = True
+        return descriptor
+
+    monkeypatch.setattr(vru_cli_module.os, "open", open_then_swap_restore)
+
+    with pytest.raises(WorkflowError, match="changed while snapshotting"):
+        vru_cli_module._load_approved_formal_human_benchmark(root)
+
+    assert swapped is True
+    assert not output.exists()
+
+
+def test_run_benchmark_loader_parses_snapshot_without_path_rehash(
+    tmp_path,
+    monkeypatch,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    root = tmp_path / "benchmark"
+    manifest = b'{"schema_version":1}\n'
+    _human_benchmark_shell(root, manifest)
+    expected_sha256 = hashlib.sha256(manifest).hexdigest()
+    sentinel = object()
+    loaded_paths = []
+
+    def load_snapshot(path):
+        loaded_paths.append(Path(path))
+        return sentinel
+
+    monkeypatch.setattr(benchmark_artifacts, "load_human_benchmark", load_snapshot)
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "human_benchmark_fingerprint",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError("strict run loader reopened benchmark.json by path")
+        ),
+    )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_fixed_human_frame_universe",
+        lambda benchmark: (),
+    )
+
+    loaded = vru_cli_module._load_human_benchmark_from_run(
+        {
+            "human_benchmark_source": str(root.resolve()),
+            "human_benchmark_sha256": expected_sha256,
+        }
+    )
+
+    assert loaded is sentinel
+    assert len(loaded_paths) == 1
+    assert loaded_paths[0] != root
 
 
 def test_compare_human_publication_failure_preserves_existing_output(
@@ -513,7 +702,7 @@ def test_compare_human_rejects_motion_off_alignment_cache_mismatch(
         "metadata_root": str((tmp_path / "metadata").resolve()),
         "seed": 20260806,
         "human_benchmark_source": str((tmp_path / "benchmark").resolve()),
-        "human_benchmark_sha256": "c" * 64,
+        "human_benchmark_sha256": _APPROVED_FORMAL_HUMAN_SHA256,
         "checkpoint_sha256": "d" * 64,
         "threshold_sha256": "e" * 64,
         "artifact_sha256": {"ground-truth.jsonl": truth_sha256},
@@ -557,6 +746,94 @@ def test_compare_human_rejects_motion_off_alignment_cache_mismatch(
 
     with pytest.raises(WorkflowError, match="alignment"):
         vru_cli_module._load_formal_human_comparison(args)
+
+
+def test_compare_human_requires_motion_off_exact_mg_threshold_source(
+    tmp_path,
+    monkeypatch,
+):
+    roots = {
+        label: tmp_path / "runs" / label
+        for label in ("baseline", "mg_full", "motion_off")
+    }
+    validation_roots = {
+        label: tmp_path / "validation" / label
+        for label in roots
+    }
+    args = build_parser().parse_args(
+        [
+            "compare-human",
+            "--baseline",
+            str(roots["baseline"]),
+            "--mg-full",
+            str(roots["mg_full"]),
+            "--motion-off",
+            str(roots["motion_off"]),
+            "--output",
+            str(tmp_path / "comparison"),
+        ]
+    )
+    common = {
+        "schema_version": 2,
+        "evaluation_split": "test",
+        "manifest_sha256": "a" * 64,
+        "config_sha256": "b" * 64,
+        "class_schema": dict(vru_cli_module._CLASS_SCHEMA),
+        "detection_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "continuity_frame_keys": [
+            {"site": "site19", "sequence": "sequence_a", "frame": 1}
+        ],
+        "image_root": str((tmp_path / "images").resolve()),
+        "metadata_root": str((tmp_path / "metadata").resolve()),
+        "seed": 20260806,
+        "human_benchmark_source": str((tmp_path / "benchmark").resolve()),
+        "human_benchmark_sha256": _APPROVED_FORMAL_HUMAN_SHA256,
+        "checkpoint_sha256": "d" * 64,
+        "threshold_sha256": "e" * 64,
+        "alignment_cache": str((tmp_path / "alignment").resolve()),
+        "alignment_cache_sha256": "9" * 64,
+        "artifact_sha256": {"ground-truth.jsonl": "f" * 64},
+    }
+    records = {
+        "baseline": {
+            **common,
+            "model_name": "baseline",
+            "motion_off": False,
+            "threshold_source": str(
+                (validation_roots["baseline"] / "threshold.json").resolve()
+            ),
+            "alignment_cache": None,
+            "alignment_cache_sha256": None,
+        },
+        "mg_full": {
+            **common,
+            "model_name": "mg_vtod",
+            "motion_off": False,
+            "threshold_source": str(
+                (validation_roots["mg_full"] / "threshold.json").resolve()
+            ),
+        },
+        "motion_off": {
+            **common,
+            "model_name": "mg_vtod",
+            "motion_off": True,
+            "threshold_source": str(
+                (validation_roots["motion_off"] / "threshold.json").resolve()
+            ),
+        },
+    }
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_verified_evaluation_run",
+        lambda path: (records[Path(path).name], {}, Path(path)),
+    )
+
+    with pytest.raises(WorkflowError, match="same threshold source"):
+        vru_cli_module._load_formal_human_comparison(args)
+
+    assert not Path(args.output).exists()
 
 
 def test_formal_human_evidence_loads_verified_full_ranking_below_threshold(
@@ -9176,6 +9453,11 @@ def test_human_evaluate_publishes_benchmark_motion_and_v3_truth_provenance(
         benchmark_artifacts,
         "human_benchmark_fingerprint",
         lambda path: "f" * 64,
+    )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_load_stable_human_benchmark",
+        lambda path: (benchmark, "f" * 64),
     )
     first_frame = benchmark.frames[0]
     below_threshold = {

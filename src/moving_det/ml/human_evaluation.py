@@ -321,7 +321,7 @@ def _precision_recall_curve(
     class_id: int,
     iou_threshold: float,
     frame_count: int,
-) -> list[Mapping[str, float]]:
+) -> list[Mapping[str, float | None]]:
     truth_count = sum(row.class_id == class_id for row in ground_truth)
     ordered = sorted(
         (
@@ -356,21 +356,102 @@ def _precision_recall_curve(
         if eligible.size:
             eligible_precision = precision[eligible]
             best = int(eligible[int(np.argmax(eligible_precision))])
-            precision_value = float(precision[best])
+            operating_recall: float | None = float(recall[best])
+            operating_precision: float | None = float(precision[best])
+            score: float | None = float(ordered[best][1].confidence)
+            false_positives_per_frame: float | None = (
+                float(cumulative_false[best]) / frame_count
+            )
+            interpolated_precision = operating_precision
         else:
-            best = len(ordered) - 1
-            precision_value = 0.0
+            operating_recall = None
+            operating_precision = None
+            score = None
+            false_positives_per_frame = None
+            interpolated_precision = 0.0
         rows.append(
             {
-                "recall": float(recall[best]),
-                "precision": precision_value,
-                "score": float(ordered[best][1].confidence),
-                "false_positives_per_frame": (
-                    float(cumulative_false[best]) / frame_count
-                ),
+                "recall_target": float(target),
+                "operating_recall": operating_recall,
+                "operating_precision": operating_precision,
+                "interpolated_precision": interpolated_precision,
+                "score": score,
+                "false_positives_per_frame": false_positives_per_frame,
             }
         )
     return rows
+
+
+def ranked_recall_at_class_fp_budgets(
+    predictions: Sequence[Detection],
+    benchmark: HumanBenchmark,
+    class_budgets: Mapping[str, float],
+    *,
+    iou_threshold: float = 0.25,
+) -> Mapping[str, float | None]:
+    """Return lossless ranked-prefix recall at independent class FP budgets."""
+    if not isinstance(class_budgets, Mapping) or set(class_budgets) != {
+        str(class_id) for class_id in _CLASS_IDS
+    }:
+        raise ValueError("per-class false-positive budgets are invalid")
+    normalized_budgets = {}
+    for class_id, value in class_budgets.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise ValueError("per-class false-positive budget is invalid")
+        normalized_budgets[class_id] = float(value)
+    threshold = _unit_interval(iou_threshold, "ranked-prefix IoU threshold")
+    truth_rows, frame_universe = _validate_human_benchmark(benchmark)
+    prediction_rows = _validated_human_predictions(
+        predictions,
+        frame_universe,
+        "ranked-prefix",
+    )
+    unsuppressed_rows, _ = suppress_ignored_predictions(
+        prediction_rows,
+        benchmark.ignores,
+    )
+    ground_truth = _as_ground_truth(truth_rows)
+    result = {}
+    for class_id in _CLASS_IDS:
+        truth_count = sum(row.class_id == class_id for row in ground_truth)
+        class_key = str(class_id)
+        if truth_count == 0:
+            result[class_key] = None
+            continue
+        matched = match_detections(
+            unsuppressed_rows,
+            ground_truth,
+            threshold,
+            class_id=class_id,
+        )
+        ordered = sorted(
+            (
+                (index, row)
+                for index, row in enumerate(unsuppressed_rows)
+                if row.class_id == class_id
+            ),
+            key=_prediction_key,
+        )
+        true_positives = 0
+        false_positives = 0
+        best_recall = 0.0
+        for index, _ in ordered:
+            if matched.prediction_is_true_positive[index]:
+                true_positives += 1
+            else:
+                false_positives += 1
+            if (
+                false_positives / len(frame_universe)
+                <= normalized_budgets[class_key]
+            ):
+                best_recall = max(best_recall, true_positives / truth_count)
+        result[class_key] = best_recall
+    return result
 
 
 def _recall_row(
