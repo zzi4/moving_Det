@@ -159,6 +159,11 @@ async function evidenceRouteServer(
 ) {
   const server = createServer(async (request, response) => {
     try {
+      const routeBarrier = routeOptions.beforeResponseBarrier;
+      const beforeResponseBarrier =
+        routeBarrier === undefined || routeBarrier === null
+          ? routeBarrier
+          : () => routeBarrier(request);
       await serveFormalEvidenceRoute({
         request,
         response,
@@ -166,6 +171,7 @@ async function evidenceRouteServer(
         route: "/formal-evidence/videos/site19-day.mp4",
         evidenceCache,
         ...routeOptions,
+        beforeResponseBarrier,
       });
     } catch {
       if (!response.headersSent) response.statusCode = 404;
@@ -340,6 +346,48 @@ test("formal evidence cache deduplicates concurrent initial validation", async (
   assert.equal(manifestReads, 1);
 });
 
+test("formal evidence cache detaches a completed task before rebuild notification", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const evidenceCache = createFormalEvidenceCache();
+  await evidenceCache.getFiles({ formalRoot });
+  const manifestPath = join(formalRoot, "demo", "demo.json");
+  const manifest = await readFile(manifestPath);
+  await rename(manifestPath, `${manifestPath}.completed-task-swap`);
+  await writeFile(manifestPath, manifest);
+
+  let announceNotification;
+  const notificationStarted = new Promise((resolve) => {
+    announceNotification = resolve;
+  });
+  let releaseNotification;
+  const notificationBlocked = new Promise((resolve) => {
+    releaseNotification = resolve;
+  });
+  const rebuild = evidenceCache.getFiles({
+    formalRoot,
+    onConsistencyRebuild: async () => {
+      announceNotification();
+      await notificationBlocked;
+    },
+  });
+  await notificationStarted;
+
+  let lateNotifications = 0;
+  let lateFiles;
+  try {
+    lateFiles = await evidenceCache.getFiles({
+      formalRoot,
+      onConsistencyRebuild: () => {
+        lateNotifications += 1;
+      },
+    });
+    assert.equal(lateNotifications, 0);
+  } finally {
+    releaseNotification();
+  }
+  assert.strictEqual(await rebuild, lateFiles);
+});
+
 test("formal evidence cache revalidates ctime and manifest identity changes", async (t) => {
   const formalRoot = await formalMediaFixture(t);
   let hashCount = 0;
@@ -496,6 +544,103 @@ test("formal evidence counts a cache-hit manifest rebuild against the request bu
   assert.equal(response.headers.get("etag"), null);
   assert.equal(body.includes("site19-day"), false);
   assert.equal(barrierCalls, 1);
+  assert.equal(manifestReads, 2);
+});
+
+test("formal evidence charges a concurrent joiner for a route-originated rebuild", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  let manifestReads = 0;
+  let releaseRouteRebuild;
+  const routeRebuildBlocked = new Promise((resolve) => {
+    releaseRouteRebuild = resolve;
+  });
+  let announceRouteRebuild;
+  const routeRebuildStarted = new Promise((resolve) => {
+    announceRouteRebuild = resolve;
+  });
+  const evidenceCache = createFormalEvidenceCache({
+    manifestReader: async (options) => {
+      manifestReads += 1;
+      if (manifestReads === 2) {
+        announceRouteRebuild();
+        await routeRebuildBlocked;
+      }
+      return readFormalDemoManifest(options);
+    },
+  });
+  await evidenceCache.getFiles({ formalRoot });
+
+  let routeGetCalls = 0;
+  let announceJoiner;
+  const joinerJoined = new Promise((resolve) => {
+    announceJoiner = resolve;
+  });
+  const rebuildNotifications = new Map();
+  const observedCache = {
+    getFiles(options) {
+      routeGetCalls += 1;
+      const call = routeGetCalls;
+      const task = evidenceCache.getFiles({
+        ...options,
+        onConsistencyRebuild: async () => {
+          rebuildNotifications.set(
+            call,
+            (rebuildNotifications.get(call) ?? 0) + 1,
+          );
+          await options.onConsistencyRebuild?.();
+        },
+      });
+      if (routeGetCalls === 3) announceJoiner();
+      return task;
+    },
+    invalidate(root) {
+      evidenceCache.invalidate(root);
+    },
+  };
+  const manifestPath = join(formalRoot, "demo", "demo.json");
+  const barrierCalls = new Map();
+  const origin = await evidenceRouteServer(t, {
+    formalRoot,
+    evidenceCache: observedCache,
+    beforeResponseBarrier: async (request) => {
+      const requestName = request.headers["x-test-request"];
+      const calls = (barrierCalls.get(requestName) ?? 0) + 1;
+      barrierCalls.set(requestName, calls);
+      if (calls !== 1) return;
+      const manifest = await readFile(manifestPath);
+      await rename(manifestPath, `${manifestPath}.${requestName}`);
+      await writeFile(manifestPath, manifest);
+    },
+  });
+
+  const originRequest = fetch(`${origin}/video`, {
+    headers: { "x-test-request": "origin" },
+  });
+  await routeRebuildStarted;
+  const joinerRequest = fetch(`${origin}/video`, {
+    headers: { "x-test-request": "joiner" },
+  });
+  await joinerJoined;
+  releaseRouteRebuild();
+
+  const [originResponse, joinerResponse] = await Promise.all([
+    originRequest,
+    joinerRequest,
+  ]);
+  const [originBody, joinerBody] = await Promise.all([
+    originResponse.text(),
+    joinerResponse.text(),
+  ]);
+  assert.equal(joinerResponse.status, 404);
+  assert.equal(joinerResponse.headers.get("accept-ranges"), null);
+  assert.equal(joinerResponse.headers.get("content-type"), null);
+  assert.equal(joinerResponse.headers.get("etag"), null);
+  assert.equal(joinerBody.includes("site19-day"), false);
+  assert.equal(originBody.includes("site19-day"), originResponse.status === 200);
+  assert.equal(barrierCalls.get("joiner"), 1);
+  assert.equal(rebuildNotifications.get(2) ?? 0, 0);
+  assert.equal(rebuildNotifications.get(3), 1);
+  assert.equal(routeGetCalls, 3);
   assert.equal(manifestReads, 2);
 });
 

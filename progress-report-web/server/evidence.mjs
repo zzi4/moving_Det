@@ -98,16 +98,22 @@ export function createFormalEvidenceCache({
   const entries = new Map();
   const inFlight = new Map();
 
-  async function getFiles({ formalRoot, onConsistencyRebuild = null }) {
+  async function getFiles({
+    formalRoot,
+    onConsistencyRebuild = null,
+    consistencyRebuildConsumed = false,
+  }) {
     const pending = inFlight.get(formalRoot);
     if (pending) {
-      try {
-        return await pending.task;
-      } finally {
-        if (pending.rebuilt && onConsistencyRebuild !== null) {
-          onConsistencyRebuild();
-        }
+      const files = await pending.task;
+      if (
+        pending.rebuilt &&
+        !consistencyRebuildConsumed &&
+        onConsistencyRebuild !== null
+      ) {
+        await onConsistencyRebuild();
       }
+      return files;
     }
 
     const pendingEntry = { task: null, rebuilt: false };
@@ -127,6 +133,7 @@ export function createFormalEvidenceCache({
         }
       }
 
+      if (consistencyRebuildConsumed) pendingEntry.rebuilt = true;
       const manifest = await manifestReader({ formalRoot });
       if (manifest === null) return new Map();
       await manifestMatcher({
@@ -152,14 +159,20 @@ export function createFormalEvidenceCache({
     })();
     pendingEntry.task = task;
     inFlight.set(formalRoot, pendingEntry);
+    let files;
     try {
-      return await task;
+      files = await task;
     } finally {
       if (inFlight.get(formalRoot) === pendingEntry) inFlight.delete(formalRoot);
-      if (pendingEntry.rebuilt && onConsistencyRebuild !== null) {
-        onConsistencyRebuild();
-      }
     }
+    if (
+      pendingEntry.rebuilt &&
+      !consistencyRebuildConsumed &&
+      onConsistencyRebuild !== null
+    ) {
+      await onConsistencyRebuild();
+    }
+    return files;
   }
 
   return {
@@ -286,6 +299,7 @@ export async function serveFormalEvidenceRoute({
       const evidence = (
         await evidenceCache.getFiles({
           formalRoot,
+          consistencyRebuildConsumed: consistencyRebuilds > 0,
           onConsistencyRebuild: () => {
             consistencyRebuilds += 1;
           },

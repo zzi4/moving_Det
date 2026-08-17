@@ -250,3 +250,89 @@ exit 0
 
 - Callers that supply a custom `FormalEvidenceCache` implementation must honor the optional consistency-rebuild callback for the route to aggregate cache-internal rebuilds; the process-wide cache used by production does so.
 - The existing filesystem identity trust boundary remains based on dev/inode/size/mtime/ctime reporting and `O_NOFOLLOW`; this fix changes only per-request rebuild accounting.
+
+# Task 5 Fix Round 5 — Shared Route-Rebuild Provenance
+
+## Boundary
+
+- Fix baseline: `e3d8ee4a2c0edbbc92fa22f6a5733a366ddbab3e` (verified before edits).
+- Worktree and branch only: `/home/stu1/Projects/moving_Det/.worktrees/mg-vtod-formal-execution` on `codex/mg-vtod-formal-execution`.
+- Changed only the formal evidence cache/route consistency accounting, its declaration and focused tests, and this report.
+- Did not open a browser, deploy, access/create any real formal output, or touch training logic. All new behavior tests use a temporary producer-compatible fixture.
+- Did not modify `.superpowers/sdd/2026-08-17-mg-vtod-formal-comparison/progress.md`.
+
+## RED Evidence
+
+The concurrent HTTP regression test catches the production mutation where a route retry creates a shared in-flight rebuild without marking its provenance. Specifically, omitting the route's consumed-budget state leaves the route-originated `pendingEntry.rebuilt` false, so a concurrent joiner receives rebuilt files without its consistency-rebuild callback and incorrectly spends a second rebuild after the next manifest change.
+
+```text
+node --test server/evidence.test.mjs
+exit 1
+tests 23; pass 22; fail 1
+formal evidence charges a concurrent joiner for a route-originated rebuild
+AssertionError: Expected values to be strictly equal: 200 !== 404
+```
+
+The completion-timing mutation was then isolated: retaining a resolved task in `inFlight` while awaiting its creator's callback makes a post-completion request look like a concurrent rebuild joiner.
+
+```text
+node --test server/evidence.test.mjs
+exit 1
+tests 24; pass 23; fail 1
+formal evidence cache detaches a completed task before rebuild notification
+AssertionError: Expected values to be strictly equal: 1 !== 0
+```
+
+## GREEN Implementation and Concurrency Proof
+
+`serveFormalEvidenceRoute()` now tells `getFiles()` when the current request has already consumed its route-level rebuild. A manifest read created by that retry marks the shared in-flight entry as rebuilt, while notification is suppressed for callers that have already consumed their budget. Every uncharged caller that actually awaits the successful shared task is notified exactly once. Notifications are awaited, occur only after task success, and the task is removed from `inFlight` before a creator-specific callback runs, so callback delay/failure cannot retain or mutate shared in-flight state or leak a detached rejection.
+
+The real HTTP/cache test warms the cache, changes the first request's response barrier, blocks its route-originated manifest rebuild, and starts a second request. The observer resolves only after that second request has called the real cache and joined the pending task. After release, the joiner receives one rebuild notification while the initiating retry receives zero; a second manifest change at the joiner's response barrier returns `404` before `Accept-Ranges`, `Content-Type`, `ETag`, or old `site19-day` bytes. Exactly three route cache calls and two manifest reads prove that the joiner performs no second rebuild. A separate timing test holds the creator's async notification and proves a request arriving after task completion uses the published cache entry with zero rebuild notifications.
+
+```text
+npm run test:evidence
+exit 0
+tests 24; pass 24; fail 0
+```
+
+## Complete Verification
+
+Fresh commands after the last source edit:
+
+```text
+npm test
+exit 0
+70/70 tests passed across status 8/8, evidence 24/24, raw local API 1/1,
+formal status 16/16, formal adapter 6/6, formal view 1/1,
+client/pipeline/LAN 11/11, and rendered HTML 3/3.
+TypeScript completed; the embedded production build completed all five Vinext phases.
+```
+
+```text
+npm run build
+exit 0
+All five Vinext build phases completed. The only advisory was the environment proxy notice.
+```
+
+```text
+npm run lint
+exit 0
+ESLint completed with no warnings or errors.
+```
+
+```text
+git diff --check
+exit 0
+```
+
+## Changed Files
+
+- `progress-report-web/server/evidence.mjs`
+- `progress-report-web/server/evidence.d.mts`
+- `progress-report-web/server/evidence.test.mjs`
+- `.superpowers/sdd/2026-08-17-mg-vtod-formal-comparison/task-5-report.md`
+
+## Residual Risk
+
+- The production process-wide cache implements shared route-rebuild provenance. Existing custom cache objects remain runtime-compatible because the new consumed-budget option is optional; a custom cache that performs its own in-flight deduplication must propagate equivalent provenance to provide the same aggregate guarantee.
+- The unchanged local filesystem trust boundary still relies on dev/inode/size/mtime/ctime identity reporting and `O_NOFOLLOW`.

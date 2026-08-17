@@ -16,7 +16,8 @@ export type FormalEvidenceFile = EvidenceFile & {
 export type FormalEvidenceCache = {
   getFiles(options: {
     formalRoot: string;
-    onConsistencyRebuild?: (() => void) | null;
+    onConsistencyRebuild?: (() => void | Promise<void>) | null;
+    consistencyRebuildConsumed?: boolean;
   }): Promise<Map<string, FormalEvidenceFile>>;
   invalidate(formalRoot: string): void;
 };
