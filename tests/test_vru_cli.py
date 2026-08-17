@@ -7328,6 +7328,134 @@ def test_human_artifacts_accept_exact_fixed_benchmark_evidence(
     assert validated.audit["edge_ignore_count"] == 334
 
 
+@pytest.mark.parametrize(
+    ("field", "mutate"),
+    (
+        (
+            "diagnostic_tile_xywh",
+            lambda value: tuple(value),
+        ),
+        (
+            "diagnostic_tile_xywh",
+            lambda value: [False, *value[1:]],
+        ),
+        (
+            "diagnostic_tile_xywh",
+            lambda value: [float(value[0]), *value[1:]],
+        ),
+        (
+            "tile_grid_xywh",
+            lambda value: {"row": value[0]},
+        ),
+        (
+            "tile_grid_xywh",
+            lambda value: [tuple(value[0]), *value[1:]],
+        ),
+        (
+            "tile_grid_xywh",
+            lambda value: [[False, *value[0][1:]], *value[1:]],
+        ),
+        (
+            "tile_grid_xywh",
+            lambda value: [[float(value[0][0]), *value[0][1:]], *value[1:]],
+        ),
+        (
+            "tile_grid_xywh",
+            lambda value: [[-1, *value[0][1:]], *value[1:]],
+        ),
+        (
+            "tile_grid_xywh",
+            lambda value: [[*value[0][:2], 0, value[0][3]], *value[1:]],
+        ),
+        (
+            "tile_grid_xywh",
+            lambda value: [value[0], value[0], *value[2:]],
+        ),
+        (
+            "tile_grid_xywh",
+            lambda value: [value[1], value[0], *value[2:]],
+        ),
+    ),
+    ids=(
+        "extent-tuple",
+        "extent-bool",
+        "extent-integer-float",
+        "grid-mapping",
+        "grid-row-tuple",
+        "grid-bool",
+        "grid-integer-float",
+        "grid-negative-origin",
+        "grid-zero-width",
+        "grid-duplicate",
+        "grid-order",
+    ),
+)
+def test_human_artifacts_reject_non_exact_overview_geometry(
+    tmp_path,
+    monkeypatch,
+    field,
+    mutate,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    first = dict(bundle.diagnostics[0])
+    first[field] = mutate(first[field])
+
+    with pytest.raises(WorkflowError, match="diagnostic (crop|tile grid)"):
+        _validate_evaluation_artifacts(
+            replace(
+                bundle,
+                diagnostics=(first, *bundle.diagnostics[1:]),
+            ),
+            request,
+        )
+
+
+@pytest.mark.parametrize(
+    ("tile_size", "tile_overlap"),
+    ((960, 128), (1024, 64)),
+    ids=("tile-size", "tile-overlap"),
+)
+def test_human_artifacts_bind_overview_grid_to_request_config(
+    tmp_path,
+    monkeypatch,
+    tile_size,
+    tile_overlap,
+):
+    import moving_det.ml.human_benchmark_artifacts as benchmark_artifacts
+
+    benchmark, request, bundle = _human_evaluation_request_and_bundle(tmp_path)
+    monkeypatch.setattr(
+        benchmark_artifacts,
+        "load_human_benchmark",
+        lambda path: benchmark,
+    )
+    first = {
+        **bundle.diagnostics[0],
+        **_human_overview_metadata(
+            SimpleNamespace(
+                tile_size=tile_size,
+                tile_overlap=tile_overlap,
+            )
+        ),
+    }
+
+    with pytest.raises(WorkflowError, match="tile grid.*config"):
+        _validate_evaluation_artifacts(
+            replace(
+                bundle,
+                diagnostics=(first, *bundle.diagnostics[1:]),
+            ),
+            request,
+        )
+
+
 def test_human_artifacts_reject_legacy_per_speed_metric_disguise(
     tmp_path,
     monkeypatch,
@@ -11119,6 +11247,8 @@ def test_compact_diagnostic_archive_round_trips_bounded_official_maps(tmp_path):
         expected_offsets=(-2, -1, 0, 1, 2),
         human_benchmark=True,
         expected_motion_enabled=True,
+        expected_tile_size=1024,
+        expected_tile_overlap=128,
     )
 
     assert tuple(
@@ -11149,6 +11279,8 @@ def test_compact_diagnostic_archive_round_trips_bounded_official_maps(tmp_path):
             expected_offsets=(-2, -1, 0, 1, 2),
             human_benchmark=True,
             expected_motion_enabled=True,
+            expected_tile_size=1024,
+            expected_tile_overlap=128,
         )
 
     with pytest.raises(WorkflowError, match="truncated"):
@@ -11207,6 +11339,92 @@ def test_compact_diagnostic_archive_round_trips_bounded_official_maps(tmp_path):
             expected_offsets=(-2, -1, 0, 1, 2),
             human_benchmark=True,
             expected_motion_enabled=True,
+            expected_tile_size=1024,
+            expected_tile_overlap=128,
+        )
+
+
+@pytest.mark.parametrize(
+    "defect",
+    (
+        "extent-bool",
+        "extent-integer-float",
+        "extent-mapping",
+        "grid-mapping",
+        "grid-row-mapping",
+        "grid-bool",
+        "grid-integer-float",
+        "wrong-config",
+    ),
+)
+def test_compact_diagnostic_archive_rejects_non_exact_overview_geometry(
+    tmp_path,
+    defect,
+):
+    image_root = (tmp_path / "images").resolve()
+    identity = ("site19", "day-a", 10)
+    cfg = SimpleNamespace(tile_size=1024, tile_overlap=128)
+    metadata = _human_overview_metadata(cfg)
+    if defect == "extent-bool":
+        metadata["diagnostic_tile_xywh"][0] = False
+    elif defect == "extent-integer-float":
+        metadata["diagnostic_tile_xywh"][0] = 0.0
+    elif defect == "extent-mapping":
+        metadata["diagnostic_tile_xywh"] = {"x": 0}
+    elif defect == "grid-mapping":
+        metadata["tile_grid_xywh"] = {"row": metadata["tile_grid_xywh"][0]}
+    elif defect == "grid-row-mapping":
+        metadata["tile_grid_xywh"][0] = {"x": 0}
+    elif defect == "grid-bool":
+        metadata["tile_grid_xywh"][0][0] = False
+    elif defect == "grid-integer-float":
+        metadata["tile_grid_xywh"][0][0] = 0.0
+    else:
+        metadata = _human_overview_metadata(
+            SimpleNamespace(tile_size=960, tile_overlap=128)
+        )
+    zero = vru_cli_module._compact_diagnostic_map(
+        np.zeros((180, 320), dtype=np.float32)
+    )
+    row = {
+        "schema_version": 1,
+        "site": identity[0],
+        "sequence": identity[1],
+        "frame": identity[2],
+        "frame_shape": [2160, 3840],
+        "image_root": str(image_root),
+        "offsets": [-2, -1, 0, 1, 2],
+        "support_paths": [
+            str(
+                image_root
+                / f"{identity[0]}_sequence"
+                / identity[1]
+                / f"{identity[2] + offset:06d}.jpg"
+            )
+            for offset in (-2, -1, 0, 1, 2)
+        ],
+        "motion_map": zero,
+        "selected_long_index": -1,
+        "short_alignment_magnitude": zero,
+        "motion_enabled": True,
+        **metadata,
+    }
+    archive = tmp_path / "diagnostics.bin"
+    digest = vru_cli_module._write_diagnostic_archive(archive, (row,))
+
+    with pytest.raises(WorkflowError, match="diagnostic (crop|tile grid)"):
+        vru_cli_module._read_diagnostic_archive(
+            archive,
+            expected_sha256=digest,
+            expected_identities=(identity,),
+            universe=frozenset((identity,)),
+            model_name="mg_vtod",
+            image_root=image_root,
+            expected_offsets=(-2, -1, 0, 1, 2),
+            human_benchmark=True,
+            expected_motion_enabled=True,
+            expected_tile_size=1024,
+            expected_tile_overlap=128,
         )
 
 
@@ -11333,9 +11551,60 @@ def test_formal_demo_loader_consumes_real_v2_human_writer_contract(
     assert loaded.run["artifact_schema"]["ground-truth.jsonl"] == 3
     assert loaded.run["artifact_schema"]["diagnostics.bin"] == 1
     assert "diagnostics.jsonl" not in loaded.run["artifact_schema"]
+    assert loaded.run["tile_size"] == cfg.tile_size
+    assert loaded.run["tile_overlap"] == cfg.tile_overlap
     assert len(loaded.diagnostics) == 873
     assert loaded.ground_truth[0]["schema_version"] == 3
     assert loaded.threshold == 0.42
+
+    verified_run, _, _ = vru_cli_module._load_verified_evaluation_run(output)
+    assert verified_run["tile_size"] == cfg.tile_size
+    assert verified_run["tile_overlap"] == cfg.tile_overlap
+
+    loaders = (
+        lambda: vru_cli_module._load_verified_evaluation_run(output),
+        lambda: formal_demo.load_verified_run(
+            output,
+            expected_model="mg_vtod",
+            benchmark=benchmark,
+            benchmark_sha256="f" * 64,
+        ),
+    )
+    malformed = {
+        **diagnostics[0],
+        "diagnostic_tile_xywh": [0.0, 0, 3840, 2160],
+    }
+    replacement = output / "diagnostics-replacement.bin"
+    replacement_digest = vru_cli_module._write_diagnostic_archive(
+        replacement,
+        (malformed, *diagnostics[1:]),
+    )
+    replacement.replace(output / "diagnostics.bin")
+    run = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    run["artifact_sha256"]["diagnostics.bin"] = replacement_digest
+    (output / "run.json").write_text(
+        json.dumps(run, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    for loader in loaders:
+        with pytest.raises(ValueError, match="diagnostic crop"):
+            loader()
+
+    replacement = output / "diagnostics-replacement.bin"
+    replacement_digest = vru_cli_module._write_diagnostic_archive(
+        replacement,
+        diagnostics,
+    )
+    replacement.replace(output / "diagnostics.bin")
+    run["artifact_sha256"]["diagnostics.bin"] = replacement_digest
+    run["tile_overlap"] = cfg.tile_overlap + 1
+    (output / "run.json").write_text(
+        json.dumps(run, allow_nan=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    for loader in loaders:
+        with pytest.raises(ValueError, match="tile grid.*config"):
+            loader()
 
 
 def test_build_formal_demo_cli_requires_verified_inputs_and_fixed_fps(

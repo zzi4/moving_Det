@@ -240,6 +240,8 @@ _HUMAN_EVALUATION_RUN_FIELDS = _EVALUATION_RUN_FIELDS | {
     "human_benchmark_source",
     "human_benchmark_sha256",
     "motion_off",
+    "tile_size",
+    "tile_overlap",
 }
 _AUDIT_FIELDS = (
     "site",
@@ -1034,6 +1036,8 @@ def _read_diagnostic_archive(
     expected_offsets: tuple[int, ...] | None,
     human_benchmark: bool,
     expected_motion_enabled: bool | None,
+    expected_tile_size: int | None,
+    expected_tile_overlap: int | None,
 ) -> tuple[dict[str, object], ...]:
     if not _is_sha256(expected_sha256):
         raise WorkflowError("diagnostic archive hash declaration is invalid")
@@ -1162,6 +1166,8 @@ def _read_diagnostic_archive(
         expected_offsets=expected_offsets,
         human_benchmark=human_benchmark,
         expected_motion_enabled=expected_motion_enabled,
+        expected_tile_size=expected_tile_size,
+        expected_tile_overlap=expected_tile_overlap,
     )
 
 
@@ -3138,6 +3144,44 @@ def _validate_diagnostic_map(value: object, *, field: str) -> None:
             raise WorkflowError(f"diagnostic {field} values are invalid")
 
 
+def _validate_human_tile_config(
+    tile_size: object,
+    tile_overlap: object,
+    *,
+    artifact: str,
+) -> tuple[int, int]:
+    if (
+        type(tile_size) is not int
+        or tile_size <= 0
+        or type(tile_overlap) is not int
+        or tile_overlap < 0
+        or tile_overlap >= tile_size
+    ):
+        raise WorkflowError(f"{artifact} tile grid configuration is invalid")
+    return tile_size, tile_overlap
+
+
+def _validate_human_xywh(
+    value: object,
+    *,
+    artifact: str,
+    frame_shape: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    if (
+        type(value) is not list
+        or len(value) != 4
+        or any(type(coordinate) is not int for coordinate in value)
+    ):
+        raise WorkflowError(f"{artifact} schema is invalid")
+    x, y, width, height = value
+    if x < 0 or y < 0 or width <= 0 or height <= 0:
+        raise WorkflowError(f"{artifact} values are invalid")
+    frame_height, frame_width = frame_shape
+    if x + width > frame_width or y + height > frame_height:
+        raise WorkflowError(f"{artifact} lies outside its frame")
+    return x, y, width, height
+
+
 def _absolute_resolved_path(value: object, *, field: str) -> Path:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise WorkflowError(f"{field} must be an absolute resolved path")
@@ -3156,7 +3200,16 @@ def _validate_diagnostic_rows(
     expected_offsets: tuple[int, ...] | None,
     human_benchmark: bool = False,
     expected_motion_enabled: bool | None = None,
+    expected_tile_size: int | None = None,
+    expected_tile_overlap: int | None = None,
 ) -> tuple[dict[str, object], ...]:
+    expected_tile_config = None
+    if human_benchmark:
+        expected_tile_config = _validate_human_tile_config(
+            expected_tile_size,
+            expected_tile_overlap,
+            artifact="expected human diagnostic",
+        )
     normalized = []
     seen: set[tuple[str, str, int]] = set()
     expected_root = image_root.resolve(strict=False)
@@ -3295,18 +3348,39 @@ def _validate_diagnostic_rows(
 
             if raw["diagnostic_space"] != "full-frame-overview":
                 raise WorkflowError("human diagnostic space is invalid")
-            tile_size = raw["tile_size"]
-            tile_overlap = raw["tile_overlap"]
-            if (
-                isinstance(tile_size, bool)
-                or not isinstance(tile_size, int)
-                or tile_size <= 0
-                or isinstance(tile_overlap, bool)
-                or not isinstance(tile_overlap, int)
-                or tile_overlap < 0
-                or tile_overlap >= tile_size
-            ):
-                raise WorkflowError("human diagnostic tile grid parameters are invalid")
+            tile_size, tile_overlap = _validate_human_tile_config(
+                raw["tile_size"],
+                raw["tile_overlap"],
+                artifact="human diagnostic",
+            )
+            assert expected_tile_config is not None
+            if (tile_size, tile_overlap) != expected_tile_config:
+                raise WorkflowError(
+                    "human diagnostic tile grid configuration provenance "
+                    "is inconsistent"
+                )
+            extent = _validate_human_xywh(
+                raw["diagnostic_tile_xywh"],
+                artifact="human diagnostic crop",
+                frame_shape=(frame_shape[0], frame_shape[1]),
+            )
+            if extent != (0, 0, frame_shape[1], frame_shape[0]):
+                raise WorkflowError(
+                    "human diagnostic crop must cover the complete frame"
+                )
+            grid_raw = raw["tile_grid_xywh"]
+            if type(grid_raw) is not list or not grid_raw:
+                raise WorkflowError("human diagnostic tile grid schema is invalid")
+            grid = tuple(
+                _validate_human_xywh(
+                    row,
+                    artifact="human diagnostic tile grid row",
+                    frame_shape=(frame_shape[0], frame_shape[1]),
+                )
+                for row in grid_raw
+            )
+            if len(grid) != len(set(grid)):
+                raise WorkflowError("human diagnostic tile grid contains duplicates")
             try:
                 expected_tiles = full_frame_tiles(
                     frame_shape[1],
@@ -3316,22 +3390,13 @@ def _validate_diagnostic_rows(
                 )
             except ValueError as exc:
                 raise WorkflowError("human diagnostic tile grid is invalid") from exc
-            expected_grid = [
-                [tile.x, tile.y, tile.width, tile.height]
+            expected_grid = tuple(
+                (tile.x, tile.y, tile.width, tile.height)
                 for tile in expected_tiles
-            ]
-            if raw["tile_grid_xywh"] != expected_grid:
+            )
+            if grid != expected_grid:
                 raise WorkflowError(
                     "human diagnostic tile grid is not the canonical ordered grid"
-                )
-            if raw["diagnostic_tile_xywh"] != [
-                0,
-                0,
-                frame_shape[1],
-                frame_shape[0],
-            ]:
-                raise WorkflowError(
-                    "human diagnostic crop must cover the complete frame"
                 )
         else:
             _validate_tile(
@@ -3466,6 +3531,10 @@ def _validate_evaluation_artifacts(
         expected_offsets=_model_offsets(request.model_name, request.cfg),
         human_benchmark=human,
         expected_motion_enabled=(not request.motion_off if human else None),
+        expected_tile_size=(getattr(request.cfg, "tile_size") if human else None),
+        expected_tile_overlap=(
+            getattr(request.cfg, "tile_overlap") if human else None
+        ),
     )
     if human:
         assert expected_human_frames is not None
@@ -3934,6 +4003,8 @@ def _run_evaluate_from_snapshot(
                     ),
                     "human_benchmark_sha256": human_benchmark_sha256,
                     "motion_off": request.motion_off,
+                    "tile_size": getattr(cfg, "tile_size"),
+                    "tile_overlap": getattr(cfg, "tile_overlap"),
                 }
             )
         _validate_evaluation_run_schema(run)
@@ -4254,6 +4325,11 @@ def _validate_evaluation_run_schema(
             raise WorkflowError("human run motion_off provenance is invalid")
         if run.get("motion_off") and model_name != "mg_vtod":
             raise WorkflowError("Motion-Off provenance requires MG-VTOD")
+        _validate_human_tile_config(
+            run.get("tile_size"),
+            run.get("tile_overlap"),
+            artifact="human evaluation run",
+        )
         _validate_human_run_audit(run.get("audit"))
     else:
         _validate_audit(run.get("audit"))
@@ -4418,6 +4494,16 @@ def _load_verified_evaluation_run(
                 if "human_benchmark_sha256" in run
                 else None
             ),
+            expected_tile_size=(
+                run["tile_size"]
+                if "human_benchmark_sha256" in run
+                else None
+            ),
+            expected_tile_overlap=(
+                run["tile_overlap"]
+                if "human_benchmark_sha256" in run
+                else None
+            ),
         )
     if "diagnostics.bin" in schema:
         _read_diagnostic_archive(
@@ -4433,6 +4519,8 @@ def _load_verified_evaluation_run(
             expected_offsets=None,
             human_benchmark=True,
             expected_motion_enabled=not bool(run["motion_off"]),
+            expected_tile_size=run["tile_size"],
+            expected_tile_overlap=run["tile_overlap"],
         )
     if "threshold.json" in schema:
         threshold = _read_json(root / "threshold.json")

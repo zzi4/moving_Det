@@ -688,6 +688,8 @@ def load_verified_run(
         expected_offsets=None,
         human_benchmark=True,
         expected_motion_enabled=True,
+        expected_tile_size=run["tile_size"],
+        expected_tile_overlap=run["tile_overlap"],
     )
     after = root.stat()
     if (
