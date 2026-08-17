@@ -496,6 +496,21 @@ def build_parser() -> argparse.ArgumentParser:
     compare_human.add_argument("--mg-frozen", type=_path_argument)
     compare_human.add_argument("--output", type=_path_argument, required=True)
 
+    formal_demo = subparsers.add_parser(
+        "build-formal-demo",
+        help="build the deterministic verified Baseline/MG Full formal demo",
+    )
+    formal_demo.add_argument("--comparison", type=_path_argument, required=True)
+    formal_demo.add_argument("--baseline", type=_path_argument, required=True)
+    formal_demo.add_argument("--mg-full", type=_path_argument, required=True)
+    formal_demo.add_argument(
+        "--human-benchmark",
+        type=_path_argument,
+        required=True,
+    )
+    formal_demo.add_argument("--output", type=_path_argument, required=True)
+    formal_demo.add_argument("--fps", type=_positive_integer, default=30)
+
     audit = subparsers.add_parser(
         "audit-sample",
         help="freeze a deterministic GT-only independent audit sample",
@@ -552,6 +567,8 @@ def _validate_cross_arguments(
             parser.error("--threshold is forbidden for validation evaluation")
         if args.model == "baseline" and args.alignment_cache is not None:
             parser.error("--alignment-cache is only valid for temporal models")
+    if args.command == "build-formal-demo" and args.fps != 30:
+        parser.error("--fps must be exactly 30 for a formal demo")
 
 
 def main(
@@ -574,6 +591,7 @@ def main(
             "visualize": run_visualize,
             "compare": run_compare,
             "compare-human": run_compare_human,
+            "build-formal-demo": run_build_formal_demo,
             "audit-sample": run_audit_sample,
             "diagnose-overfit": run_diagnose_overfit,
         }
@@ -5540,6 +5558,23 @@ def run_compare_human(args: argparse.Namespace) -> int:
 
     primary = _replace_directory(output, writer)
     print(primary.resolve())
+    return 0
+
+
+def run_build_formal_demo(args: argparse.Namespace) -> int:
+    from moving_det.ml.formal_demo import FormalDemoRequest, build_formal_demo
+
+    primary = build_formal_demo(
+        FormalDemoRequest(
+            comparison_dir=Path(args.comparison),
+            baseline_run=Path(args.baseline),
+            mg_run=Path(args.mg_full),
+            benchmark_dir=Path(args.human_benchmark),
+            output=Path(args.output),
+            fps=int(args.fps),
+        )
+    )
+    print(Path(primary).resolve())
     return 0
 
 

@@ -64,6 +64,7 @@ EXPECTED_COMMANDS = {
     "visualize",
     "compare",
     "compare-human",
+    "build-formal-demo",
     "audit-sample",
     "diagnose-overfit",
 }
@@ -10814,3 +10815,51 @@ def test_audit_sample_defaults_to_the_frozen_config_and_seed():
 
     assert args.config == Path("configs/vrud-temporal-obb.yaml")
     assert args.seed == 20260806
+
+
+def test_build_formal_demo_cli_requires_verified_inputs_and_fixed_fps(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    import moving_det.ml.formal_demo as formal_demo
+
+    output = tmp_path / "demo"
+    arguments = [
+        "build-formal-demo",
+        "--comparison",
+        str(tmp_path / "comparison"),
+        "--baseline",
+        str(tmp_path / "baseline"),
+        "--mg-full",
+        str(tmp_path / "mg-full"),
+        "--human-benchmark",
+        str(tmp_path / "benchmark"),
+        "--output",
+        str(output),
+    ]
+    requests = []
+
+    def builder(request):
+        requests.append(request)
+        output.mkdir()
+        primary = output / "demo.json"
+        primary.write_text("{}\n", encoding="utf-8")
+        return primary
+
+    monkeypatch.setattr(formal_demo, "build_formal_demo", builder)
+
+    assert main(arguments) == 0
+    assert len(requests) == 1
+    assert requests[0].comparison_dir == tmp_path / "comparison"
+    assert requests[0].baseline_run == tmp_path / "baseline"
+    assert requests[0].mg_run == tmp_path / "mg-full"
+    assert requests[0].benchmark_dir == tmp_path / "benchmark"
+    assert requests[0].output == output
+    assert requests[0].fps == 30
+    assert capsys.readouterr().out.strip() == str((output / "demo.json").resolve())
+
+    with pytest.raises(SystemExit):
+        main([*arguments, "--fps", "29"])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([*arguments, "--lstfe", "forbidden"])
