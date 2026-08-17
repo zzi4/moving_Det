@@ -13,6 +13,7 @@
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
     "test:status": "node --test server/status.test.mjs",
     "test:evidence": "node --test server/evidence.test.mjs",
+    "test:local-api": "node --test server/local-report-api.test.mjs",
     "test:formal-status": "node --test server/formal-status.test.mjs",
     "test:formal-data": "node --experimental-strip-types --test app/formal-report-data.test.mjs",
     "test:formal-view": "node --experimental-strip-types --test app/components/formal-report.test.mjs",
@@ -21,7 +22,7 @@
     "test:lan": "node --test scripts/lan-url.test.mjs",
     "typecheck": "tsc --noEmit",
     "audit:prod": "npm audit --omit=dev",
-    "test": "npm run test:status && npm run test:evidence && npm run test:formal-status && npm run test:formal-data && npm run test:formal-view && npm run test:client-state && npm run test:pipeline-state && npm run test:lan && npm run typecheck && npm run build && node --test tests/rendered-html.test.mjs",
+    "test": "npm run test:status && npm run test:evidence && npm run test:local-api && npm run test:formal-status && npm run test:formal-data && npm run test:formal-view && npm run test:client-state && npm run test:pipeline-state && npm run test:lan && npm run typecheck && npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next"
   },
   "dependencies": {

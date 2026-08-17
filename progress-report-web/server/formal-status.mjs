@@ -1,12 +1,51 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 const JSON_LIMIT = 1_048_576;
 const COMPARISON_LIMIT = 16_777_216;
 const TRANSITIONS_LIMIT = 67_108_864;
 const MAX_EPOCHS = 80;
+
+export const FORMAL_MP4_MAX_BYTES = 256 * 1024 ** 2;
+export const FORMAL_PNG_MAX_BYTES = 16 * 1024 ** 2;
+export const FORMAL_MEDIA_TOTAL_MAX_BYTES = 1024 ** 3;
+export const FORMAL_HASH_GLOBAL_LIMIT = 4;
+export const FORMAL_HASH_PER_ROOT_LIMIT = 2;
+
+class Semaphore {
+  constructor(limit) {
+    this.limit = limit;
+    this.active = 0;
+    this.waiters = [];
+  }
+
+  async run(task) {
+    if (this.active >= this.limit) {
+      await new Promise((resolve) => this.waiters.push(resolve));
+    }
+    this.active += 1;
+    try {
+      return await task();
+    } finally {
+      this.active -= 1;
+      this.waiters.shift()?.();
+    }
+  }
+}
+
+const globalHashSemaphore = new Semaphore(FORMAL_HASH_GLOBAL_LIMIT);
+const rootHashSemaphores = new Map();
+
+export function runWithFormalHashLimit(formalRoot, task) {
+  let rootSemaphore = rootHashSemaphores.get(formalRoot);
+  if (rootSemaphore === undefined) {
+    rootSemaphore = new Semaphore(FORMAL_HASH_PER_ROOT_LIMIT);
+    rootHashSemaphores.set(formalRoot, rootSemaphore);
+  }
+  return rootSemaphore.run(() => globalHashSemaphore.run(task));
+}
 
 export const FORMAL_STAGE_NAMES = Object.freeze([
   "preflight",
@@ -183,6 +222,8 @@ function statIdentity(value) {
     size: value.size,
     mtimeNs:
       value.mtimeNs ?? BigInt(Math.trunc(Number(value.mtimeMs) * 1_000_000)),
+    ctimeNs:
+      value.ctimeNs ?? BigInt(Math.trunc(Number(value.ctimeMs) * 1_000_000)),
   };
 }
 
@@ -191,7 +232,8 @@ function sameIdentity(left, right) {
     left.dev === right.dev &&
     left.ino === right.ino &&
     left.size === right.size &&
-    left.mtimeNs === right.mtimeNs
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
   );
 }
 
@@ -277,8 +319,12 @@ async function hashOpenFile(handle, before, relative) {
   }
   const hash = createHash("sha256");
   let total = 0;
-  while (true) {
-    const buffer = Buffer.allocUnsafe(65_536);
+  const expectedSize = Number(before.size);
+  while (total <= expectedSize) {
+    const buffer = Buffer.allocUnsafe(
+      Math.min(65_536, expectedSize + 1 - total),
+    );
+    if (buffer.length === 0) break;
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, total);
     if (bytesRead === 0) break;
     hash.update(buffer.subarray(0, bytesRead));
@@ -291,47 +337,117 @@ async function hashOpenFile(handle, before, relative) {
   return hash.digest("hex");
 }
 
-export async function openVerifiedFormalFile({
+function formalIdentityChanged(relative, cause) {
+  const error = new TypeError(`formal media identity changed: ${relative}`, {
+    cause,
+  });
+  error.code = "FORMAL_IDENTITY_CHANGED";
+  return error;
+}
+
+export async function openMatchedFormalFile({
   formalRoot,
   relative,
-  expectedSha256,
   expectedVerification = null,
+  maximumBytes = Number.MAX_SAFE_INTEGER,
   openFile = open,
 }) {
-  sha256(expectedSha256, `formal media ${relative}`);
   const located = await locateStableRegularFile(formalRoot, relative);
   if (
     expectedVerification !== null &&
     !sameLocatedIdentity(expectedVerification, located)
   ) {
-    throw new TypeError(`formal media identity changed: ${relative}`);
+    throw formalIdentityChanged(relative);
   }
   const handle = await openFile(
     located.path,
     constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
   );
   try {
-    const beforeStat = await handle.stat({ bigint: true });
-    const before = statIdentity(beforeStat);
-    if (!beforeStat.isFile() || !sameIdentity(before, located.identity)) {
-      throw new TypeError(`formal media identity changed: ${relative}`);
+    const fileStat = await handle.stat({ bigint: true });
+    const identity = statIdentity(fileStat);
+    if (!fileStat.isFile() || !sameIdentity(identity, located.identity)) {
+      throw formalIdentityChanged(relative);
     }
-    const actualSha256 = await hashOpenFile(handle, before, relative);
-    if (actualSha256 !== expectedSha256) {
-      throw new TypeError(`formal media hash differs: ${relative}`);
+    if (identity.size > BigInt(maximumBytes)) {
+      throw new RangeError(
+        `formal media exceeds size limit (${maximumBytes} bytes): ${relative}`,
+      );
     }
-    await verifyLocatedIdentity(located, relative);
+    try {
+      await verifyLocatedIdentity(located, relative);
+    } catch (error) {
+      throw formalIdentityChanged(relative, error);
+    }
     return {
       handle,
       path: located.path,
-      size: Number(before.size),
-      sha256: actualSha256,
+      size: Number(identity.size),
       verification: located,
     };
   } catch (error) {
     await handle.close();
     throw error;
   }
+}
+
+export async function matchesFormalFileIdentity(options) {
+  const matched = await openMatchedFormalFile(options);
+  await matched.handle.close();
+  return true;
+}
+
+export async function inspectFormalFile(options) {
+  const inspected = await openMatchedFormalFile(options);
+  await inspected.handle.close();
+  return {
+    path: inspected.path,
+    size: inspected.size,
+    verification: inspected.verification,
+  };
+}
+
+async function openVerifiedFormalFileWithoutLimit({
+  formalRoot,
+  relative,
+  expectedSha256,
+  expectedVerification = null,
+  maximumBytes = Number.MAX_SAFE_INTEGER,
+  openFile = open,
+}) {
+  sha256(expectedSha256, `formal media ${relative}`);
+  const matched = await openMatchedFormalFile({
+    formalRoot,
+    relative,
+    expectedVerification,
+    maximumBytes,
+    openFile,
+  });
+  const { handle } = matched;
+  try {
+    const before = matched.verification.identity;
+    const actualSha256 = await hashOpenFile(handle, before, relative);
+    if (actualSha256 !== expectedSha256) {
+      throw new TypeError(`formal media hash differs: ${relative}`);
+    }
+    await verifyLocatedIdentity(matched.verification, relative);
+    return {
+      handle,
+      path: matched.path,
+      size: matched.size,
+      sha256: actualSha256,
+      verification: matched.verification,
+    };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+export function openVerifiedFormalFile(options) {
+  return runWithFormalHashLimit(options.formalRoot, () =>
+    openVerifiedFormalFileWithoutLimit(options),
+  );
 }
 
 export async function verifyFormalFile(options) {
@@ -345,7 +461,7 @@ export async function verifyFormalFile(options) {
   };
 }
 
-export async function readStableBoundedFile({
+async function readStableBoundedFileRecord({
   formalRoot,
   relative,
   maximumBytes,
@@ -399,27 +515,50 @@ export async function readStableBoundedFile({
       throw new TypeError(`formal artifact changed while reading: ${relative}`);
     }
     await verifyLocatedIdentity(located, relative);
-    return Buffer.concat(chunks, total);
+    const contents = Buffer.concat(chunks, total);
+    return {
+      contents,
+      sha256: digest(contents),
+      verification: located,
+    };
   } finally {
     await handle.close();
   }
 }
 
-async function readJson(formalRoot, relative, maximumBytes, options) {
-  const contents = await readBoundedRegularFile(
+export async function readStableBoundedFile(options) {
+  const record = await readStableBoundedFileRecord(options);
+  return record?.contents ?? null;
+}
+
+async function readJsonRecord(formalRoot, relative, maximumBytes, options) {
+  const record = await readStableBoundedFileRecord({
     formalRoot,
     relative,
     maximumBytes,
-    options,
-  );
-  if (contents === null) return null;
+    ...options,
+  });
+  if (record === null) return null;
   try {
-    return JSON.parse(contents.toString("utf8"));
+    return {
+      ...record,
+      value: JSON.parse(record.contents.toString("utf8")),
+    };
   } catch (error) {
     throw new TypeError(`formal JSON artifact is malformed: ${relative}`, {
       cause: error,
     });
   }
+}
+
+async function readJson(formalRoot, relative, maximumBytes, options) {
+  const record = await readJsonRecord(
+    formalRoot,
+    relative,
+    maximumBytes,
+    options,
+  );
+  return record?.value ?? null;
 }
 
 async function requireExactArtifactSet(formalRoot, directory, expectedNames) {
@@ -554,6 +693,7 @@ function validateRunReference(value, label) {
   }[label];
   if (
     typeof value.run_dir !== "string" ||
+    !isAbsolute(value.run_dir) ||
     expectedProvenance === undefined ||
     value.model_name !== expectedProvenance.model_name ||
     value.motion_off !== expectedProvenance.motion_off
@@ -791,18 +931,24 @@ function mediaUrl(path) {
     .join("/")}`;
 }
 
-async function requireDeclaredMediaFile(formalRoot, path, label) {
+async function requireDeclaredMediaFile(formalRoot, path, label, verifyFile) {
   const relative = `demo/${path}`;
-  const verified = await verifyFormalFile({
+  const maximumBytes = mediaMaximumBytes(path);
+  const verified = await verifyFile({
     formalRoot,
     relative,
     expectedSha256: label.sha256,
+    maximumBytes,
   });
+  if (verified.size > maximumBytes) {
+    throw new RangeError(`formal media exceeds size limit: ${relative}`);
+  }
   return {
     route: mediaUrl(path),
     formalRoot,
     relative,
     path: verified.path,
+    size: verified.size,
     sha256: label.sha256,
     verification: verified.verification,
     contentType: path.endsWith(".mp4") ? "video/mp4" : "image/png",
@@ -810,14 +956,25 @@ async function requireDeclaredMediaFile(formalRoot, path, label) {
   };
 }
 
-export async function readFormalDemoManifest({ formalRoot }) {
-  const manifest = await readJson(
+function mediaMaximumBytes(path) {
+  return path.endsWith(".mp4")
+    ? FORMAL_MP4_MAX_BYTES
+    : FORMAL_PNG_MAX_BYTES;
+}
+
+export async function readFormalDemoManifest({
+  formalRoot,
+  inspectFile = inspectFormalFile,
+  verifyFile = verifyFormalFile,
+}) {
+  const manifestRecord = await readJsonRecord(
     formalRoot,
     "demo/demo.json",
     JSON_LIMIT,
     { optional: true },
   );
-  if (manifest === null) return null;
+  if (manifestRecord === null) return null;
+  const manifest = manifestRecord.value;
   exactFields(manifest, ["schema_version", "fps", "scenes", "cases"], "formal demo");
   if (
     manifest.schema_version !== 1 ||
@@ -832,7 +989,7 @@ export async function readFormalDemoManifest({ formalRoot }) {
 
   const videos = [];
   const cases = [];
-  const files = [];
+  const mediaDeclarations = [];
   const paths = new Set();
   for (const [index, scene] of manifest.scenes.entries()) {
     exactFields(
@@ -862,7 +1019,7 @@ export async function readFormalDemoManifest({ formalRoot }) {
       throw new TypeError("formal demo contains a duplicate media path");
     }
     paths.add(media.path);
-    files.push(await requireDeclaredMediaFile(formalRoot, media.path, media));
+    mediaDeclarations.push({ path: media.path, media });
     videos.push({
       scene: scene.name,
       src: mediaUrl(media.path),
@@ -924,7 +1081,7 @@ export async function readFormalDemoManifest({ formalRoot }) {
         throw new TypeError("formal demo contains a duplicate media path");
       }
       paths.add(media.path);
-      files.push(await requireDeclaredMediaFile(formalRoot, media.path, media));
+      mediaDeclarations.push({ path: media.path, media });
     }
     cases.push({
       state: identity.state,
@@ -941,7 +1098,46 @@ export async function readFormalDemoManifest({ formalRoot }) {
   ) {
     throw new TypeError("formal demo cases do not cover every required state");
   }
-  return { videos, cases, files };
+  let inspectedTotalBytes = 0;
+  for (const { path } of mediaDeclarations) {
+    const relative = `demo/${path}`;
+    const maximumBytes = mediaMaximumBytes(path);
+    const inspected = await inspectFile({
+      formalRoot,
+      relative,
+      maximumBytes,
+    });
+    if (inspected.size > maximumBytes) {
+      throw new RangeError(`formal media exceeds size limit: ${relative}`);
+    }
+    inspectedTotalBytes += inspected.size;
+    if (inspectedTotalBytes > FORMAL_MEDIA_TOTAL_MAX_BYTES) {
+      throw new RangeError(
+        `formal demo total media size exceeds limit (${FORMAL_MEDIA_TOTAL_MAX_BYTES} bytes)`,
+      );
+    }
+  }
+  const settledFiles = await Promise.allSettled(
+    mediaDeclarations.map(({ path, media }) =>
+      requireDeclaredMediaFile(formalRoot, path, media, verifyFile),
+    ),
+  );
+  const rejectedFile = settledFiles.find((result) => result.status === "rejected");
+  if (rejectedFile !== undefined) throw rejectedFile.reason;
+  const files = settledFiles.map((result) => result.value);
+  const totalMediaBytes = files.reduce((total, file) => total + file.size, 0);
+  if (totalMediaBytes > FORMAL_MEDIA_TOTAL_MAX_BYTES) {
+    throw new RangeError(
+      `formal demo total media size exceeds limit (${FORMAL_MEDIA_TOTAL_MAX_BYTES} bytes)`,
+    );
+  }
+  return {
+    videos,
+    cases,
+    files,
+    manifestVerification: manifestRecord.verification,
+    manifestSha256: manifestRecord.sha256,
+  };
 }
 
 function serializableLocatedIdentity(located) {
@@ -950,6 +1146,7 @@ function serializableLocatedIdentity(located) {
     ino: String(value.ino),
     size: String(value.size),
     mtimeNs: String(value.mtimeNs),
+    ctimeNs: String(value.ctimeNs),
   });
   return {
     identity: identity(located.identity),

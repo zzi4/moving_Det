@@ -2,7 +2,8 @@ import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 
 import {
-  openVerifiedFormalFile,
+  matchesFormalFileIdentity,
+  openMatchedFormalFile,
   readFormalDemoManifest,
 } from "./formal-status.mjs";
 
@@ -90,15 +91,64 @@ export function createEvidenceFiles({ projectPath, worktreePath }) {
   return files;
 }
 
+export function createFormalEvidenceCache({
+  manifestReader = readFormalDemoManifest,
+  manifestMatcher = matchesFormalFileIdentity,
+} = {}) {
+  const entries = new Map();
+  const inFlight = new Map();
+
+  async function getFiles({ formalRoot }) {
+    const pending = inFlight.get(formalRoot);
+    if (pending) return pending;
+
+    const task = (async () => {
+      const cached = entries.get(formalRoot);
+      if (cached) {
+        try {
+          await manifestMatcher({
+            formalRoot,
+            relative: "demo/demo.json",
+            expectedVerification: cached.manifestVerification,
+          });
+          return cached.files;
+        } catch {
+          entries.delete(formalRoot);
+        }
+      }
+
+      const manifest = await manifestReader({ formalRoot });
+      if (manifest === null) return new Map();
+      const files = new Map(
+        manifest.files.map(({ route, ...evidence }) => [route, evidence]),
+      );
+      entries.set(formalRoot, {
+        files,
+        manifestSha256: manifest.manifestSha256,
+        manifestVerification: manifest.manifestVerification,
+      });
+      return files;
+    })();
+    inFlight.set(formalRoot, task);
+    try {
+      return await task;
+    } finally {
+      if (inFlight.get(formalRoot) === task) inFlight.delete(formalRoot);
+    }
+  }
+
+  return {
+    getFiles,
+    invalidate(formalRoot) {
+      entries.delete(formalRoot);
+    },
+  };
+}
+
+const formalEvidenceCache = createFormalEvidenceCache();
+
 export async function createFormalEvidenceFiles({ formalRoot }) {
-  const manifest = await readFormalDemoManifest({ formalRoot });
-  if (manifest === null) return new Map();
-  return new Map(
-    manifest.files.map(({ route, ...evidence }) => [
-      route,
-      evidence,
-    ]),
-  );
+  return formalEvidenceCache.getFiles({ formalRoot });
 }
 
 function parseRange(value, size) {
@@ -138,14 +188,13 @@ export async function serveFormalEvidence({ request, response, evidence }) {
     response.end("Method not allowed");
     return;
   }
-  const verified = await openVerifiedFormalFile({
+  const verified = await openMatchedFormalFile({
     formalRoot: evidence.formalRoot,
     relative: evidence.relative,
-    expectedSha256: evidence.sha256,
     expectedVerification: evidence.verification,
   });
   try {
-    const etag = `"${verified.sha256}"`;
+    const etag = `"${evidence.sha256}"`;
     response.setHeader("Content-Type", evidence.contentType);
     response.setHeader("Cache-Control", evidence.cacheControl);
     response.setHeader("Accept-Ranges", "bytes");
@@ -188,5 +237,32 @@ export async function serveFormalEvidence({ request, response, evidence }) {
     );
   } finally {
     await verified.handle.close();
+  }
+}
+
+export async function serveFormalEvidenceRoute({
+  request,
+  response,
+  formalRoot,
+  route,
+  evidenceCache = formalEvidenceCache,
+}) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const evidence = (await evidenceCache.getFiles({ formalRoot })).get(route);
+    if (!evidence) throw new TypeError("formal evidence is not allowlisted");
+    try {
+      await serveFormalEvidence({ request, response, evidence });
+      return;
+    } catch (error) {
+      const code = error instanceof Error && "code" in error ? error.code : null;
+      if (
+        attempt > 0 ||
+        response.headersSent ||
+        !["FORMAL_IDENTITY_CHANGED", "ENOENT", "ELOOP", "ENOTDIR"].includes(code)
+      ) {
+        throw error;
+      }
+      evidenceCache.invalidate(formalRoot);
+    }
   }
 }

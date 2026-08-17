@@ -363,6 +363,19 @@ test("formal status enforces label-specific run provenance", async (t) => {
   }
 });
 
+test("formal status requires producer run_dir values to be absolute and nonempty", async (t) => {
+  for (const runDir of ["", "relative/mg-full"]) {
+    const root = await completedFixture(t);
+    await mutateComparison(root, (comparison) => {
+      comparison.runs.mg_full.run_dir = runDir;
+    });
+    await assert.rejects(
+      createFormalStatusSnapshot({ formalRoot: root }),
+      /mg_full.*run.*absolute|mg_full.*provenance/i,
+    );
+  }
+});
+
 test("formal status binds comparison benchmark to the verified preflight", async (t) => {
   const root = await completedFixture(t);
   const runPath = join(root, "comparison", "run.json");

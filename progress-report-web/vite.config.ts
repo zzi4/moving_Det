@@ -1,5 +1,4 @@
 import vinext from "vinext";
-import { stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
@@ -8,17 +7,13 @@ import { sites } from "./build/sites-vite-plugin";
 import {
   createCachedStatusReader,
   createStatusSnapshot,
-  streamFixedFile,
 } from "./server/status.mjs";
-import {
-  createEvidenceFiles,
-  createFormalEvidenceFiles,
-  serveFormalEvidence,
-} from "./server/evidence.mjs";
+import { createEvidenceFiles } from "./server/evidence.mjs";
 import {
   createCachedFormalStatusReader,
   createFormalStatusSnapshot,
 } from "./server/formal-status.mjs";
+import { createLocalReportMiddleware } from "./server/local-report-api.mjs";
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   "00000000-0000-4000-8000-000000000000";
@@ -40,134 +35,18 @@ const readFormalStatus = createCachedFormalStatusReader({
   ttlMs: 15_000,
   snapshotFactory: createFormalStatusSnapshot,
 });
+const localReportMiddleware = createLocalReportMiddleware({
+  evidenceFiles,
+  formalRoot,
+  readCalibrationStatus,
+  readFormalStatus,
+});
 
 function localReportApi(): Plugin {
   return {
     name: "local-report-api",
     configureServer(server) {
-      server.middlewares.use(async (request, response, next) => {
-        const pathname = new URL(
-          request.url ?? "/",
-          "http://localhost",
-        ).pathname;
-
-        if (pathname === "/api/status") {
-          if (!["GET", "HEAD"].includes(request.method ?? "GET")) {
-            response.statusCode = 405;
-            response.setHeader("Allow", "GET, HEAD");
-            response.end("Method not allowed");
-            return;
-          }
-          const status = await readCalibrationStatus();
-          response.statusCode = 200;
-          response.setHeader(
-            "Content-Type",
-            "application/json; charset=utf-8",
-          );
-          response.setHeader("Cache-Control", "no-store");
-          response.end(
-            request.method === "HEAD" ? undefined : JSON.stringify(status),
-          );
-          return;
-        }
-
-        if (pathname === "/api/formal-status") {
-          if (!["GET", "HEAD"].includes(request.method ?? "GET")) {
-            response.statusCode = 405;
-            response.setHeader("Allow", "GET, HEAD");
-            response.end("Method not allowed");
-            return;
-          }
-          try {
-            const status = await readFormalStatus();
-            response.statusCode = 200;
-            response.setHeader(
-              "Content-Type",
-              "application/json; charset=utf-8",
-            );
-            response.setHeader("Cache-Control", "no-store");
-            response.end(
-              request.method === "HEAD" ? undefined : JSON.stringify(status),
-            );
-          } catch {
-            response.statusCode = 503;
-            response.setHeader("Cache-Control", "no-store");
-            response.end("Formal status is unavailable");
-          }
-          return;
-        }
-
-        if (
-          !pathname.startsWith("/evidence/") &&
-          !pathname.startsWith("/formal-evidence/")
-        ) {
-          next();
-          return;
-        }
-
-        if (!["GET", "HEAD"].includes(request.method ?? "GET")) {
-          response.statusCode = 405;
-          response.setHeader("Allow", "GET, HEAD");
-          response.end("Method not allowed");
-          return;
-        }
-
-        if (pathname.startsWith("/formal-evidence/")) {
-          try {
-            const formalEvidence = (
-              await createFormalEvidenceFiles({ formalRoot })
-            ).get(pathname);
-            if (!formalEvidence) {
-              response.statusCode = 404;
-              response.end("Not found");
-              return;
-            }
-            await serveFormalEvidence({
-              request,
-              response,
-              evidence: formalEvidence,
-            });
-          } catch {
-            if (!response.headersSent) {
-              response.statusCode = 404;
-              response.end("Evidence file is not available");
-            } else {
-              response.destroy();
-            }
-            return;
-          }
-          return;
-        }
-        const evidence = evidenceFiles.get(pathname);
-        if (!evidence) {
-          response.statusCode = 404;
-          response.end("Not found");
-          return;
-        }
-
-        try {
-          const fileStat = await stat(evidence.path);
-          const etag = `W/"${fileStat.size}-${Math.trunc(fileStat.mtimeMs)}"`;
-          if (request.headers["if-none-match"] === etag) {
-            response.statusCode = 304;
-            response.end();
-            return;
-          }
-          response.statusCode = 200;
-          response.setHeader("Content-Type", evidence.contentType);
-          response.setHeader("Cache-Control", evidence.cacheControl);
-          response.setHeader("Content-Length", String(fileStat.size));
-          response.setHeader("ETag", etag);
-          if (request.method === "HEAD") {
-            response.end();
-          } else {
-            await streamFixedFile(evidence.path, response);
-          }
-        } catch {
-          response.statusCode = 404;
-          response.end("Evidence file is not available");
-        }
-      });
+      server.middlewares.use(localReportMiddleware);
     },
   };
 }

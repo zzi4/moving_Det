@@ -7,8 +7,16 @@ export type EvidenceFile = {
 export type FormalEvidenceFile = EvidenceFile & {
   formalRoot: string;
   relative: string;
+  size: number;
   sha256: string;
   verification: import("./formal-status.mjs").FormalFileVerification;
+};
+
+export type FormalEvidenceCache = {
+  getFiles(options: {
+    formalRoot: string;
+  }): Promise<Map<string, FormalEvidenceFile>>;
+  invalidate(formalRoot: string): void;
 };
 
 export function createEvidenceFiles(paths: {
@@ -20,8 +28,21 @@ export function createFormalEvidenceFiles(options: {
   formalRoot: string;
 }): Promise<Map<string, FormalEvidenceFile>>;
 
+export function createFormalEvidenceCache(options?: {
+  manifestReader?: typeof import("./formal-status.mjs").readFormalDemoManifest;
+  manifestMatcher?: typeof import("./formal-status.mjs").matchesFormalFileIdentity;
+}): FormalEvidenceCache;
+
 export function serveFormalEvidence(options: {
   request: import("node:http").IncomingMessage;
   response: import("node:http").ServerResponse;
   evidence: FormalEvidenceFile;
+}): Promise<void>;
+
+export function serveFormalEvidenceRoute(options: {
+  request: import("node:http").IncomingMessage;
+  response: import("node:http").ServerResponse;
+  formalRoot: string;
+  route: string;
+  evidenceCache?: FormalEvidenceCache;
 }): Promise<void>;

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
+  chmod,
   mkdir,
   mkdtemp,
+  open as openFile,
   readFile,
   rename,
   rm,
@@ -15,10 +17,41 @@ import { createServer } from "node:http";
 import test from "node:test";
 
 import {
+  createFormalEvidenceCache,
   createEvidenceFiles,
   createFormalEvidenceFiles,
   serveFormalEvidence,
+  serveFormalEvidenceRoute,
 } from "./evidence.mjs";
+import {
+  FORMAL_MP4_MAX_BYTES,
+  FORMAL_PNG_MAX_BYTES,
+  FORMAL_MEDIA_TOTAL_MAX_BYTES,
+  FORMAL_HASH_GLOBAL_LIMIT,
+  FORMAL_HASH_PER_ROOT_LIMIT,
+  openMatchedFormalFile,
+  openVerifiedFormalFile,
+  readFormalDemoManifest,
+  runWithFormalHashLimit,
+  verifyFormalFile,
+} from "./formal-status.mjs";
+
+function fakeVerification({ formalRoot, relative, expectedSha256 }, size) {
+  const path = join(formalRoot, relative);
+  const identity = {
+    dev: 1n,
+    ino: 1n,
+    size: BigInt(size),
+    mtimeNs: 1n,
+    ctimeNs: 1n,
+  };
+  return {
+    path,
+    size,
+    sha256: expectedSha256,
+    verification: { path, identity, parents: [] },
+  };
+}
 
 function digest(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -114,6 +147,32 @@ async function evidenceServer(t, evidence) {
   return `http://127.0.0.1:${address.port}`;
 }
 
+async function evidenceRouteServer(t, { formalRoot, evidenceCache }) {
+  const server = createServer(async (request, response) => {
+    try {
+      await serveFormalEvidenceRoute({
+        request,
+        response,
+        formalRoot,
+        route: "/formal-evidence/videos/site19-day.mp4",
+        evidenceCache,
+      });
+    } catch {
+      if (!response.headersSent) response.statusCode = 404;
+      response.end("Evidence file is not available");
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  assert.notEqual(address, null);
+  assert.equal(typeof address, "object");
+  return `http://127.0.0.1:${address.port}`;
+}
+
 test("exposes generated pipeline visuals through the evidence allowlist", () => {
   const files = createEvidenceFiles({
     projectPath: "/project/report",
@@ -191,6 +250,7 @@ test("formal evidence serves one byte range and HEAD from the verified FD", asyn
   assert.equal(partial.headers.get("accept-ranges"), "bytes");
   assert.equal(partial.headers.get("content-range"), "bytes 1-3/10");
   assert.equal(partial.headers.get("content-length"), "3");
+  assert.equal(partial.headers.get("etag"), `"${evidence.sha256}"`);
   assert.equal(await partial.text(), "ite");
 
   const head = await fetch(`${origin}/video`, {
@@ -208,6 +268,113 @@ test("formal evidence serves one byte range and HEAD from the verified FD", asyn
   assert.equal(invalid.status, 416);
   assert.equal(invalid.headers.get("content-range"), "bytes */10");
   assert.equal(invalid.headers.get("content-length"), "0");
+});
+
+test("formal evidence cache avoids rehashing repeated Range and HEAD requests", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  let hashCount = 0;
+  let manifestReads = 0;
+  const evidenceCache = createFormalEvidenceCache({
+    manifestReader: async (options) => {
+      manifestReads += 1;
+      return readFormalDemoManifest({
+        ...options,
+        verifyFile: async (verifyOptions) => {
+          hashCount += 1;
+          return verifyFormalFile(verifyOptions);
+        },
+      });
+    },
+  });
+  const origin = await evidenceRouteServer(t, { formalRoot, evidenceCache });
+
+  const first = await fetch(`${origin}/video`, {
+    headers: { Range: "bytes=0-1" },
+  });
+  assert.equal(first.status, 206);
+  await first.arrayBuffer();
+  const second = await fetch(`${origin}/video`, {
+    headers: { Range: "bytes=2-4" },
+  });
+  assert.equal(second.status, 206);
+  await second.arrayBuffer();
+  const head = await fetch(`${origin}/video`, { method: "HEAD" });
+  assert.equal(head.status, 200);
+
+  assert.equal(manifestReads, 1);
+  assert.equal(hashCount, 11);
+});
+
+test("formal evidence cache deduplicates concurrent initial validation", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  let manifestReads = 0;
+  let release;
+  const blocked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const evidenceCache = createFormalEvidenceCache({
+    manifestReader: async (options) => {
+      manifestReads += 1;
+      await blocked;
+      return readFormalDemoManifest(options);
+    },
+  });
+
+  const first = evidenceCache.getFiles({ formalRoot });
+  const second = evidenceCache.getFiles({ formalRoot });
+  await Promise.resolve();
+  assert.equal(manifestReads, 1);
+  release();
+  const [firstFiles, secondFiles] = await Promise.all([first, second]);
+  assert.strictEqual(firstFiles, secondFiles);
+  assert.equal(manifestReads, 1);
+});
+
+test("formal evidence cache revalidates ctime and manifest identity changes", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  let hashCount = 0;
+  let manifestReads = 0;
+  const evidenceCache = createFormalEvidenceCache({
+    manifestReader: async (options) => {
+      manifestReads += 1;
+      return readFormalDemoManifest({
+        ...options,
+        verifyFile: async (verifyOptions) => {
+          hashCount += 1;
+          return verifyFormalFile(verifyOptions);
+        },
+      });
+    },
+  });
+  const origin = await evidenceRouteServer(t, { formalRoot, evidenceCache });
+
+  const first = await fetch(`${origin}/video`);
+  assert.equal(first.status, 200);
+  await first.arrayBuffer();
+  assert.equal(hashCount, 11);
+
+  await chmod(
+    join(formalRoot, "demo", "videos", "site19-day.mp4"),
+    0o600,
+  );
+  const afterCtime = await fetch(`${origin}/video`, {
+    headers: { Range: "bytes=0-1" },
+  });
+  assert.equal(afterCtime.status, 206);
+  await afterCtime.arrayBuffer();
+  assert.equal(hashCount, 22);
+
+  const manifestPath = join(formalRoot, "demo", "demo.json");
+  const manifestBytes = await readFile(manifestPath);
+  await rename(manifestPath, `${manifestPath}.old`);
+  await writeFile(manifestPath, manifestBytes);
+  const afterManifestSwap = await fetch(`${origin}/video`, {
+    headers: { Range: "bytes=2-3" },
+  });
+  assert.equal(afterManifestSwap.status, 206);
+  await afterManifestSwap.arrayBuffer();
+  assert.equal(manifestReads, 3);
+  assert.equal(hashCount, 33);
 });
 
 test("formal evidence rejects file and parent identity swaps after allowlisting", async (t) => {
@@ -265,6 +432,186 @@ test("formal evidence refuses to allowlist media with the wrong bytes", async (t
     createFormalEvidenceFiles({ formalRoot }),
     /media.*hash|hash.*differs/i,
   );
+});
+
+test("formal demo applies explicit MP4 and PNG size limits", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const seen = [];
+  let verifyCalls = 0;
+  await assert.rejects(
+    readFormalDemoManifest({
+      formalRoot,
+      inspectFile: async (options) => {
+        seen.push(options);
+        return fakeVerification(options, FORMAL_MP4_MAX_BYTES + 1);
+      },
+      verifyFile: async (options) => {
+        verifyCalls += 1;
+        return fakeVerification(options, 1);
+      },
+    }),
+    /media.*size limit|exceeds.*limit/i,
+  );
+  assert.equal(seen[0].maximumBytes, FORMAL_MP4_MAX_BYTES);
+  assert.equal(verifyCalls, 0);
+});
+
+test("formal demo rejects declared media above the total size limit", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const manifestPath = join(formalRoot, "demo", "demo.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  for (let index = 4; index < 9; index += 1) {
+    manifest.cases.push({
+      identity: {
+        site: "site19",
+        sequence: "sequence-a",
+        frame: index + 1,
+        track_id: index,
+        visible_span: 0,
+        class_id: index % 4,
+        state: "rescued",
+      },
+      panel: {
+        path: `cases/${index}-panel.png`,
+        sha256: "a".repeat(64),
+        width: 640,
+        height: 360,
+      },
+      timeline: {
+        path: `cases/${index}-timeline.png`,
+        sha256: "b".repeat(64),
+        width: 640,
+        height: 80,
+      },
+    });
+  }
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`);
+
+  let verifyCalls = 0;
+  await assert.rejects(
+    readFormalDemoManifest({
+      formalRoot,
+      inspectFile: async (options) =>
+        fakeVerification(
+          options,
+          options.relative.endsWith(".mp4")
+            ? FORMAL_MP4_MAX_BYTES
+            : FORMAL_PNG_MAX_BYTES,
+        ),
+      verifyFile: async (options) =>
+        (verifyCalls += 1, fakeVerification(options, 1)),
+    }),
+    new RegExp(`total.*${FORMAL_MEDIA_TOTAL_MAX_BYTES}|total.*size`, "i"),
+  );
+  assert.equal(verifyCalls, 0);
+});
+
+test("formal media hashing is bounded globally and per formal root", async () => {
+  let activeGlobal = 0;
+  let maximumGlobal = 0;
+  const activeByRoot = new Map();
+  const maximumByRoot = new Map();
+  let release;
+  const blocked = new Promise((resolve) => {
+    release = resolve;
+  });
+  const task = (formalRoot) =>
+    runWithFormalHashLimit(formalRoot, async () => {
+      activeGlobal += 1;
+      maximumGlobal = Math.max(maximumGlobal, activeGlobal);
+      const activeForRoot = (activeByRoot.get(formalRoot) ?? 0) + 1;
+      activeByRoot.set(formalRoot, activeForRoot);
+      maximumByRoot.set(
+        formalRoot,
+        Math.max(maximumByRoot.get(formalRoot) ?? 0, activeForRoot),
+      );
+      await blocked;
+      activeGlobal -= 1;
+      activeByRoot.set(formalRoot, (activeByRoot.get(formalRoot) ?? 1) - 1);
+    });
+
+  const tasks = [
+    ...Array.from({ length: 4 }, () => task("/fixture/root-a")),
+    ...Array.from({ length: 4 }, () => task("/fixture/root-b")),
+  ];
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(maximumGlobal, FORMAL_HASH_GLOBAL_LIMIT);
+  assert.equal(maximumByRoot.get("/fixture/root-a"), FORMAL_HASH_PER_ROOT_LIMIT);
+  assert.equal(maximumByRoot.get("/fixture/root-b"), FORMAL_HASH_PER_ROOT_LIMIT);
+  release();
+  await Promise.all(tasks);
+  assert.ok(maximumGlobal <= FORMAL_HASH_GLOBAL_LIMIT);
+  assert.ok(
+    [...maximumByRoot.values()].every(
+      (maximum) => maximum <= FORMAL_HASH_PER_ROOT_LIMIT,
+    ),
+  );
+});
+
+test("formal demo validates media concurrently within the per-root bound", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  let active = 0;
+  let maximum = 0;
+  await readFormalDemoManifest({
+    formalRoot,
+    verifyFile: (options) =>
+      runWithFormalHashLimit(formalRoot, async () => {
+        active += 1;
+        maximum = Math.max(maximum, active);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        active -= 1;
+        return fakeVerification(options, 1);
+      }),
+  });
+  assert.equal(maximum, FORMAL_HASH_PER_ROOT_LIMIT);
+});
+
+test("formal media verification closes FDs on size and hash errors", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  const relative = "demo/videos/site19-day.mp4";
+
+  let sizeErrorCloses = 0;
+  await assert.rejects(
+    openMatchedFormalFile({
+      formalRoot,
+      relative,
+      maximumBytes: 1,
+      openFile: async (...arguments_) => {
+        const handle = await openFile(...arguments_);
+        return {
+          stat: (...statArguments) => handle.stat(...statArguments),
+          close: async () => {
+            sizeErrorCloses += 1;
+            await handle.close();
+          },
+        };
+      },
+    }),
+    /size limit/i,
+  );
+  assert.equal(sizeErrorCloses, 1);
+
+  let hashErrorCloses = 0;
+  await assert.rejects(
+    openVerifiedFormalFile({
+      formalRoot,
+      relative,
+      expectedSha256: "0".repeat(64),
+      openFile: async (...arguments_) => {
+        const handle = await openFile(...arguments_);
+        return {
+          stat: (...statArguments) => handle.stat(...statArguments),
+          read: (...readArguments) => handle.read(...readArguments),
+          close: async () => {
+            hashErrorCloses += 1;
+            await handle.close();
+          },
+        };
+      },
+    }),
+    /hash differs/i,
+  );
+  assert.equal(hashErrorCloses, 1);
 });
 
 test("formal evidence rejects traversal, checkpoint declarations, and symlinks", async (t) => {
