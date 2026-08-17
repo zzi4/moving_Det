@@ -98,10 +98,19 @@ export function createFormalEvidenceCache({
   const entries = new Map();
   const inFlight = new Map();
 
-  async function getFiles({ formalRoot }) {
+  async function getFiles({ formalRoot, onConsistencyRebuild = null }) {
     const pending = inFlight.get(formalRoot);
-    if (pending) return pending;
+    if (pending) {
+      try {
+        return await pending.task;
+      } finally {
+        if (pending.rebuilt && onConsistencyRebuild !== null) {
+          onConsistencyRebuild();
+        }
+      }
+    }
 
+    const pendingEntry = { task: null, rebuilt: false };
     const task = (async () => {
       const cached = entries.get(formalRoot);
       if (cached) {
@@ -113,6 +122,7 @@ export function createFormalEvidenceCache({
           });
           return cached.files;
         } catch {
+          pendingEntry.rebuilt = true;
           entries.delete(formalRoot);
         }
       }
@@ -140,11 +150,15 @@ export function createFormalEvidenceCache({
       });
       return files;
     })();
-    inFlight.set(formalRoot, task);
+    pendingEntry.task = task;
+    inFlight.set(formalRoot, pendingEntry);
     try {
       return await task;
     } finally {
-      if (inFlight.get(formalRoot) === task) inFlight.delete(formalRoot);
+      if (inFlight.get(formalRoot) === pendingEntry) inFlight.delete(formalRoot);
+      if (pendingEntry.rebuilt && onConsistencyRebuild !== null) {
+        onConsistencyRebuild();
+      }
     }
   }
 
@@ -266,9 +280,17 @@ export async function serveFormalEvidenceRoute({
   manifestMatcher = matchesFormalFileIdentity,
   beforeResponseBarrier = null,
 }) {
+  let consistencyRebuilds = 0;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const evidence = (await evidenceCache.getFiles({ formalRoot })).get(route);
+      const evidence = (
+        await evidenceCache.getFiles({
+          formalRoot,
+          onConsistencyRebuild: () => {
+            consistencyRebuilds += 1;
+          },
+        })
+      ).get(route);
       if (!evidence) throw new TypeError("formal evidence is not allowlisted");
       await serveFormalEvidence({
         request,
@@ -289,12 +311,14 @@ export async function serveFormalEvidenceRoute({
     } catch (error) {
       const code = error instanceof Error && "code" in error ? error.code : null;
       if (
+        consistencyRebuilds > 0 ||
         attempt > 0 ||
         response.headersSent ||
         !["FORMAL_IDENTITY_CHANGED", "ENOENT", "ELOOP", "ENOTDIR"].includes(code)
       ) {
         throw error;
       }
+      consistencyRebuilds += 1;
       evidenceCache.invalidate(formalRoot);
     }
   }

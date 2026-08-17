@@ -460,6 +460,45 @@ test("formal evidence writes no old response when both manifest barriers change"
   assert.equal(manifestReads, 2);
 });
 
+test("formal evidence counts a cache-hit manifest rebuild against the request budget", async (t) => {
+  const formalRoot = await formalMediaFixture(t);
+  let manifestReads = 0;
+  const evidenceCache = createFormalEvidenceCache({
+    manifestReader: async (options) => {
+      manifestReads += 1;
+      return readFormalDemoManifest(options);
+    },
+  });
+  await evidenceCache.getFiles({ formalRoot });
+  const manifestPath = join(formalRoot, "demo", "demo.json");
+  const manifest = await readFile(manifestPath);
+  await rename(manifestPath, `${manifestPath}.cache-hit-swap`);
+  await writeFile(manifestPath, manifest);
+  let barrierCalls = 0;
+  const origin = await evidenceRouteServer(t, {
+    formalRoot,
+    evidenceCache,
+    beforeResponseBarrier: async () => {
+      barrierCalls += 1;
+      if (barrierCalls === 1) {
+        const current = await readFile(manifestPath);
+        await rename(manifestPath, `${manifestPath}.response-swap`);
+        await writeFile(manifestPath, current);
+      }
+    },
+  });
+
+  const response = await fetch(`${origin}/video`);
+  const body = await response.text();
+  assert.equal(response.status, 404);
+  assert.equal(response.headers.get("accept-ranges"), null);
+  assert.equal(response.headers.get("content-type"), null);
+  assert.equal(response.headers.get("etag"), null);
+  assert.equal(body.includes("site19-day"), false);
+  assert.equal(barrierCalls, 1);
+  assert.equal(manifestReads, 2);
+});
+
 test("formal evidence rejects file and parent identity swaps after allowlisting", async (t) => {
   for (const replacement of ["file", "parent"]) {
     const formalRoot = await formalMediaFixture(t);
