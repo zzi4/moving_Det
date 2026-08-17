@@ -788,11 +788,9 @@ def test_freeze_rejects_float_nc_before_publishing(tmp_path, monkeypatch):
     assert not (tmp_path / "frozen").exists()
 
 
-@pytest.mark.parametrize("restore_original", [False, True])
-def test_checkpoint_snapshot_binds_parent_before_final_file_open(
+def test_checkpoint_snapshot_binds_restored_parent_before_final_file_open(
     tmp_path,
     monkeypatch,
-    restore_original,
 ):
     parent = tmp_path / "parent"
     parent.mkdir()
@@ -812,9 +810,8 @@ def test_checkpoint_snapshot_binds_parent_before_final_file_open(
             replacement_parent.rename(parent)
             replaced = True
             descriptor = real_open(path, flags, *args, **kwargs)
-            if restore_original:
-                parent.rename(replacement_parent)
-                parked_parent.rename(parent)
+            parent.rename(replacement_parent)
+            parked_parent.rename(parent)
             return descriptor
         return real_open(path, flags, *args, **kwargs)
 
@@ -831,6 +828,253 @@ def test_checkpoint_snapshot_binds_parent_before_final_file_open(
     assert consumed == b"original-parent-bytes"
 
 
+def test_checkpoint_snapshot_rejects_relative_cwd_replacement_during_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    source = cwd / "weights.pt"
+    source.write_bytes(b"original-cwd-bytes")
+    replacement_cwd = tmp_path / "replacement-cwd"
+    replacement_cwd.mkdir()
+    (replacement_cwd / source.name).write_bytes(b"replacement-cwd-bytes")
+    parked_cwd = tmp_path / "parked-cwd"
+    monkeypatch.chdir(cwd)
+    real_cwd = Path.cwd
+    real_open = os.open
+    replaced = False
+    opened_descriptors = []
+    consumed = []
+
+    def replacing_cwd(cls):
+        nonlocal replaced
+        lexical_cwd = real_cwd()
+        if not replaced:
+            cwd.rename(parked_cwd)
+            replacement_cwd.rename(cwd)
+            replaced = True
+        return lexical_cwd
+
+    def tracking_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(transfer_module.Path, "cwd", classmethod(replacing_cwd))
+    monkeypatch.setattr(transfer_module.os, "open", tracking_open)
+
+    with pytest.raises(ValueError, match="changed|safely"):
+        with transfer_module._open_checkpoint_snapshot(
+            Path(source.name),
+            label="test checkpoint",
+        ) as snapshot:
+            snapshot.stream.seek(0)
+            consumed.append(snapshot.stream.read())
+
+    assert replaced is True
+    assert consumed == []
+    assert opened_descriptors
+    for descriptor in opened_descriptors:
+        with pytest.raises(OSError) as closed_error:
+            os.fstat(descriptor)
+        assert closed_error.value.errno == errno.EBADF
+
+
+def test_checkpoint_snapshot_opens_relative_source_from_bound_cwd(
+    tmp_path,
+    monkeypatch,
+):
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    source = cwd / "weights.pt"
+    source.write_bytes(b"relative-checkpoint")
+    monkeypatch.chdir(cwd)
+
+    with transfer_module._open_checkpoint_snapshot(
+        Path(source.name),
+        label="test checkpoint",
+    ) as snapshot:
+        snapshot.stream.seek(0)
+        assert snapshot.source_path == source
+        assert snapshot.stream.read() == b"relative-checkpoint"
+
+
+def test_checkpoint_snapshot_relative_cwd_open_error_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    real_open = os.open
+
+    def failing_cwd_open(path, flags, *args, **kwargs):
+        if Path(path) == Path("."):
+            raise OSError(errno.EIO, "injected cwd open failure")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(transfer_module.os, "open", failing_cwd_open)
+
+    with pytest.raises(ValueError, match="safely"):
+        with transfer_module._open_checkpoint_snapshot(
+            Path("weights.pt"),
+            label="test checkpoint",
+        ):
+            raise AssertionError("cwd open failure must prevent yield")
+
+
+@pytest.mark.parametrize("stat_call", [1, 2])
+def test_checkpoint_snapshot_rejects_parent_replacement_at_stat_boundary(
+    tmp_path,
+    monkeypatch,
+    stat_call,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    source = parent / "weights.pt"
+    source.write_bytes(b"original-parent-bytes")
+    replacement_parent = tmp_path / "replacement-parent"
+    replacement_parent.mkdir()
+    (replacement_parent / source.name).write_bytes(b"replacement-parent-bytes")
+    parked_parent = tmp_path / "parked-parent"
+    real_open = os.open
+    real_stat = os.stat
+    parent_stat_calls = 0
+    replaced = False
+    opened_descriptors = []
+    consumed = []
+
+    def replacing_stat(path, *args, **kwargs):
+        nonlocal parent_stat_calls, replaced
+        metadata = real_stat(path, *args, **kwargs)
+        if (
+            Path(path) == Path(parent.name)
+            and kwargs.get("dir_fd") is not None
+        ):
+            parent_stat_calls += 1
+            if parent_stat_calls == stat_call:
+                parent.rename(parked_parent)
+                replacement_parent.rename(parent)
+                replaced = True
+        return metadata
+
+    def tracking_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(transfer_module.os, "stat", replacing_stat)
+    monkeypatch.setattr(transfer_module.os, "open", tracking_open)
+
+    with pytest.raises(ValueError, match="changed|safely"):
+        with transfer_module._open_checkpoint_snapshot(
+            source,
+            label="test checkpoint",
+        ) as snapshot:
+            snapshot.stream.seek(0)
+            consumed.append(snapshot.stream.read())
+
+    assert replaced is True
+    assert consumed == []
+    assert opened_descriptors
+    for descriptor in opened_descriptors:
+        with pytest.raises(OSError) as closed_error:
+            os.fstat(descriptor)
+        assert closed_error.value.errno == errno.EBADF
+
+
+def test_checkpoint_snapshot_rejects_persistent_parent_replacement_before_file_open(
+    tmp_path,
+    monkeypatch,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    source = parent / "weights.pt"
+    source.write_bytes(b"original-parent-bytes")
+    replacement_parent = tmp_path / "replacement-parent"
+    replacement_parent.mkdir()
+    (replacement_parent / source.name).write_bytes(b"replacement-parent-bytes")
+    parked_parent = tmp_path / "parked-parent"
+    real_open = os.open
+    replaced = False
+    consumed = []
+
+    def replacing_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and Path(path) == Path(source.name):
+            parent.rename(parked_parent)
+            replacement_parent.rename(parent)
+            replaced = True
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(transfer_module.os, "open", replacing_open)
+
+    with pytest.raises(ValueError, match="changed|safely"):
+        with transfer_module._open_checkpoint_snapshot(
+            source,
+            label="test checkpoint",
+        ) as snapshot:
+            snapshot.stream.seek(0)
+            consumed.append(snapshot.stream.read())
+
+    assert replaced is True
+    assert consumed == []
+
+
+@pytest.mark.parametrize("restore_original", [False, True])
+def test_checkpoint_snapshot_rejects_parent_replacement_during_parent_open(
+    tmp_path,
+    monkeypatch,
+    restore_original,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    source = parent / "weights.pt"
+    source.write_bytes(b"original-parent-bytes")
+    replacement_parent = tmp_path / "replacement-parent"
+    replacement_parent.mkdir()
+    (replacement_parent / source.name).write_bytes(b"replacement-parent-bytes")
+    parked_parent = tmp_path / "parked-parent"
+    real_open = os.open
+    replaced = False
+    opened_parent_descriptors = []
+    consumed = []
+
+    def replacing_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if (
+            not replaced
+            and Path(path) == Path(parent.name)
+            and kwargs.get("dir_fd") is not None
+        ):
+            parent.rename(parked_parent)
+            replacement_parent.rename(parent)
+            replaced = True
+            descriptor = real_open(path, flags, *args, **kwargs)
+            opened_parent_descriptors.append(descriptor)
+            if restore_original:
+                parent.rename(replacement_parent)
+                parked_parent.rename(parent)
+            return descriptor
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(transfer_module.os, "open", replacing_open)
+
+    with pytest.raises(ValueError, match="changed|safely"):
+        with transfer_module._open_checkpoint_snapshot(
+            source,
+            label="test checkpoint",
+        ) as snapshot:
+            snapshot.stream.seek(0)
+            consumed.append(snapshot.stream.read())
+
+    assert replaced is True
+    assert consumed == []
+    assert len(opened_parent_descriptors) == 1
+    with pytest.raises(OSError) as closed_error:
+        os.fstat(opened_parent_descriptors[0])
+    assert closed_error.value.errno == errno.EBADF
+
+
 def test_checkpoint_snapshot_allows_unrelated_ancestor_sibling_creation(
     tmp_path,
     monkeypatch,
@@ -844,8 +1088,12 @@ def test_checkpoint_snapshot_allows_unrelated_ancestor_sibling_creation(
 
     def inserting_open(path, flags, *args, **kwargs):
         nonlocal inserted
-        if not inserted and Path(path) in {source, Path(source.name)}:
-            (tmp_path / "unrelated-sibling").mkdir()
+        if (
+            not inserted
+            and Path(path) == Path(parent.name)
+            and kwargs.get("dir_fd") is not None
+        ):
+            (parent / "unrelated-sibling").write_bytes(b"unrelated")
             inserted = True
         return real_open(path, flags, *args, **kwargs)
 

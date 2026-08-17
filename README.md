@@ -66,19 +66,12 @@ conda run -n moving-det-vru moving-det-vru freeze-p2-init \
   --output runs/vrud-pilot/universal-p2-init-20260816
 ```
 
-正式 Baseline 从该冻结文件开始训练，不再直接读取原始 Universal checkpoint：
+正式 Baseline 从该冻结文件开始训练，不再直接读取原始 Universal
+checkpoint。完整训练命令和中断处理见下文，这里不重复启动同一输出目录。
 
-```bash
-conda run -n moving-det-vru moving-det-vru train \
-  --model baseline \
-  --config configs/vrud-temporal-obb.yaml \
-  --manifest runs/vrud-pilot/manifest \
-  --output runs/vrud-pilot/baseline \
-  --weights runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt
-```
-
-人工 benchmark 只能用于 `test`。置信度阈值必须先在原 validation 集冻结，然后原样
-用于人工 test；禁止在这 873 帧上选择或调整阈值：
+人工 benchmark 只能用于 `test`。待下文的正式 Baseline 和 validation 阈值冻结后，
+再运行此评测。置信度阈值必须先在原 validation 集冻结，然后原样用于人工
+test；禁止在这 873 帧上选择或调整阈值：
 
 ```bash
 conda run -n moving-det-vru moving-det-vru evaluate \
@@ -121,7 +114,8 @@ conda run -n moving-det-vru moving-det-vru cache-alignments \
   --manifest runs/vrud-pilot/manifest
 ```
 
-训练单帧基线：
+训练单帧基线。下列 `runs/vrud-pilot/baseline` 专指直接从冻结 P2 启动、
+从未使用 `--resume` 并一次不间断完成的正式 Baseline run（分支 A）：
 
 ```bash
 conda run -n moving-det-vru moving-det-vru train \
@@ -132,11 +126,45 @@ conda run -n moving-det-vru moving-det-vru train \
   --weights runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt
 ```
 
-MG 和 LSTFE 只能从同一个正式 Baseline `best.pt` 初始化。该 checkpoint 必须直接由
-上面的冻结 Universal-P2 文件开始训练，不能带时序 alignment 指纹，也不能是内部
-init 或 resume 的产物；其 P2 文件、SHA-256、Universal 来源 SHA-256 和 427/859
-迁移计数都会在加载检测器参数前重新严格验证。`--baseline-init` 是明确写法；为兼容
-冻结的 Task 13 命令，时序模型的 `--weights <baseline-best.pt>` 具有相同含义：
+若 Baseline 中断，分支 B 只用于继续 Baseline 训练或单独评测 Baseline。将恢复结果
+写入明确命名的新目录，且不再传 `--weights`：
+
+```bash
+conda run -n moving-det-vru moving-det-vru train \
+  --model baseline \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/baseline-resumed-only \
+  --resume runs/vrud-pilot/baseline/checkpoints/last.pt
+```
+
+分支 B 生成的 `best.pt` 和 `last.pt` 都带 resume provenance；它们只能再恢复
+Baseline 或用 `--model baseline` 评测，永远不能作为正式 MG/LSTFE 的
+`--baseline-init` 或等价 `--weights`。
+
+若中断后仍必须满足当前严格证据合同，不要恢复该 run，也不要覆盖或复用已中断的
+`runs/vrud-pilot/baseline`。必须从同一冻结 P2 在全新输出目录重启，并不间断完成：
+
+```bash
+conda run -n moving-det-vru moving-det-vru train \
+  --model baseline \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/baseline-formal-restart-01 \
+  --weights runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt
+```
+
+重启后，只有该新目录中不间断完成的 `best.pt` 可以作为正式时序初始化。下文的字面
+`runs/vrud-pilot/baseline` 路径假定分支 A 成功不间断完成；如果采用上述严格重启，
+MG、LSTFE 和正式 Baseline 评测中的所有 checkpoint 路径都必须一致改为
+`runs/vrud-pilot/baseline-formal-restart-01`，绝不能改为 `baseline-resumed-only`。
+
+MG 和 LSTFE 只能从同一个不间断完成的正式 Baseline `best.pt` 初始化。该
+checkpoint 必须直接由上面的冻结 Universal-P2 文件开始训练，不能带时序
+alignment 指纹，也不能是内部 init 或 resume 的产物；其 P2 文件、SHA-256、
+Universal 来源 SHA-256 和 427/859 迁移计数都会在加载检测器参数前重新严格验证。
+`--baseline-init` 是明确写法；为兼容冻结的 Task 13 命令，时序模型的
+`--weights <baseline-best.pt>` 具有相同含义：
 
 ```bash
 conda run -n moving-det-vru moving-det-vru train \
@@ -153,7 +181,8 @@ conda run -n moving-det-vru moving-det-vru train \
 ```
 
 `--baseline-init` 会拒绝 MG/LSTFE checkpoint、Baseline `last.pt`、由 resume/internal
-init 产生的 Baseline checkpoint，以及不来自正式冻结 P2 artifact 的 checkpoint。
+init 产生的任何 Baseline checkpoint（包括恢复后的 `best.pt`），以及不来自正式
+冻结 P2 artifact 的 checkpoint。
 时序训练中断后必须使用 `--resume <temporal-output>/checkpoints/last.pt` 恢复，不能把
 该时序 checkpoint 再作为 `--baseline-init`。
 
@@ -170,23 +199,14 @@ conda run -n moving-det-vru moving-det-vru train \
   --max-steps 300
 ```
 
-训练输出的主 checkpoint 是 `<output>/checkpoints/best.pt`。恢复同一 run
-使用 `--resume <output>/checkpoints/last.pt`。非默认缓存可通过
+训练输出的主 checkpoint 是 `<output>/checkpoints/best.pt`，模型内部恢复来源是
+`<source-output>/checkpoints/last.pt`。Baseline 的 resume 仅按上述分支 B 处理，
+不改变正式时序初始化合同。非默认缓存可通过
 `--alignment-cache /safe/path/alignment-cache` 显式指定。
 
-正式 Baseline 若中断，继续同一输出目录并只使用内部 `last.pt` 恢复；此时不要再传
-`--weights`，原冻结 P2 来源会由 checkpoint 的 `load_provenance` 延续：
-
-```bash
-conda run -n moving-det-vru moving-det-vru train \
-  --model baseline \
-  --config configs/vrud-temporal-obb.yaml \
-  --manifest runs/vrud-pilot/manifest \
-  --output runs/vrud-pilot/baseline \
-  --resume runs/vrud-pilot/baseline/checkpoints/last.pt
-```
-
-评测必须先在 validation 选择并冻结阈值，再应用到 test：
+正式三模型比较中的 Baseline 评测必须使用与 MG/LSTFE 初始化相同的分支 A
+`best.pt`（或上述严格重启后的新正式 `best.pt`）。评测必须先在 validation 选择并冻结
+阈值，再应用到 test：
 
 ```bash
 conda run -n moving-det-vru moving-det-vru evaluate \
@@ -204,6 +224,11 @@ conda run -n moving-det-vru moving-det-vru evaluate \
   --threshold runs/vrud-pilot/baseline-validation/threshold.json \
   --output runs/vrud-pilot/baseline-eval
 ```
+
+如果只评测分支 B，可将上述 checkpoint 指向
+`runs/vrud-pilot/baseline-resumed-only/checkpoints/best.pt`，但 validation、test
+和阈值必须写入独立的 `baseline-resumed-only-*` 输出。这些是 Baseline-only
+评测产物，不属于下面的正式三模型比较。
 
 三个 test run 的 manifest、split、类别 schema 和逐帧评测全集必须完全兼容，
 否则拒绝比较：

@@ -441,6 +441,98 @@ def _required_checkpoint_open_flag(name: str, *, label: str) -> int:
     return value
 
 
+def _checkpoint_path_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+    )
+
+
+def _require_stable_checkpoint_directory(
+    metadata: tuple[os.stat_result, ...],
+    *,
+    label: str,
+    component: str,
+) -> None:
+    if (
+        not metadata
+        or any(not stat.S_ISDIR(value.st_mode) for value in metadata)
+        or len({_checkpoint_path_identity(value) for value in metadata}) != 1
+    ):
+        raise _CheckpointUnsafeError(
+            f"{label} parent component changed or is not a directory: "
+            f"{component}"
+        )
+
+
+def _revalidate_checkpoint_source_chain(
+    *,
+    root_fd: int,
+    lexical_directory_chain: tuple[tuple[int, str, int], ...],
+    cwd_binding: tuple[int, int] | None,
+    relative_directory_chain: tuple[tuple[int, str, int], ...],
+    source_parent_fd: int,
+    source_component: str,
+    source_descriptor: int,
+    label: str,
+) -> None:
+    root_path = Path("/")
+    _require_stable_checkpoint_directory(
+        (
+            os.stat(root_path, follow_symlinks=False),
+            os.fstat(root_fd),
+        ),
+        label=label,
+        component=str(root_path),
+    )
+    for parent_fd, component, directory_fd in lexical_directory_chain:
+        _require_stable_checkpoint_directory(
+            (
+                os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                ),
+                os.fstat(directory_fd),
+            ),
+            label=label,
+            component=component,
+        )
+    if cwd_binding is not None:
+        lexical_cwd_fd, cwd_fd = cwd_binding
+        _require_stable_checkpoint_directory(
+            (os.fstat(lexical_cwd_fd), os.fstat(cwd_fd)),
+            label=label,
+            component="current working directory",
+        )
+    for parent_fd, component, directory_fd in relative_directory_chain:
+        _require_stable_checkpoint_directory(
+            (
+                os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                ),
+                os.fstat(directory_fd),
+            ),
+            label=label,
+            component=component,
+        )
+    lexical_source = os.stat(
+        source_component,
+        dir_fd=source_parent_fd,
+        follow_symlinks=False,
+    )
+    opened_source = os.fstat(source_descriptor)
+    if _checkpoint_path_identity(lexical_source) != _checkpoint_path_identity(
+        opened_source
+    ):
+        raise _CheckpointUnsafeError(
+            f"{label} changed while opening: {source_component}"
+        )
+
+
 def _open_checkpoint_source_descriptor(
     source: Path,
     *,
@@ -449,29 +541,139 @@ def _open_checkpoint_source_descriptor(
     directory_flags: int,
     file_flags: int,
 ) -> tuple[Path, int]:
-    absolute_source = source if source.is_absolute() else Path.cwd() / source
-    components = absolute_source.parts[1:]
-    if not components:
-        raise _CheckpointUnsafeError(
-            f"{label} must identify a file below the filesystem root"
-        )
+    absolute_source = source
     try:
-        current_fd = owned_fds.own(os.open(Path("/"), directory_flags))
-        root_metadata = os.fstat(current_fd)
-        if not stat.S_ISDIR(root_metadata.st_mode):
-            raise _CheckpointUnsafeError(
-                f"{label} filesystem root is not a directory"
+        relative_source = not source.is_absolute()
+        cwd_fd: int | None = None
+        if relative_source:
+            relative_components = source.parts
+            if not relative_components:
+                raise _CheckpointUnsafeError(
+                    f"{label} must identify a file below the current directory"
+                )
+            cwd_path = Path(".")
+            cwd_before = os.stat(cwd_path, follow_symlinks=False)
+            cwd_fd = owned_fds.own(os.open(cwd_path, directory_flags))
+            cwd_opened = os.fstat(cwd_fd)
+            cwd_after = os.stat(cwd_path, follow_symlinks=False)
+            _require_stable_checkpoint_directory(
+                (cwd_before, cwd_opened, cwd_after),
+                label=label,
+                component="current working directory",
             )
-        for component in components[:-1]:
-            current_fd = owned_fds.own(
+            try:
+                absolute_cwd = Path.cwd()
+            except OSError as exc:
+                raise _CheckpointUnsafeError(
+                    f"{label} current directory cannot be resolved safely"
+                ) from exc
+            absolute_source = absolute_cwd / source
+            lexical_components = absolute_cwd.parts[1:]
+        else:
+            absolute_source = source
+            absolute_components = absolute_source.parts[1:]
+            if not absolute_components:
+                raise _CheckpointUnsafeError(
+                    f"{label} must identify a file below the filesystem root"
+                )
+            lexical_components = absolute_components[:-1]
+            relative_components = ()
+
+        root_path = Path("/")
+        root_before = os.stat(root_path, follow_symlinks=False)
+        root_fd = owned_fds.own(os.open(root_path, directory_flags))
+        root_opened = os.fstat(root_fd)
+        root_after = os.stat(root_path, follow_symlinks=False)
+        _require_stable_checkpoint_directory(
+            (root_before, root_opened, root_after),
+            label=label,
+            component=str(root_path),
+        )
+        current_fd = root_fd
+        lexical_directory_chain = []
+        for component in lexical_components:
+            before = os.stat(
+                component,
+                dir_fd=current_fd,
+                follow_symlinks=False,
+            )
+            parent_fd = current_fd
+            directory_fd = owned_fds.own(
                 os.open(component, directory_flags, dir_fd=current_fd)
             )
-            if not stat.S_ISDIR(os.fstat(current_fd).st_mode):
+            opened = os.fstat(directory_fd)
+            after = os.stat(
+                component,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            _require_stable_checkpoint_directory(
+                (before, opened, after),
+                label=label,
+                component=component,
+            )
+            lexical_directory_chain.append(
+                (parent_fd, component, directory_fd)
+            )
+            current_fd = directory_fd
+
+        cwd_binding: tuple[int, int] | None = None
+        relative_directory_chain = []
+        if relative_source:
+            if cwd_fd is None:
                 raise _CheckpointUnsafeError(
-                    f"{label} parent component is not a directory: {component}"
+                    f"{label} current directory cannot be bound safely"
                 )
+            lexical_cwd_fd = current_fd
+            _require_stable_checkpoint_directory(
+                (os.fstat(lexical_cwd_fd), os.fstat(cwd_fd)),
+                label=label,
+                component="current working directory",
+            )
+            cwd_binding = (lexical_cwd_fd, cwd_fd)
+            current_fd = cwd_fd
+            for component in relative_components[:-1]:
+                before = os.stat(
+                    component,
+                    dir_fd=current_fd,
+                    follow_symlinks=False,
+                )
+                parent_fd = current_fd
+                directory_fd = owned_fds.own(
+                    os.open(component, directory_flags, dir_fd=current_fd)
+                )
+                opened = os.fstat(directory_fd)
+                after = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                _require_stable_checkpoint_directory(
+                    (before, opened, after),
+                    label=label,
+                    component=component,
+                )
+                relative_directory_chain.append(
+                    (parent_fd, component, directory_fd)
+                )
+                current_fd = directory_fd
+            source_component = relative_components[-1]
+        else:
+            source_component = absolute_components[-1]
+
+        source_parent_fd = current_fd
         source_descriptor = owned_fds.own(
-            os.open(components[-1], file_flags, dir_fd=current_fd)
+            os.open(source_component, file_flags, dir_fd=source_parent_fd)
+        )
+        _revalidate_checkpoint_source_chain(
+            root_fd=root_fd,
+            lexical_directory_chain=tuple(lexical_directory_chain),
+            cwd_binding=cwd_binding,
+            relative_directory_chain=tuple(relative_directory_chain),
+            source_parent_fd=source_parent_fd,
+            source_component=source_component,
+            source_descriptor=source_descriptor,
+            label=label,
         )
     except FileNotFoundError as exc:
         raise _CheckpointMissingError(

@@ -7510,6 +7510,293 @@ def test_evaluation_snapshot_failure_cleans_descriptors_and_private_temp(
     assert not list(tmp_path.glob("moving-det-evaluation-*"))
 
 
+_TEST_EVALUATION_TEXT_LIMIT_BYTES = 512 * 1024 * 1024
+_TEST_EVALUATION_CHECKPOINT_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _assert_snapshot_rejects_target_before_copy(
+    *,
+    tmp_path: Path,
+    monkeypatch,
+    manifest: Path,
+    checkpoint: Path,
+    threshold: Path | None,
+    source_name: str,
+    destination_suffix: tuple[str, ...],
+) -> None:
+    proc_fds = Path("/proc/self/fd")
+    if not proc_fds.is_dir():
+        pytest.skip("requires /proc file-descriptor accounting")
+    monkeypatch.setattr(vru_cli_module.tempfile, "tempdir", str(tmp_path))
+    real_open = vru_cli_module.os.open
+    real_fstat = vru_cli_module.os.fstat
+    real_read = vru_cli_module.os.read
+    target_source_fds = set()
+    target_fstat_seen = False
+    destination_attempted = False
+    payload_read = False
+
+    def forbid_target_destination(path, flags, *args, **kwargs):
+        nonlocal destination_attempted
+        candidate = Path(path)
+        is_target_destination = (
+            kwargs.get("dir_fd") is None
+            and flags & vru_cli_module.os.O_CREAT
+            and tuple(candidate.parts[-len(destination_suffix) :])
+            == destination_suffix
+        )
+        if is_target_destination:
+            destination_attempted = True
+            raise AssertionError(
+                "oversize target destination was created before rejection"
+            )
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if (
+            kwargs.get("dir_fd") is not None
+            and vru_cli_module.os.fspath(path) == source_name
+            and not flags & vru_cli_module.os.O_CREAT
+        ):
+            target_source_fds.add(descriptor)
+        return descriptor
+
+    def track_target_fstat(descriptor):
+        nonlocal target_fstat_seen
+        result = real_fstat(descriptor)
+        if descriptor in target_source_fds:
+            target_fstat_seen = True
+        return result
+
+    def forbid_target_payload_read(descriptor, size):
+        nonlocal payload_read
+        if descriptor in target_source_fds:
+            payload_read = True
+            raise AssertionError(
+                "oversize target payload was read before rejection"
+            )
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(vru_cli_module.os, "open", forbid_target_destination)
+    monkeypatch.setattr(vru_cli_module.os, "fstat", track_target_fstat)
+    monkeypatch.setattr(vru_cli_module.os, "read", forbid_target_payload_read)
+    baseline_fds = len(tuple(proc_fds.iterdir()))
+
+    with pytest.raises(WorkflowError, match="size|budget|limit"):
+        with vru_cli_module._snapshot_evaluation_inputs(
+            manifest,
+            checkpoint,
+            threshold,
+            {"model_name": "baseline"},
+        ):
+            pytest.fail("oversize evaluation inputs must not yield a snapshot")
+
+    assert target_fstat_seen is True
+    assert destination_attempted is False
+    assert payload_read is False
+    assert len(tuple(proc_fds.iterdir())) == baseline_fds
+    assert not list(tmp_path.glob("moving-det-evaluation-*"))
+
+
+def test_evaluation_snapshot_rejects_oversize_manifest_child_before_copy(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    oversized = manifest / "train.jsonl"
+    with oversized.open("wb") as stream:
+        stream.truncate(_TEST_EVALUATION_TEXT_LIMIT_BYTES + 1)
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+
+    _assert_snapshot_rejects_target_before_copy(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=None,
+        source_name=oversized.name,
+        destination_suffix=("manifest", oversized.name),
+    )
+
+
+def test_evaluation_snapshot_rejects_oversize_checkpoint_before_copy(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    with checkpoint.open("wb") as stream:
+        stream.truncate(_TEST_EVALUATION_CHECKPOINT_LIMIT_BYTES + 1)
+
+    _assert_snapshot_rejects_target_before_copy(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=None,
+        source_name=checkpoint.name,
+        destination_suffix=("checkpoint.pt",),
+    )
+
+
+def test_evaluation_snapshot_bounds_validation_run_before_parsing_or_copy(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    oversized = threshold.parent / "run.json"
+    with oversized.open("wb") as stream:
+        stream.truncate(_TEST_EVALUATION_TEXT_LIMIT_BYTES + 1)
+
+    _assert_snapshot_rejects_target_before_copy(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=threshold,
+        source_name=oversized.name,
+        destination_suffix=("validation-run", oversized.name),
+    )
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ("threshold.json", "predictions.jsonl"),
+)
+def test_evaluation_snapshot_rejects_oversize_declared_validation_artifact(
+    tmp_path,
+    monkeypatch,
+    artifact_name,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    threshold = _publish_strict_validation_run(
+        tmp_path / "validation",
+        manifest=manifest,
+        checkpoint=checkpoint,
+    )
+    oversized = threshold.parent / artifact_name
+    with oversized.open("wb") as stream:
+        stream.truncate(_TEST_EVALUATION_TEXT_LIMIT_BYTES + 1)
+
+    _assert_snapshot_rejects_target_before_copy(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=threshold,
+        source_name=oversized.name,
+        destination_suffix=("validation-run", oversized.name),
+    )
+
+
+def test_evaluation_snapshot_rejects_cumulative_budget_before_next_copy(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    (manifest / "train.jsonl").write_bytes(b"earlier manifest bytes\n")
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"approved checkpoint")
+    target = manifest / "class-audit.json"
+    target_index = vru_cli_module._MANIFEST_ARTIFACTS.index(target.name)
+    bytes_through_target = sum(
+        (manifest / name).stat().st_size
+        for name in vru_cli_module._MANIFEST_ARTIFACTS[: target_index + 1]
+    )
+    assert target.stat().st_size < bytes_through_target
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_MAX_EVALUATION_SNAPSHOT_TOTAL_BYTES",
+        bytes_through_target - 1,
+        raising=False,
+    )
+
+    _assert_snapshot_rejects_target_before_copy(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        manifest=manifest,
+        checkpoint=checkpoint,
+        threshold=None,
+        source_name=target.name,
+        destination_suffix=("manifest", target.name),
+    )
+
+
+def test_evaluation_snapshot_accepts_exact_file_and_total_byte_boundaries(
+    tmp_path,
+    monkeypatch,
+):
+    manifest = tmp_path / "manifest"
+    _manifest_children(manifest, [])
+    exact_text = b"t" * 2048
+    (manifest / "train.jsonl").write_bytes(exact_text)
+    checkpoint = tmp_path / "best.pt"
+    exact_checkpoint = b"c" * 1024
+    checkpoint.write_bytes(exact_checkpoint)
+    total_bytes = sum(
+        (manifest / name).stat().st_size
+        for name in vru_cli_module._MANIFEST_ARTIFACTS
+    ) + checkpoint.stat().st_size
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_MAX_EVALUATION_TEXT_ARTIFACT_BYTES",
+        len(exact_text),
+    )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_MAX_EVALUATION_CHECKPOINT_BYTES",
+        len(exact_checkpoint),
+    )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_MAX_EVALUATION_SNAPSHOT_TOTAL_BYTES",
+        total_bytes,
+    )
+
+    with vru_cli_module._snapshot_evaluation_inputs(
+        manifest,
+        checkpoint,
+        None,
+        {"model_name": "baseline"},
+    ) as inputs:
+        snapshot_root = inputs.root
+        assert (inputs.manifest_dir / "train.jsonl").read_bytes() == exact_text
+        assert inputs.checkpoint.read_bytes() == exact_checkpoint
+
+    assert not snapshot_root.exists()
+
+
+@pytest.mark.parametrize("invalid_value", (True, -1))
+def test_evaluation_snapshot_budget_rejects_invalid_accounting_values(
+    invalid_value,
+):
+    budget = vru_cli_module._EvaluationSnapshotBudget()
+
+    with pytest.raises(WorkflowError, match="size|budget"):
+        budget.reserve(invalid_value, label="injected artifact")
+
+
+def test_evaluation_snapshot_budget_rejects_invalid_prior_accounting():
+    budget = vru_cli_module._EvaluationSnapshotBudget()
+    budget._accounted_bytes = True
+
+    with pytest.raises(WorkflowError, match="budget"):
+        budget.reserve(0, label="injected artifact")
+
+
 def test_evaluation_descriptor_close_error_never_retries_reused_fd(
     tmp_path,
     monkeypatch,

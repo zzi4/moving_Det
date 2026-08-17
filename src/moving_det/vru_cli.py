@@ -165,6 +165,13 @@ _DIAGNOSTIC_MAP_SHAPE = (180, 320)
 _LSTFE_LONG_SLOTS = (0, 1, 5, 6)
 _MAX_FULL_FRAME_IMAGE_BYTES = 128 * 1024 * 1024
 _FULL_FRAME_READ_CHUNK_BYTES = 1024 * 1024
+# Evaluation inputs are copied into a private temporary snapshot.  These are
+# deliberately wide, trusted policy limits: source metadata and manifest
+# declarations never select or enlarge them.  JSON, JSONL, CSV, and other text
+# evidence share one limit, while binary model checkpoints have a larger one.
+_MAX_EVALUATION_TEXT_ARTIFACT_BYTES = 512 * 1024 * 1024
+_MAX_EVALUATION_CHECKPOINT_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_EVALUATION_SNAPSHOT_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 _EVALUATION_RUN_FIELDS = frozenset(
     {
         "schema_version",
@@ -3714,6 +3721,41 @@ class _EvaluationFileDescriptorRegistry:
         return tuple(errors)
 
 
+class _EvaluationSnapshotBudget:
+    def __init__(self) -> None:
+        self._accounted_bytes = 0
+
+    def reserve(self, size: int, *, label: str) -> None:
+        total_limit = _MAX_EVALUATION_SNAPSHOT_TOTAL_BYTES
+        if (
+            type(total_limit) is not int
+            or total_limit <= 0
+            or type(self._accounted_bytes) is not int
+            or self._accounted_bytes < 0
+            or self._accounted_bytes > total_limit
+        ):
+            raise WorkflowError("evaluation snapshot byte budget is invalid")
+        if type(size) is not int or size < 0:
+            raise WorkflowError(f"{label} size is invalid")
+        if size > total_limit - self._accounted_bytes:
+            raise WorkflowError(
+                f"{label} exceeds the evaluation snapshot total byte budget"
+            )
+        self._accounted_bytes += size
+
+
+def _evaluation_snapshot_file_limit(artifact_kind: str) -> int:
+    if artifact_kind == "text":
+        limit = _MAX_EVALUATION_TEXT_ARTIFACT_BYTES
+    elif artifact_kind == "checkpoint":
+        limit = _MAX_EVALUATION_CHECKPOINT_BYTES
+    else:
+        raise WorkflowError("evaluation snapshot artifact kind is invalid")
+    if type(limit) is not int or limit <= 0:
+        raise WorkflowError("evaluation snapshot file size limit is invalid")
+    return limit
+
+
 def _evaluation_cleanup_note(
     descriptor: int,
     purpose: str,
@@ -4008,6 +4050,8 @@ def _copy_evaluation_regular_file(
     destination_flags: int,
     registry: _EvaluationFileDescriptorRegistry,
     source_directory_fd: int,
+    artifact_kind: str,
+    budget: _EvaluationSnapshotBudget,
 ) -> tuple[str, tuple[int, int]]:
     if (
         not isinstance(source_name, str)
@@ -4053,9 +4097,19 @@ def _copy_evaluation_regular_file(
         or (before.st_dev, before.st_ino) != opened_identity
         or (path_after_open.st_dev, path_after_open.st_ino)
         != opened_identity
+        or type(opened.st_size) is not int
         or opened.st_size < 0
     ):
         raise WorkflowError(f"{label} is not one stable regular file")
+
+    file_limit = _evaluation_snapshot_file_limit(artifact_kind)
+    if opened.st_size > file_limit:
+        raise WorkflowError(
+            f"{label} exceeds the evaluation {artifact_kind} file size limit"
+        )
+    if not isinstance(budget, _EvaluationSnapshotBudget):
+        raise WorkflowError("evaluation snapshot byte budget is invalid")
+    budget.reserve(opened.st_size, label=label)
 
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(destination.parent, 0o700)
@@ -4128,6 +4182,7 @@ def _snapshot_evaluation_inputs(
     )
     root = Path(tempfile.mkdtemp(prefix="moving-det-evaluation-"))
     registry = _EvaluationFileDescriptorRegistry()
+    budget = _EvaluationSnapshotBudget()
     primary_error: BaseException | None = None
     try:
         os.chmod(root, 0o700)
@@ -4149,6 +4204,8 @@ def _snapshot_evaluation_inputs(
                 destination_flags=destination_flags,
                 registry=registry,
                 source_directory_fd=manifest_fd,
+                artifact_kind="text",
+                budget=budget,
             )
             if identity in source_identities:
                 raise WorkflowError("manifest artifacts contain path aliases")
@@ -4179,6 +4236,8 @@ def _snapshot_evaluation_inputs(
                 destination_flags=destination_flags,
                 registry=registry,
                 source_directory_fd=checkpoint_parent_fd,
+                artifact_kind="checkpoint",
+                budget=budget,
             )
         )
         _close_evaluation_descriptor(registry, checkpoint_parent_fd)
@@ -4243,6 +4302,8 @@ def _snapshot_evaluation_inputs(
                 destination_flags=destination_flags,
                 registry=registry,
                 source_directory_fd=validation_fd,
+                artifact_kind="text",
+                budget=budget,
             )
             if run_identity in source_identities:
                 raise WorkflowError("evaluation inputs contain path aliases")
@@ -4292,6 +4353,8 @@ def _snapshot_evaluation_inputs(
                     destination_flags=destination_flags,
                     registry=registry,
                     source_directory_fd=validation_fd,
+                    artifact_kind="text",
+                    budget=budget,
                 )
                 if identity in source_identities:
                     raise WorkflowError(
