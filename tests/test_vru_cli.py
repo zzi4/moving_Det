@@ -112,6 +112,7 @@ def test_vru_cli_exposes_exact_workflow_commands():
             "--alignment-cache runs/vrud-pilot/alignment-cache "
             "--human-benchmark runs/vrud-pilot/human-benchmark-20260816 "
             "--p2-init runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt "
+            "--expected-git-commit 1111111111111111111111111111111111111111 "
             "--output runs/formal-20260817-01"
         ),
         (
@@ -185,7 +186,10 @@ def test_task12_and_task13_command_forms_parse_without_ambiguity(arguments):
     assert args.command in EXPECTED_COMMANDS
 
 
-def test_formal_preflight_cli_publishes_only_canonical_report(tmp_path):
+def test_formal_preflight_cli_publishes_only_canonical_report(
+    tmp_path,
+    monkeypatch,
+):
     output = tmp_path / "formal-20260817-01"
     args = build_parser().parse_args(
         [
@@ -200,6 +204,8 @@ def test_formal_preflight_cli_publishes_only_canonical_report(tmp_path):
             str(tmp_path / "human-benchmark"),
             "--p2-init",
             str(tmp_path / "p2-init.pt"),
+            "--expected-git-commit",
+            "a" * 40,
             "--output",
             str(output),
         ]
@@ -207,6 +213,7 @@ def test_formal_preflight_cli_publishes_only_canonical_report(tmp_path):
     passing = FormalPreflightReport(
         schema_version=1,
         git_commit="a" * 40,
+        config_sha256="1" * 64,
         manifest_sha256="b" * 64,
         alignment_cache_sha256="c" * 64,
         human_benchmark_sha256="d" * 64,
@@ -216,6 +223,13 @@ def test_formal_preflight_cli_publishes_only_canonical_report(tmp_path):
         free_bytes=200 * 1024**3,
         passed=True,
     )
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_replace_directory",
+        lambda *_args, **_kwargs: pytest.fail(
+            "formal preflight reused the replacing directory publisher"
+        ),
+    )
 
     assert run_formal_preflight(args, preflight=lambda request: passing) == 0
 
@@ -223,6 +237,7 @@ def test_formal_preflight_cli_publishes_only_canonical_report(tmp_path):
     assert {path.name for path in preflight_root.iterdir()} == {"report.json"}
     assert json.loads((preflight_root / "report.json").read_text()) == {
         "alignment_cache_sha256": "c" * 64,
+        "config_sha256": "1" * 64,
         "free_bytes": 200 * 1024**3,
         "git_commit": "a" * 40,
         "gpu_names": ["NVIDIA RTX A6000", "NVIDIA RTX A6000"],
@@ -233,6 +248,66 @@ def test_formal_preflight_cli_publishes_only_canonical_report(tmp_path):
         "schema_version": 1,
         "train_record_count": 13_998,
     }
+
+
+def test_formal_preflight_create_only_publication_preserves_racing_writer(
+    tmp_path,
+    monkeypatch,
+):
+    output = tmp_path / "formal-20260817-01"
+    args = build_parser().parse_args(
+        [
+            "formal-preflight",
+            "--config",
+            "formal.yaml",
+            "--manifest",
+            "manifest",
+            "--alignment-cache",
+            "alignment-cache",
+            "--human-benchmark",
+            "human-benchmark",
+            "--p2-init",
+            "p2-init.pt",
+            "--expected-git-commit",
+            "a" * 40,
+            "--output",
+            str(output),
+        ]
+    )
+    passing = FormalPreflightReport(
+        schema_version=1,
+        git_commit="a" * 40,
+        config_sha256="1" * 64,
+        manifest_sha256="b" * 64,
+        alignment_cache_sha256="c" * 64,
+        human_benchmark_sha256="d" * 64,
+        p2_init_sha256="e" * 64,
+        train_record_count=13_998,
+        gpu_names=("NVIDIA RTX A6000", "NVIDIA RTX A6000"),
+        free_bytes=200 * 1024**3,
+        passed=True,
+    )
+    real_rename = vru_cli_module._rename_directory_noreplace
+
+    def race_at_atomic_claim(source, destination):
+        destination.mkdir()
+        (destination / "other-process.txt").write_text(
+            "foreign",
+            encoding="utf-8",
+        )
+        return real_rename(source, destination)
+
+    monkeypatch.setattr(
+        vru_cli_module,
+        "_rename_directory_noreplace",
+        race_at_atomic_claim,
+    )
+
+    with pytest.raises(WorkflowError, match="already exists|concurrent"):
+        run_formal_preflight(args, preflight=lambda _request: passing)
+
+    assert (output / "other-process.txt").read_text(encoding="utf-8") == "foreign"
+    assert not (output / "preflight").exists()
 
 
 def test_formal_preflight_cli_rejects_nonempty_root_before_preflight(tmp_path):
@@ -253,6 +328,8 @@ def test_formal_preflight_cli_rejects_nonempty_root_before_preflight(tmp_path):
             "human-benchmark",
             "--p2-init",
             "p2-init.pt",
+            "--expected-git-commit",
+            "a" * 40,
             "--output",
             str(output),
         ]
@@ -267,6 +344,36 @@ def test_formal_preflight_cli_rejects_nonempty_root_before_preflight(tmp_path):
         )
 
     assert sentinel.read_text(encoding="utf-8") == "owned"
+
+
+def test_formal_preflight_parser_requires_external_expected_git_commit():
+    required_paths = [
+        "formal-preflight",
+        "--config",
+        "formal.yaml",
+        "--manifest",
+        "manifest",
+        "--alignment-cache",
+        "alignment-cache",
+        "--human-benchmark",
+        "human-benchmark",
+        "--p2-init",
+        "p2-init.pt",
+        "--output",
+        "formal-output",
+    ]
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(required_paths)
+
+    args = build_parser().parse_args(
+        [
+            *required_paths,
+            "--expected-git-commit",
+            "1" * 40,
+        ]
+    )
+    assert args.expected_git_commit == "1" * 40
 
 
 def test_diagnose_overfit_parser_preserves_all_frozen_inputs():

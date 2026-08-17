@@ -5,8 +5,10 @@ from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 import csv
+import ctypes
 from dataclasses import asdict, dataclass, is_dataclass, replace
 from datetime import datetime, timezone
+import errno
 import hashlib
 import importlib.metadata
 import io
@@ -27,7 +29,6 @@ from typing import Any, Iterator
 
 
 _DEFAULT_CONFIG = Path("configs/vrud-temporal-obb.yaml")
-_FORMAL_EXPECTED_GIT_COMMIT = "5205f4640d90771750274519f0860fb3e482f198"
 _FORMAL_MINIMUM_FREE_BYTES = 100 * 1024**3
 _MODEL_NAMES = ("baseline", "mg_vtod", "lstfe")
 _CLASS_SCHEMA = {
@@ -332,6 +333,16 @@ def _positive_integer(value: str) -> int:
     return converted
 
 
+def _git_commit_argument(value: str) -> str:
+    if len(value) != 40 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise argparse.ArgumentTypeError(
+            "Git commit must be exactly 40 lowercase hexadecimal characters"
+        )
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="moving-det-vru",
@@ -356,6 +367,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
     formal_preflight.add_argument("--p2-init", type=_path_argument, required=True)
+    formal_preflight.add_argument(
+        "--expected-git-commit",
+        type=_git_commit_argument,
+        required=True,
+    )
     formal_preflight.add_argument("--output", type=_path_argument, required=True)
 
     human_benchmark = subparsers.add_parser(
@@ -751,6 +767,62 @@ def _write_bytes(path: Path, content: bytes) -> None:
         os.fsync(stream.fileno())
 
 
+def _rename_directory_noreplace(source: Path, destination: Path) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as exc:
+        raise WorkflowError(
+            "create-only formal publication is unavailable on this platform"
+        ) from exc
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        -100,
+        os.fsencode(source),
+        -100,
+        os.fsencode(destination),
+        1,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise WorkflowError(
+            "formal output root already exists due to a concurrent publisher"
+        )
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _publish_formal_preflight_report(output: Path, report: object) -> Path:
+    destination = Path(output)
+    _reject_symlink_components(destination)
+    if not destination.parent.is_dir():
+        raise WorkflowError("formal output parent directory does not exist")
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.create-only.",
+            dir=destination.parent,
+        )
+    )
+    relative = Path("preflight") / "report.json"
+    try:
+        _write_bytes(staging / relative, _json_bytes(asdict(report)))
+        _fsync_directory(staging / "preflight")
+        _fsync_directory(staging)
+        _rename_directory_noreplace(staging, destination)
+        _fsync_directory(destination.parent)
+        return destination / relative
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
 def run_formal_preflight(
     args: argparse.Namespace,
     *,
@@ -778,7 +850,7 @@ def run_formal_preflight(
         benchmark_dir=Path(args.human_benchmark),
         p2_init=Path(args.p2_init),
         output_root=output,
-        expected_git_commit=_FORMAL_EXPECTED_GIT_COMMIT,
+        expected_git_commit=args.expected_git_commit,
         minimum_free_bytes=_FORMAL_MINIMUM_FREE_BYTES,
     )
     selected_preflight = (
@@ -792,12 +864,7 @@ def run_formal_preflight(
     if output.exists() and next(output.iterdir(), None) is not None:
         raise WorkflowError("formal output root became non-empty during preflight")
 
-    def writer(stage: Path) -> Path:
-        relative = Path("preflight") / "report.json"
-        _write_bytes(stage / relative, _json_bytes(asdict(report)))
-        return relative
-
-    primary = _replace_directory(output, writer)
+    primary = _publish_formal_preflight_report(output, report)
     print(primary.resolve())
     return 0
 
