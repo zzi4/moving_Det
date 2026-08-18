@@ -96,7 +96,7 @@ CUDA_VISIBLE_DEVICES=0 conda run -n moving-det-vru python \
 ### 正式 MG-VTOD 比较：一次性 root 与持久训练服务
 
 本轮正式证据唯一根目录为
-`runs/vrud-pilot/formal-20260817-01`。必须在最终 code/docs commit 的干净
+`runs/vrud-pilot/formal-20260818-01`。必须在最终 code/docs commit 的干净
 checkout 或 worktree 中执行；先记录该最终 HEAD，再把同一个 40 位 SHA 显式传给
 preflight。不得先手工创建正式 root，也不得对已存在的 root 重跑：
 
@@ -105,7 +105,7 @@ cd "$(git rev-parse --show-toplevel)"
 FORMAL_GIT_COMMIT="$(git rev-parse HEAD)"
 test "${#FORMAL_GIT_COMMIT}" -eq 40
 test -z "$(git status --porcelain=v1 --untracked-files=normal)"
-test ! -e runs/vrud-pilot/formal-20260817-01
+test ! -e runs/vrud-pilot/formal-20260818-01
 
 CUDA_VISIBLE_DEVICES=0,1 conda run -n moving-det-vru moving-det-vru formal-preflight \
   --config configs/vrud-temporal-obb.yaml \
@@ -114,55 +114,55 @@ CUDA_VISIBLE_DEVICES=0,1 conda run -n moving-det-vru moving-det-vru formal-prefl
   --human-benchmark runs/vrud-pilot/human-benchmark-20260816 \
   --p2-init runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt \
   --expected-git-commit "$FORMAL_GIT_COMMIT" \
-  --output runs/vrud-pilot/formal-20260817-01
+  --output runs/vrud-pilot/formal-20260818-01
 ```
 
-preflight 只允许生成 `formal-20260817-01/preflight/report.json`，且其中
+preflight 只允许生成 `formal-20260818-01/preflight/report.json`，且其中
 `passed` 必须为 `true`。随后用用户级 systemd transient service 保持双 GPU 训练；
 `--same-dir` 会把上面的干净项目根目录传给服务。正式 Baseline 必须直接从冻结 P2
 开始，使用 `train_scope=full`，且绝不带 `--resume`：
 
 ```bash
-systemd-run --user --unit=moving-det-formal-20260817-01-baseline \
+systemd-run --user --unit=moving-det-formal-20260818-01-baseline \
   --collect --same-dir --setenv=CUDA_VISIBLE_DEVICES=0,1 \
-  conda run -n moving-det-vru moving-det-vru train \
+  /home/stu1/anaconda3/bin/conda run --no-capture-output -n moving-det-vru moving-det-vru train \
   --model baseline \
   --config configs/vrud-temporal-obb.yaml \
   --manifest runs/vrud-pilot/manifest \
-  --output runs/vrud-pilot/formal-20260817-01/baseline \
+  --output runs/vrud-pilot/formal-20260818-01/baseline \
   --weights runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt \
   --train-scope full --devices 2
 
-systemctl --user status moving-det-formal-20260817-01-baseline
-journalctl --user -u moving-det-formal-20260817-01-baseline -n 200 --no-pager
+systemctl --user status moving-det-formal-20260818-01-baseline
+journalctl --user -u moving-det-formal-20260818-01-baseline -n 200 --no-pager
 ```
 
 若该正式 Baseline 中断，保留失败目录作为证据；不得恢复、覆盖、删除后重用，也不得
 让它初始化 MG。必须使用新的正式 root 名称，重新通过 preflight，并从同一冻结 P2
 启动一个全新的非续训 Baseline。只有一次不间断完成且 provenance 直接指向冻结 P2
-的 `formal-20260817-01/baseline/checkpoints/best.pt` 才能启动后续 MG 服务：
+的 `formal-20260818-01/baseline/checkpoints/best.pt` 才能启动后续 MG 服务：
 
 ```bash
-systemd-run --user --unit=moving-det-formal-20260817-01-mg-full \
+systemd-run --user --unit=moving-det-formal-20260818-01-mg-full \
   --collect --same-dir --setenv=CUDA_VISIBLE_DEVICES=0,1 \
-  conda run -n moving-det-vru moving-det-vru train \
+  /home/stu1/anaconda3/bin/conda run --no-capture-output -n moving-det-vru moving-det-vru train \
   --model mg_vtod \
   --config configs/vrud-temporal-obb.yaml \
   --manifest runs/vrud-pilot/manifest \
   --alignment-cache runs/vrud-pilot/alignment-cache \
-  --output runs/vrud-pilot/formal-20260817-01/mg-vtod-full \
-  --baseline-init runs/vrud-pilot/formal-20260817-01/baseline/checkpoints/best.pt \
+  --output runs/vrud-pilot/formal-20260818-01/mg-vtod-full \
+  --baseline-init runs/vrud-pilot/formal-20260818-01/baseline/checkpoints/best.pt \
   --train-scope full --devices 2
 
-systemd-run --user --unit=moving-det-formal-20260817-01-mg-frozen \
+systemd-run --user --unit=moving-det-formal-20260818-01-mg-frozen \
   --collect --same-dir --setenv=CUDA_VISIBLE_DEVICES=0,1 \
-  conda run -n moving-det-vru moving-det-vru train \
+  /home/stu1/anaconda3/bin/conda run --no-capture-output -n moving-det-vru moving-det-vru train \
   --model mg_vtod \
   --config configs/vrud-temporal-obb.yaml \
   --manifest runs/vrud-pilot/manifest \
   --alignment-cache runs/vrud-pilot/alignment-cache \
-  --output runs/vrud-pilot/formal-20260817-01/mg-frozen \
-  --baseline-init runs/vrud-pilot/formal-20260817-01/baseline/checkpoints/best.pt \
+  --output runs/vrud-pilot/formal-20260818-01/mg-frozen \
+  --baseline-init runs/vrud-pilot/formal-20260818-01/baseline/checkpoints/best.pt \
   --train-scope temporal --devices 2
 ```
 

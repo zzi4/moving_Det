@@ -197,6 +197,10 @@ def test_loader_runtime_uses_bounded_persistent_prefetch():
 
 def test_readme_formal_baseline_commands_use_frozen_p2_and_resume_last():
     readme = Path("README.md").read_text(encoding="utf-8")
+    formal_section = readme.split(
+        "### 正式 MG-VTOD 比较：一次性 root 与持久训练服务",
+        maxsplit=1,
+    )[1].split("这批人工序列", maxsplit=1)[0]
 
     assert "--weights yolo11m-obb.pt" not in readme
     assert readme.count(
@@ -206,6 +210,14 @@ def test_readme_formal_baseline_commands_use_frozen_p2_and_resume_last():
         "--resume runs/vrud-pilot/baseline/checkpoints/last.pt"
         in readme
     )
+    service_entrypoint = (
+        "  /home/stu1/anaconda3/bin/conda run --no-capture-output "
+        "-n moving-det-vru moving-det-vru train"
+    )
+    assert formal_section.count(service_entrypoint) == 3
+    assert "\n  conda run -n moving-det-vru moving-det-vru train \\" not in formal_section
+    assert "formal-20260818-01" in formal_section
+    assert "formal-20260817-01" not in formal_section
 
 
 def test_loader_runtime_supports_synchronous_test_override():
