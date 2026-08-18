@@ -362,6 +362,61 @@ def test_real_git_probe_enforces_matched_clean_head_and_rejects_wrong_or_dirty(
     assert not matched.output_root.exists()
 
 
+def _probe_gpus_with_process_rows(monkeypatch, process_rows):
+    def fake_run_probe(_command, *, label):
+        if label == "GPU devices":
+            return "NVIDIA RTX A6000\nNVIDIA RTX A6000\n"
+        assert label == "GPU compute processes"
+        return process_rows
+
+    monkeypatch.setattr(formal_experiment_module, "_run_probe", fake_run_probe)
+    return probe_gpus()
+
+
+@pytest.mark.parametrize(
+    ("process_row", "expected_pids"),
+    [
+        (
+            "707476, /snap/snapd-desktop-integration/391/usr/bin/"
+            "snapd-desktop-integration, 16\n",
+            (),
+        ),
+        ("707477, snapd-desktop-integration, 0\n", ()),
+        ("707478, snapd-desktop-integration-helper, 6\n", (707478,)),
+        ("707479, snapd-desktop-integration, 17\n", (707479,)),
+        ("707480, /home/stu5/train.py, 6\n", (707480,)),
+    ],
+)
+def test_gpu_probe_ignores_only_exact_small_snapd_desktop_context(
+    monkeypatch,
+    process_row,
+    expected_pids,
+):
+    observed = _probe_gpus_with_process_rows(monkeypatch, process_row)
+
+    assert observed == {
+        "devices": ("NVIDIA RTX A6000", "NVIDIA RTX A6000"),
+        "compute_pids": expected_pids,
+    }
+
+
+@pytest.mark.parametrize(
+    "process_rows",
+    [
+        "707476\n",
+        "not-a-pid, snapd-desktop-integration, 6\n",
+        "0, snapd-desktop-integration, 6\n",
+        "707476, , 6\n",
+        "707476, snapd-desktop-integration, not-memory\n",
+        "707476, snapd-desktop-integration, -1\n",
+        "707476, snapd-desktop-integration, 6, extra\n",
+    ],
+)
+def test_gpu_probe_rejects_malformed_compute_rows(monkeypatch, process_rows):
+    with pytest.raises(ValueError, match="malformed GPU process data"):
+        _probe_gpus_with_process_rows(monkeypatch, process_rows)
+
+
 def test_public_preflight_cannot_override_production_root_or_approved_contract(
     monkeypatch,
     tmp_path,

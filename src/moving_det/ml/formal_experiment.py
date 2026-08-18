@@ -712,20 +712,35 @@ def probe_gpus() -> Mapping[str, object]:
         for line in _run_probe(
             (
                 "nvidia-smi",
-                "--query-compute-apps=pid",
+                "--query-compute-apps=pid,process_name,used_gpu_memory",
                 "--format=csv,noheader,nounits",
             ),
             label="GPU compute processes",
         ).splitlines()
         if line.strip()
     )
-    try:
-        compute_pids = tuple(int(line) for line in process_lines)
-    except ValueError as exc:
-        raise ValueError("formal preflight received malformed GPU process data") from exc
-    if any(pid <= 0 for pid in compute_pids):
-        raise ValueError("formal preflight received malformed GPU process data")
-    return {"devices": names, "compute_pids": compute_pids}
+    compute_pids = []
+    for line in process_lines:
+        fields = tuple(field.strip() for field in line.split(","))
+        if len(fields) != 3:
+            raise ValueError("formal preflight received malformed GPU process data")
+        pid_text, process_name, used_memory_text = fields
+        try:
+            pid = int(pid_text)
+            used_memory = int(used_memory_text)
+        except ValueError as exc:
+            raise ValueError(
+                "formal preflight received malformed GPU process data"
+            ) from exc
+        if pid <= 0 or not process_name or used_memory < 0:
+            raise ValueError("formal preflight received malformed GPU process data")
+        if (
+            Path(process_name).name == "snapd-desktop-integration"
+            and used_memory <= 16
+        ):
+            continue
+        compute_pids.append(pid)
+    return {"devices": names, "compute_pids": tuple(compute_pids)}
 
 
 def probe_free_bytes(path: Path) -> int:

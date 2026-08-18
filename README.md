@@ -93,6 +93,89 @@ CUDA_VISIBLE_DEVICES=0 conda run -n moving-det-vru python \
   --p2-init runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt
 ```
 
+### 正式 MG-VTOD 比较：一次性 root 与持久训练服务
+
+本轮正式证据唯一根目录为
+`runs/vrud-pilot/formal-20260817-01`。必须在最终 code/docs commit 的干净
+checkout 或 worktree 中执行；先记录该最终 HEAD，再把同一个 40 位 SHA 显式传给
+preflight。不得先手工创建正式 root，也不得对已存在的 root 重跑：
+
+```bash
+cd "$(git rev-parse --show-toplevel)"
+FORMAL_GIT_COMMIT="$(git rev-parse HEAD)"
+test "${#FORMAL_GIT_COMMIT}" -eq 40
+test -z "$(git status --porcelain=v1 --untracked-files=normal)"
+test ! -e runs/vrud-pilot/formal-20260817-01
+
+CUDA_VISIBLE_DEVICES=0,1 conda run -n moving-det-vru moving-det-vru formal-preflight \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --alignment-cache runs/vrud-pilot/alignment-cache \
+  --human-benchmark runs/vrud-pilot/human-benchmark-20260816 \
+  --p2-init runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt \
+  --expected-git-commit "$FORMAL_GIT_COMMIT" \
+  --output runs/vrud-pilot/formal-20260817-01
+```
+
+preflight 只允许生成 `formal-20260817-01/preflight/report.json`，且其中
+`passed` 必须为 `true`。随后用用户级 systemd transient service 保持双 GPU 训练；
+`--same-dir` 会把上面的干净项目根目录传给服务。正式 Baseline 必须直接从冻结 P2
+开始，使用 `train_scope=full`，且绝不带 `--resume`：
+
+```bash
+systemd-run --user --unit=moving-det-formal-20260817-01-baseline \
+  --collect --same-dir --setenv=CUDA_VISIBLE_DEVICES=0,1 \
+  conda run -n moving-det-vru moving-det-vru train \
+  --model baseline \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --output runs/vrud-pilot/formal-20260817-01/baseline \
+  --weights runs/vrud-pilot/universal-p2-init-20260816/p2-init.pt \
+  --train-scope full --devices 2
+
+systemctl --user status moving-det-formal-20260817-01-baseline
+journalctl --user -u moving-det-formal-20260817-01-baseline -n 200 --no-pager
+```
+
+若该正式 Baseline 中断，保留失败目录作为证据；不得恢复、覆盖、删除后重用，也不得
+让它初始化 MG。必须使用新的正式 root 名称，重新通过 preflight，并从同一冻结 P2
+启动一个全新的非续训 Baseline。只有一次不间断完成且 provenance 直接指向冻结 P2
+的 `formal-20260817-01/baseline/checkpoints/best.pt` 才能启动后续 MG 服务：
+
+```bash
+systemd-run --user --unit=moving-det-formal-20260817-01-mg-full \
+  --collect --same-dir --setenv=CUDA_VISIBLE_DEVICES=0,1 \
+  conda run -n moving-det-vru moving-det-vru train \
+  --model mg_vtod \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --alignment-cache runs/vrud-pilot/alignment-cache \
+  --output runs/vrud-pilot/formal-20260817-01/mg-vtod-full \
+  --baseline-init runs/vrud-pilot/formal-20260817-01/baseline/checkpoints/best.pt \
+  --train-scope full --devices 2
+
+systemd-run --user --unit=moving-det-formal-20260817-01-mg-frozen \
+  --collect --same-dir --setenv=CUDA_VISIBLE_DEVICES=0,1 \
+  conda run -n moving-det-vru moving-det-vru train \
+  --model mg_vtod \
+  --config configs/vrud-temporal-obb.yaml \
+  --manifest runs/vrud-pilot/manifest \
+  --alignment-cache runs/vrud-pilot/alignment-cache \
+  --output runs/vrud-pilot/formal-20260817-01/mg-frozen \
+  --baseline-init runs/vrud-pilot/formal-20260817-01/baseline/checkpoints/best.pt \
+  --train-scope temporal --devices 2
+```
+
+三个 service 必须按 Baseline、MG Full、MG Frozen 的依赖顺序启动，不能并发争用同一
+双 GPU。每个 service 启动后先核对两个 DDP worker、epoch 0 的 13,998 行完整覆盖和
+有限 loss/checkpoint，再持续监控；禁止在训练中改学习率、数据、checkpoint 或阈值。
+
+人工 test 是最后的一次性证据边界。在打开任何 human prediction 输出前，必须先只用
+validation 分别冻结 Baseline、MG Full、Motion-Off 与 MG Frozen 的四份
+`threshold.json`，严格校验 checkpoint/manifest/threshold SHA，并写入
+`test_opened=false` 的阈值清单。四份阈值全部冻结后才能把对应阈值原样传给人工
+benchmark；不得在 873 帧 human test 上选阈值、调阈值、重跑或删除不利结果。
+
 这批人工序列大部分来自 Universal 模型曾用于生成伪标注的目标视频，因此并非与
 Universal 完全独立的数据。即使后续 MG 优于同初始化的 Baseline，可信结论也只能是
 “在当前目标域和固定人工 test 上的增量改进”，不能表述为对未见场景的通用泛化提升。
