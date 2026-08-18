@@ -145,16 +145,19 @@ def _configure_train_scope(
         raise ValueError("train_scope must be 'full' or 'temporal'")
     if train_scope == "temporal" and model_name == "baseline":
         raise ValueError("temporal scope requires a temporal model")
-    allowed = (
-        _allowed_temporal_parameter_names(model)
-        if train_scope == "temporal"
-        else {name for name, _ in model.named_parameters()}
-    )
-    selected = []
-    for name, parameter in model.named_parameters():
-        parameter.requires_grad_(name in allowed)
-        if name in allowed:
-            selected.append(parameter)
+    if train_scope == "full":
+        selected = [
+            parameter
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ]
+    else:
+        allowed = _allowed_temporal_parameter_names(model)
+        selected = []
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name in allowed)
+            if name in allowed:
+                selected.append(parameter)
     if not selected:
         raise ValueError("train scope selected no parameters")
     return tuple(selected)

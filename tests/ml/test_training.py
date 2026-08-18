@@ -865,6 +865,13 @@ class TinyTemporalOBB(TinyOBB):
         return {"temporal.weight", "temporal.bias"}
 
 
+class NativelyFrozenTinyTemporalOBB(TinyTemporalOBB):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dfl_projection = nn.Linear(1, 1, bias=False)
+        self.dfl_projection.weight.requires_grad_(False)
+
+
 class TrainableTinyTemporalOBB(TinyTemporalOBB):
     def loss(
         self,
@@ -1094,6 +1101,28 @@ def test_optimizer_matches_approved_settings(temporal_config):
     assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(1e-2)
 
 
+def test_full_scope_preserves_native_frozen_parameters(temporal_config):
+    model = NativelyFrozenTinyTemporalOBB()
+
+    optimizer = build_optimizer(model, temporal_config, train_scope="full")
+
+    optimized = {
+        name
+        for name, parameter in model.named_parameters()
+        if any(
+            parameter is item
+            for group in optimizer.param_groups
+            for item in group["params"]
+        )
+    }
+    expected = {"detector.weight", "temporal.weight", "temporal.bias"}
+    assert optimized == expected
+    assert all(
+        parameter.requires_grad == (name in expected)
+        for name, parameter in model.named_parameters()
+    )
+
+
 def test_temporal_scope_optimizes_exact_temporal_parameters(temporal_config):
     model = TinyTemporalOBB()
     temporal_names = model.temporal_parameter_names()
@@ -1116,6 +1145,30 @@ def test_temporal_scope_optimizes_exact_temporal_parameters(temporal_config):
     assert optimized == temporal_names
     assert all(
         parameter.requires_grad == (name in temporal_names)
+        for name, parameter in model.named_parameters()
+    )
+
+
+def test_temporal_scope_still_enables_every_declared_temporal_parameter(
+    temporal_config,
+):
+    model = NativelyFrozenTinyTemporalOBB()
+    model.temporal.bias.requires_grad_(False)
+
+    optimizer = build_optimizer(model, temporal_config, train_scope="temporal")
+
+    optimized = {
+        name
+        for name, parameter in model.named_parameters()
+        if any(
+            parameter is item
+            for group in optimizer.param_groups
+            for item in group["params"]
+        )
+    }
+    assert optimized == {"temporal.weight", "temporal.bias"}
+    assert all(
+        parameter.requires_grad == name.startswith("temporal.")
         for name, parameter in model.named_parameters()
     )
 
