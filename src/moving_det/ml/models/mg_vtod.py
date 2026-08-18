@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 
 from moving_det.ml.models.baseline import BaselineOBB
-from moving_det.ml.motion_strength import compute_motion_strength
+from moving_det.ml.motion_proposals import compute_motion_proposals
 from moving_det.ml.yolo_graph import (
     execute_yolo_graph,
     extract_backbone_features,
@@ -283,11 +283,12 @@ class MGVTODOBB(BaselineOBB):
                 device=current.device,
             )
             return predictions, {"motion_map": motion}
-        motion = compute_motion_strength(
+        motion = compute_motion_proposals(
             frames,
             valid,
             transforms,
-        )
+            build_binary_mask=False,
+        ).score
         has_motion = (
             motion.flatten(start_dim=1)
             .amax(dim=1)

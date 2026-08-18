@@ -18,6 +18,7 @@ from moving_det.ml.models.mg_vtod import (
     MGVTODOBB,
     MotionStem,
 )
+from moving_det.ml.motion_proposals import MotionProposalResult
 from moving_det.ml.training import (
     load_experiment_checkpoint,
     save_checkpoint,
@@ -433,16 +434,23 @@ def test_motion_off_bypasses_temporal_branch(monkeypatch):
     motion_stem_calls = 0
     fusion_calls = 0
 
-    def nonzero_motion(frames, valid, transforms):
+    def nonzero_motion(frames, valid, transforms, *, build_binary_mask):
         nonlocal motion_calls
         motion_calls += 1
-        return torch.ones(
+        assert build_binary_mask is False
+        score = torch.ones(
             frames.shape[0],
             1,
             frames.shape[-2],
             frames.shape[-1],
             dtype=frames.dtype,
             device=frames.device,
+        )
+        return MotionProposalResult(
+            score=score,
+            proposal_mask=torch.zeros_like(score, dtype=torch.bool),
+            temporal_residual=torch.zeros_like(score),
+            edge_penalty=torch.ones_like(score),
         )
 
     def capture_rgb(detector, image, indices):
@@ -455,7 +463,7 @@ def test_motion_off_bypasses_temporal_branch(monkeypatch):
         captured.append((rgb_features[-1], replacement))
         return original_execute(detector, image, replacements)
 
-    monkeypatch.setattr(mg_vtod_module, "compute_motion_strength", nonzero_motion)
+    monkeypatch.setattr(mg_vtod_module, "compute_motion_proposals", nonzero_motion)
     monkeypatch.setattr(mg_vtod_module, "extract_backbone_features", capture_rgb)
     monkeypatch.setattr(mg_vtod_module, "execute_yolo_graph", capture_replacement)
 
@@ -504,12 +512,18 @@ def test_forward_with_diagnostics_reuses_the_prediction_motion_computation(
     )
     calls = 0
 
-    def fixed_motion(*args):
+    def fixed_motion(*args, build_binary_mask):
         nonlocal calls
         calls += 1
-        return motion
+        assert build_binary_mask is False
+        return MotionProposalResult(
+            score=motion,
+            proposal_mask=torch.zeros_like(motion, dtype=torch.bool),
+            temporal_residual=torch.zeros_like(motion),
+            edge_penalty=torch.ones_like(motion),
+        )
 
-    monkeypatch.setattr(mg_vtod_module, "compute_motion_strength", fixed_motion)
+    monkeypatch.setattr(mg_vtod_module, "compute_motion_proposals", fixed_motion)
 
     with torch.no_grad():
         predictions, diagnostics = model.forward_with_diagnostics(batch)
@@ -633,7 +647,7 @@ def test_real_motion_changes_detector_output_for_same_center_frame():
     assert not torch.equal(changed["scores"], rgb_only["scores"])
 
 
-def test_localized_alignment_suppresses_camera_motion_before_stem():
+def test_global_alignment_residual_does_not_activate_motion_stem():
     height = width = 128
     yy, xx = torch.meshgrid(
         torch.arange(height, dtype=torch.float32),
@@ -692,8 +706,7 @@ def test_localized_alignment_suppresses_camera_motion_before_stem():
     finally:
         handle.remove()
 
-    assert len(captured) == 1
-    assert torch.count_nonzero(captured[0]) > 0
+    assert captured == []
 
 
 def test_partial_extraction_and_override_run_downstream_detector_once():
