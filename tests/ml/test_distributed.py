@@ -172,3 +172,49 @@ def test_distributed_worker_passes_temporal_scope_to_trainer(tmp_path):
         validator=lambda *_args, **_kwargs: {},
     ) == 0
     assert captured["train_scope"] == "temporal"
+
+
+def test_distributed_worker_forwards_warm_start_checkpoint(tmp_path):
+    from moving_det.distributed_train import build_parser, run_worker
+    from moving_det.ml.distributed import DistributedContext
+
+    context = DistributedContext(
+        rank=1,
+        local_rank=1,
+        world_size=2,
+        backend="nccl",
+    )
+    captured = {}
+    warm_start = tmp_path / "last.pt"
+
+    def trainer(*_args, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "mg_vtod",
+            "--config",
+            "config.yaml",
+            "--manifest",
+            "manifest",
+            "--output",
+            str(tmp_path / "checkpoints"),
+            "--warm-start-checkpoint",
+            str(warm_start),
+            "--train-scope",
+            "full",
+        ]
+    )
+
+    assert run_worker(
+        args,
+        config_loader=lambda _path: object(),
+        trainer=trainer,
+        context_initializer=lambda: context,
+        process_group_destroyer=lambda: None,
+        validator=lambda *_args, **_kwargs: {},
+    ) == 0
+    assert captured["warm_start_checkpoint"] == warm_start
+    assert captured["train_scope"] == "full"

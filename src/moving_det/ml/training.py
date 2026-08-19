@@ -2269,6 +2269,7 @@ def train_model(
     train_scope: TrainScope = "full",
     init_checkpoint: Path | None = None,
     resume_checkpoint: Path | None = None,
+    warm_start_checkpoint: Path | None = None,
     hooks: TrainingHooks | None = None,
     distributed_context: DistributedContext | None = None,
 ) -> TrainResult:
@@ -2280,11 +2281,29 @@ def train_model(
     output_root = Path(output_dir)
     resume_payload: _PinnedCheckpointPayload | None = None
     source_best: _PinnedCheckpointPayload | None = None
+    warm_start_payload: _PinnedCheckpointPayload | None = None
+    initialization_count = sum(
+        checkpoint is not None
+        for checkpoint in (
+            init_checkpoint,
+            resume_checkpoint,
+            warm_start_checkpoint,
+        )
+    )
+    if initialization_count > 1:
+        raise ValueError(
+            "init, resume, and warm-start checkpoints are mutually exclusive"
+        )
     if resume_checkpoint is not None:
         resume_payload, source_best = _preflight_resume_train_scope(
             Path(resume_checkpoint),
             output_root,
             train_scope,
+        )
+    if warm_start_checkpoint is not None:
+        warm_start_payload = _load_resume_checkpoint_snapshot(
+            Path(warm_start_checkpoint),
+            label="warm-start",
         )
     incoming_resume_rng = (
         _capture_global_rng_state()
@@ -2413,10 +2432,6 @@ def train_model(
             or max_steps <= 0
         ):
             raise ValueError("max_steps must be a positive integer")
-        if init_checkpoint is not None and resume_checkpoint is not None:
-            raise ValueError(
-                "init_checkpoint and resume_checkpoint are mutually exclusive"
-            )
         if device.type == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA device requested but CUDA is unavailable")
         if distributed_context is not None:
@@ -2517,14 +2532,37 @@ def train_model(
             )
             run["alignment_cache_sha256"] = alignment_cache_sha256
 
-        if resume_payload is not None:
-            assert source_best is not None
-            build_loaders()
-            _verify_resume_alignment_cache_sha256(
-                resume_payload,
-                source_best,
-                alignment_cache_sha256,
+        if resume_payload is not None or warm_start_payload is not None:
+            payload_for_cache = (
+                resume_payload
+                if resume_payload is not None
+                else warm_start_payload
             )
+            assert payload_for_cache is not None
+            _verify_manifest_sha256(
+                payload_for_cache["manifest_sha256"],
+                manifest_root,
+            )
+            if payload_for_cache.get("model_name") != model_name:
+                raise ValueError(
+                    "warm-start checkpoint model name is incompatible"
+                )
+            build_loaders()
+            if resume_payload is not None:
+                assert source_best is not None
+                _verify_resume_alignment_cache_sha256(
+                    resume_payload,
+                    source_best,
+                    alignment_cache_sha256,
+                )
+            elif (
+                payload_for_cache.get("alignment_cache_sha256")
+                != alignment_cache_sha256
+            ):
+                raise ValueError(
+                    "warm-start checkpoint alignment fingerprint does not "
+                    "match the current frozen cache snapshot"
+                )
 
         random.seed(cfg.seed)
         np.random.seed(cfg.seed)
@@ -2538,7 +2576,11 @@ def train_model(
             else (
                 Path(init_checkpoint)
                 if init_checkpoint is not None
-                else None
+                else (
+                    Path(warm_start_checkpoint)
+                    if warm_start_checkpoint is not None
+                    else None
+                )
             )
         )
         weights: Path | str | None = (
@@ -2591,6 +2633,16 @@ def train_model(
                 init_source_state,
                 allowed_missing,
             )
+        if warm_start_payload is not None:
+            allowed_missing = _validate_model_state(
+                model,
+                warm_start_payload["model"],
+            )
+            _apply_model_state(
+                model,
+                warm_start_payload["model"],
+                allowed_missing,
+            )
         selected_parameters = _configure_train_scope(
             model_name,
             model,
@@ -2617,6 +2669,17 @@ def train_model(
                 "manifest_sha256": resume_payload["manifest_sha256"],
                 "model_name": resume_payload.get("model_name"),
                 "epoch": resume_payload.get("epoch"),
+            }
+        elif warm_start_checkpoint is not None:
+            source = Path(warm_start_checkpoint)
+            assert warm_start_payload is not None
+            load_provenance = {
+                "kind": "warm_start",
+                "checkpoint": str(source.resolve()),
+                "checkpoint_sha256": warm_start_payload.checkpoint_sha256,
+                "manifest_sha256": warm_start_payload["manifest_sha256"],
+                "model_name": warm_start_payload.get("model_name"),
+                "epoch": warm_start_payload.get("epoch"),
             }
         else:
             load_provenance = {

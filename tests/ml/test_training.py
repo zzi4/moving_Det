@@ -1289,6 +1289,82 @@ def test_resume_rejects_changed_train_scope_before_loader(
     assert source_run.read_bytes() == source_run_bytes
 
 
+def test_warm_start_loads_temporal_model_but_resets_full_training_state(
+    tmp_path,
+    temporal_config,
+):
+    manifest = _write_manifest_set(tmp_path / "manifest")
+    source = train_model(
+        "mg_vtod",
+        replace(temporal_config, pilot_epochs=1),
+        manifest,
+        tmp_path / "source",
+        train_scope="temporal",
+        hooks=_tiny_hooks(
+            TrainableTinyTemporalOBB(),
+            map50_values=[0.2],
+        ),
+    )
+    source_payload = torch.load(
+        source.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    target = TrainableTinyTemporalOBB()
+    optimizer_parameter_ids: list[set[int]] = []
+    hooks = replace(
+        _tiny_hooks(target, map50_values=[0.3]),
+        on_optimizer_step=lambda optimizer, _step: (
+            optimizer_parameter_ids.append(
+                {
+                    id(parameter)
+                    for group in optimizer.param_groups
+                    for parameter in group["params"]
+                }
+            )
+        ),
+    )
+
+    result = train_model(
+        "mg_vtod",
+        replace(
+            temporal_config,
+            pilot_epochs=1,
+            learning_rate=0.0,
+        ),
+        manifest,
+        tmp_path / "warm-full",
+        train_scope="full",
+        warm_start_checkpoint=source.last_checkpoint,
+        hooks=hooks,
+    )
+
+    assert optimizer_parameter_ids == [
+        {id(parameter) for parameter in target.parameters()}
+    ]
+    run = json.loads((result.output_dir / "run.json").read_text())
+    assert run["load_provenance"] == {
+        "kind": "warm_start",
+        "checkpoint": str(source.last_checkpoint.resolve()),
+        "checkpoint_sha256": hashlib.sha256(
+            source.last_checkpoint.read_bytes()
+        ).hexdigest(),
+        "manifest_sha256": manifest_fingerprint(manifest),
+        "model_name": "mg_vtod",
+        "epoch": 0,
+    }
+    warmed = torch.load(
+        result.last_checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert warmed["epoch"] == 0
+    assert warmed["optimizer_steps"] == 1
+    assert warmed["history"][0]["epoch"] == 0
+    for name, expected in source_payload["model"].items():
+        torch.testing.assert_close(warmed["model"][name], expected)
+
+
 def _tamper_resume_train_scope(
     result,
     artifact: str,
