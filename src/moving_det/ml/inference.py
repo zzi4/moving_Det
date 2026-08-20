@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any, Callable
 
@@ -88,13 +88,23 @@ class Detection:
     tile: Tile
     site: str
     sequence: str
+    class_count: int = field(
+        default=_CLASS_COUNT,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _strict_int(self.frame, "frame")
         _validate_obb(self.obb)
         class_id = _strict_int(self.class_id, "class_id")
-        if class_id >= _CLASS_COUNT:
-            raise ValueError(f"class_id must be in [0, {_CLASS_COUNT - 1}]")
+        class_count = _strict_int(
+            self.class_count,
+            "class_count",
+            minimum=1,
+        )
+        if class_id >= class_count:
+            raise ValueError(f"class_id must be in [0, {class_count - 1}]")
         confidence = _finite_real(self.confidence, "confidence")
         if not 0.0 <= confidence <= 1.0:
             raise ValueError("confidence must be within [0, 1]")
@@ -319,6 +329,7 @@ def _validate_raw_prediction(
     output: object,
     *,
     expected_batch: int,
+    class_count: int,
 ) -> Tensor | tuple[Any, ...]:
     selected = output[0] if isinstance(output, (tuple, list)) else output
     if not isinstance(selected, Tensor):
@@ -326,10 +337,11 @@ def _validate_raw_prediction(
     if (
         selected.ndim != 3
         or selected.shape[0] != expected_batch
-        or selected.shape[1] != 4 + _CLASS_COUNT + 1
+        or selected.shape[1] != 4 + class_count + 1
     ):
         raise ValueError(
-            "pinned Ultralytics OBB output must have shape [B,9,N]"
+            "pinned Ultralytics OBB output must have shape "
+            f"[B,{4 + class_count + 1},N]"
         )
     if not bool(torch.isfinite(selected).all()):
         raise ValueError("model OBB output must be finite")
@@ -367,6 +379,11 @@ def infer_full_frame(
     inference_batch_size = _strict_int(
         _optional_cfg_value(cfg, "inference_batch_size", 1),
         "inference_batch_size",
+        minimum=1,
+    )
+    class_count = _strict_int(
+        _optional_cfg_value(cfg, "class_count", _CLASS_COUNT),
+        "class_count",
         minimum=1,
     )
     if not 0.0 <= nms_iou <= 1.0:
@@ -416,6 +433,7 @@ def infer_full_frame(
                 checked = _validate_raw_prediction(
                     raw,
                     expected_batch=len(chunk),
+                    class_count=class_count,
                 )
                 if diagnostic_consumer is not None:
                     diagnostic_consumer(tuple(chunk), diagnostic)
@@ -423,7 +441,7 @@ def infer_full_frame(
                     checked,
                     conf_thres=confidence,
                     iou_thres=nms_iou,
-                    nc=_CLASS_COUNT,
+                    nc=class_count,
                     rotated=True,
                 )
                 if len(rows_by_tile) != len(chunk):
@@ -466,6 +484,7 @@ def infer_full_frame(
                     tile=tile,
                     site=validated.site,
                     sequence=validated.sequence,
+                    class_count=class_count,
                 )
             )
     if len(tiles) == 1:

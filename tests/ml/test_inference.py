@@ -175,6 +175,38 @@ def test_default_inference_batches_one_tile_at_a_time_to_bound_memory():
     assert len(detections) == 2
 
 
+def test_full_frame_inference_supports_explicit_eight_class_taxonomy():
+    def eight_class_prediction(batch):
+        output = torch.zeros(batch, 13, 1)
+        output[:, 0, 0] = 100.0
+        output[:, 1, 0] = 80.0
+        output[:, 2, 0] = 40.0
+        output[:, 3, 0] = 20.0
+        output[:, 11, 0] = 0.9
+        output[:, 12, 0] = 0.2
+        return output
+
+    model = RecordingModel(1, output_factory=eight_class_prediction)
+    clip = {
+        "frames": torch.rand(1, 3, 1024, 1024),
+        "valid": torch.tensor([True]),
+        "transforms": torch.eye(2, 3).reshape(1, 2, 3),
+        "zero_index": 0,
+        "frame": 1,
+        "metadata": {
+            "offsets": (0,),
+            "site": "site19",
+            "sequence": "sequence_a",
+        },
+    }
+
+    detections = infer_full_frame(model, clip, _cfg(class_count=8))
+
+    assert len(detections) == 1
+    assert detections[0].class_id == 7
+    assert detections[0].class_count == 8
+
+
 def test_full_frame_inference_collects_diagnostics_from_same_ordered_forwards():
     class DiagnosticModel(RecordingModel):
         def __init__(self):

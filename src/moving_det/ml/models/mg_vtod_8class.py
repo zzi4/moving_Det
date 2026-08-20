@@ -22,20 +22,7 @@ from moving_det.ml.pretrained_transfer import (
     compatible_state,
 )
 from moving_det.ml.yolo_graph import execute_yolo_graph, extract_backbone_features
-
-
-FULL_TRAFFIC_CLASS_NAMES: Mapping[int, str] = MappingProxyType(
-    {
-        0: "car",
-        1: "truck",
-        2: "bus",
-        3: "motorcycle",
-        4: "pedestrian",
-        5: "bicycle",
-        6: "tricycle",
-        7: "engineering_vehicle",
-    }
-)
+from moving_det.vrud.types import FULL_TRAFFIC_CLASS_NAMES
 
 _MODEL_CONFIG = (
     Path(__file__).resolve().parents[4]

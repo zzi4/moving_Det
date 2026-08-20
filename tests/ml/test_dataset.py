@@ -341,6 +341,92 @@ def test_center_annotation_uses_corrected_vrud_class_and_normalized_obb(
     assert sample["metadata"]["track_keys"] == (("site22", "sequence_a", 7),)
 
 
+def test_eight_class_mg_vtod_uses_all_corrected_traffic_labels(
+    temporal_fixture,
+):
+    labels = (
+        "car",
+        "truck",
+        "bus",
+        "motorcycle",
+        "pedestrian",
+        "bicycle",
+        "tricycle",
+        "engineering_vehicle",
+    )
+    center_json = (
+        temporal_fixture.config.image_root
+        / "site22_sequence"
+        / "sequence_a"
+        / "000005.json"
+    )
+    payload = json.loads(center_json.read_text(encoding="utf-8"))
+    template = payload["shapes"][0]
+    payload["shapes"] = [
+        {
+            **template,
+            "label": label,
+            "group_id": 7 + index,
+            "description": str(7 + index),
+            "points": [
+                [50.0 + 100.0 * index, 100.0],
+                [90.0 + 100.0 * index, 100.0],
+                [90.0 + 100.0 * index, 120.0],
+                [50.0 + 100.0 * index, 120.0],
+            ],
+        }
+        for index, label in enumerate(labels)
+    ]
+    center_json.write_text(
+        json.dumps(payload, allow_nan=False),
+        encoding="utf-8",
+    )
+    _cache_required_supports(temporal_fixture)
+
+    sample = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod_8class", (-4, -2, 0, 2, 4)),
+        training=False,
+    )[0]
+
+    assert sorted(row[0] for row in sample["cls"].tolist()) == list(
+        range(8)
+    )
+    assert sample["bboxes"].shape == (8, 5)
+    assert sample["metadata"]["track_keys"] == tuple(
+        ("site22", "sequence_a", group_id)
+        for group_id in range(7, 15)
+    )
+
+
+def test_eight_class_mg_vtod_rejects_unknown_corrected_label(
+    temporal_fixture,
+):
+    center_json = (
+        temporal_fixture.config.image_root
+        / "site22_sequence"
+        / "sequence_a"
+        / "000005.json"
+    )
+    payload = json.loads(center_json.read_text(encoding="utf-8"))
+    payload["shapes"][0]["label"] = "unknown_traffic_type"
+    center_json.write_text(
+        json.dumps(payload, allow_nan=False),
+        encoding="utf-8",
+    )
+    _cache_required_supports(temporal_fixture)
+    dataset = TemporalClipDataset(
+        temporal_fixture.manifest,
+        temporal_fixture.config,
+        ClipSpec("mg_vtod_8class", (-4, -2, 0, 2, 4)),
+        training=False,
+    )
+
+    with pytest.raises(ValueError, match="unknown corrected traffic label"):
+        dataset[0]
+
+
 def test_baseline_clip_does_not_read_or_create_alignment_cache(
     temporal_fixture,
 ):

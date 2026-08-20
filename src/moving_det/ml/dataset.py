@@ -26,7 +26,7 @@ from moving_det.vrud.alignment import (
 )
 from moving_det.vrud.index import load_corrected_frame, load_track_index
 from moving_det.vrud.tiling import Tile, full_frame_tiles
-from moving_det.vrud.types import TrackKey
+from moving_det.vrud.types import FULL_TRAFFIC_TO_TRAIN, TrackKey
 
 
 _SOURCES_BY_SPLIT = {
@@ -665,7 +665,7 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
         self,
         record: _ManifestRecord,
         image_path: Path,
-    ) -> tuple[list[float], list[OBB]]:
+    ) -> tuple[list[float], list[OBB], list[TrackKey]]:
         json_path = image_path.with_suffix(".json")
         if not json_path.is_file():
             raise ValueError(
@@ -678,6 +678,37 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             record.sequence,
             self._tracks,
         )
+        if self.clip_spec.name == "mg_vtod_8class":
+            classes = []
+            local_obbs = []
+            target_track_keys = []
+            for annotation in (*frame.annotations, *frame.exclusions):
+                raw_label = annotation.raw_json_label
+                if raw_label not in FULL_TRAFFIC_TO_TRAIN:
+                    raise ValueError(
+                        "unknown corrected traffic label: "
+                        f"{raw_label!r} in {json_path}"
+                    )
+                if annotation.geometry_reason is not None:
+                    continue
+                local_obb = OBB(
+                    cx=annotation.obb.cx - record.tile.x,
+                    cy=annotation.obb.cy - record.tile.y,
+                    width=annotation.obb.width,
+                    height=annotation.obb.height,
+                    theta=annotation.obb.theta,
+                )
+                if not _obb_is_inside(
+                    local_obb,
+                    record.tile.width,
+                    record.tile.height,
+                ):
+                    continue
+                classes.append(float(FULL_TRAFFIC_TO_TRAIN[raw_label]))
+                local_obbs.append(local_obb)
+                target_track_keys.append(annotation.track_key)
+            return classes, local_obbs, target_track_keys
+
         annotation_by_key = {
             annotation.track_key: annotation
             for annotation in frame.annotations
@@ -704,7 +735,7 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
                     theta=annotation.obb.theta,
                 )
             )
-        return classes, local_obbs
+        return classes, local_obbs, list(record.track_keys)
 
     def _local_transforms(
         self,
@@ -769,7 +800,10 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
                 else zero_frame.clone()
             )
 
-        classes, obbs = self._center_targets(record, center_path)
+        classes, obbs, target_track_keys = self._center_targets(
+            record,
+            center_path,
+        )
         if self.training:
             generator, augmentation_metadata = self._augmentation_generator(index)
             spatial_transform = sample_spatial_transform(
@@ -800,20 +834,32 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
                 )
             ]
             transformed = [
-                (class_id, apply_obb_transform(obb, spatial_transform))
-                for class_id, obb in zip(classes, obbs, strict=True)
+                (
+                    class_id,
+                    apply_obb_transform(obb, spatial_transform),
+                    track_key,
+                )
+                for class_id, obb, track_key in zip(
+                    classes,
+                    obbs,
+                    target_track_keys,
+                    strict=True,
+                )
             ]
             transformed = [
-                (class_id, obb)
-                for class_id, obb in transformed
+                (class_id, obb, track_key)
+                for class_id, obb, track_key in transformed
                 if _obb_is_inside(
                     obb,
                     spatial_transform.crop_xywh[2],
                     spatial_transform.crop_xywh[3],
                 )
             ]
-            classes = [class_id for class_id, _ in transformed]
-            obbs = [obb for _, obb in transformed]
+            classes = [class_id for class_id, _, _ in transformed]
+            obbs = [obb for _, obb, _ in transformed]
+            target_track_keys = [
+                track_key for _, _, track_key in transformed
+            ]
         else:
             spatial_transform = _identity_spatial_transform(self.cfg.tile_size)
             augmentation_metadata = {
@@ -849,7 +895,7 @@ class TemporalClipDataset(Dataset[dict[str, object]]):
             ),
             "track_keys": tuple(
                 (key.site, key.sequence, key.group_id)
-                for key in record.track_keys
+                for key in target_track_keys
             ),
             "source": record.source,
             "clip_name": self.clip_spec.name,

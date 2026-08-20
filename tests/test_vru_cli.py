@@ -2235,6 +2235,13 @@ def test_build_manifest_handler_calls_strict_builder_and_prints_resolved_path(
             None,
         ),
         (
+            "mg_vtod_8class",
+            ["--weights", "public.pt"],
+            "public.pt",
+            None,
+            None,
+        ),
+        (
             "baseline",
             ["--resume", "last.pt"],
             "yolo11m-obb.pt",

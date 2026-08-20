@@ -990,6 +990,8 @@ def _clip_spec(model_name: str, cfg: TemporalOBBConfig) -> ClipSpec:
         return ClipSpec("baseline", (0,))
     if model_name == "mg_vtod":
         return ClipSpec("mg_vtod", cfg.mg_offsets)
+    if model_name == "mg_vtod_8class":
+        return ClipSpec("mg_vtod_8class", cfg.mg_offsets)
     if model_name == "lstfe":
         return ClipSpec("lstfe", cfg.lstfe_offsets)
     raise ValueError(f"unknown model name: {model_name!r}")

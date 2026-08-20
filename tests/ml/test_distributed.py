@@ -174,6 +174,25 @@ def test_distributed_worker_passes_temporal_scope_to_trainer(tmp_path):
     assert captured["train_scope"] == "temporal"
 
 
+def test_distributed_parser_accepts_eight_class_mg_vtod():
+    from moving_det.distributed_train import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "--model",
+            "mg_vtod_8class",
+            "--config",
+            "config.yaml",
+            "--manifest",
+            "manifest",
+            "--output",
+            "output",
+        ]
+    )
+
+    assert args.model == "mg_vtod_8class"
+
+
 def test_distributed_worker_forwards_warm_start_checkpoint(tmp_path):
     from moving_det.distributed_train import build_parser, run_worker
     from moving_det.ml.distributed import DistributedContext

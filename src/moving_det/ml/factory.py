@@ -23,6 +23,19 @@ def create_model(
                 "MG-VTOD is not available; implement the temporal model first"
             ) from exc
         return MGVTODOBB(weights=weights, offsets=cfg.mg_offsets)
+    if name == "mg_vtod_8class":
+        try:
+            from moving_det.ml.models.mg_vtod_8class import (
+                MGVTODEightClassOBB,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "8-class MG-VTOD is not available"
+            ) from exc
+        return MGVTODEightClassOBB(
+            weights=weights,
+            offsets=cfg.mg_offsets,
+        )
     if name == "lstfe":
         try:
             from moving_det.ml.models.lstfe import LSTFEOBB

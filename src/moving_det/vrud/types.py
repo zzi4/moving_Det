@@ -17,6 +17,24 @@ TRAIN_CLASS_NAMES: Mapping[int, str] = MappingProxyType(
         3: "motorcycle",
     }
 )
+FULL_TRAFFIC_TO_TRAIN: Mapping[str, int] = MappingProxyType(
+    {
+        "car": 0,
+        "truck": 1,
+        "bus": 2,
+        "motorcycle": 3,
+        "pedestrian": 4,
+        "bicycle": 5,
+        "tricycle": 6,
+        "engineering_vehicle": 7,
+    }
+)
+FULL_TRAFFIC_CLASS_NAMES: Mapping[int, str] = MappingProxyType(
+    {
+        class_id: label
+        for label, class_id in FULL_TRAFFIC_TO_TRAIN.items()
+    }
+)
 
 
 @dataclass(frozen=True)
