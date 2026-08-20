@@ -2867,6 +2867,17 @@ def test_validator_temporal_inputs_use_one_nonblocking_device_transfer():
 
 
 @REQUIRES_TORCH
+def test_validator_resolves_implicit_cuda_device_index(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+
+    assert vru_cli_module._resolved_validator_device(
+        torch.device("cuda")
+    ) == torch.device("cuda:1")
+
+
+@REQUIRES_TORCH
 def test_task11_training_validator_consumes_passed_loader_and_restores_identity():
     import torch
 
