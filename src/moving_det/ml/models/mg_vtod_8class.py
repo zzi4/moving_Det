@@ -15,6 +15,12 @@ from moving_det.ml.models.mg_vtod import (
     _validate_offsets,
 )
 from moving_det.ml.motion_proposals import compute_motion_proposals
+from moving_det.ml.pretrained_transfer import (
+    APPROVED_UNIVERSAL_SHA256,
+    _load_ultralytics_state,
+    _open_checkpoint_snapshot,
+    compatible_state,
+)
 from moving_det.ml.yolo_graph import execute_yolo_graph, extract_backbone_features
 
 
@@ -109,11 +115,7 @@ class ConcatenatedMotionFusion(nn.Module):
 def create_eight_class_obb_detector(
     weights: Path | str | None,
 ) -> OBBModel:
-    """Build the native P3-P5 detector before Universal transfer is applied."""
-    if weights is not None:
-        raise ValueError(
-            "eight-class Universal weight transfer is not implemented yet"
-        )
+    """Build the native P3-P5 detector and strictly load Universal weights."""
     detector = OBBModel(
         str(_MODEL_CONFIG),
         ch=3,
@@ -123,6 +125,40 @@ def create_eight_class_obb_detector(
     detector.args = get_cfg()
     detector.task = "obb"
     detector.names = dict(FULL_TRAFFIC_CLASS_NAMES)
+    if weights is None:
+        return detector
+
+    checkpoint = Path(weights)
+    with _open_checkpoint_snapshot(
+        checkpoint,
+        label="Universal checkpoint",
+    ) as snapshot:
+        if snapshot.sha256 != APPROVED_UNIVERSAL_SHA256:
+            raise ValueError("Universal checkpoint SHA-256 is not approved")
+        source_state = _load_ultralytics_state(snapshot.stream)
+
+    target_state = detector.state_dict()
+    transferred = compatible_state(source_state, target_state)
+    if (
+        len(target_state) != 691
+        or len(source_state) != len(target_state)
+        or tuple(transferred) != tuple(sorted(target_state))
+    ):
+        raise ValueError(
+            "Universal checkpoint must exactly match the 8-class target"
+        )
+    detector.load_state_dict(transferred, strict=True)
+    detector.initialization_kind = "universal_8class"
+    detector.transferred_tensors = len(transferred)
+    detector.transfer_provenance = MappingProxyType(
+        {
+            "initialization_kind": "universal_8class",
+            "source_sha256": snapshot.sha256,
+            "source_tensors": len(source_state),
+            "target_tensors": len(target_state),
+            "transferred_tensors": len(transferred),
+        }
+    )
     return detector
 
 

@@ -1,11 +1,16 @@
+import hashlib
+
+import pytest
 import torch
 from torch import nn
 
+import moving_det.ml.models.mg_vtod_8class as mg_vtod_8class_module
 from moving_det.ml.models.mg_vtod_8class import (
     ConcatenatedMotionFusion,
     EarlyMotionStem,
     FULL_TRAFFIC_CLASS_NAMES,
     MGVTODEightClassOBB,
+    create_eight_class_obb_detector,
 )
 
 
@@ -42,6 +47,10 @@ def _temporal_batch() -> dict[str, object]:
             }
         ],
     }
+
+
+def _checkpoint_sha256(path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_eight_class_model_uses_full_taxonomy_and_native_three_scale_head():
@@ -138,3 +147,62 @@ def test_eight_class_loss_accepts_engineering_vehicle_and_trains_fusion():
     assert gradient is not None
     assert torch.isfinite(gradient).all()
     assert torch.count_nonzero(gradient) > 0
+
+
+def test_universal_checkpoint_transfers_all_detector_state_and_starts_neutral(
+    tmp_path,
+    monkeypatch,
+):
+    torch.manual_seed(73)
+    source = create_eight_class_obb_detector(weights=None).eval()
+    checkpoint = tmp_path / "universal.pt"
+    torch.save({"model": source}, checkpoint)
+    monkeypatch.setattr(
+        mg_vtod_8class_module,
+        "APPROVED_UNIVERSAL_SHA256",
+        _checkpoint_sha256(checkpoint),
+    )
+
+    model = MGVTODEightClassOBB(weights=checkpoint).eval()
+
+    assert model.detector.initialization_kind == "universal_8class"
+    assert model.detector.transferred_tensors == 691
+    assert model.detector.transfer_provenance["transferred_tensors"] == 691
+    for name, expected in source.state_dict().items():
+        torch.testing.assert_close(
+            model.detector.state_dict()[name],
+            expected,
+            rtol=0,
+            atol=0,
+        )
+
+    batch = _temporal_batch()
+    with torch.no_grad():
+        motion_on, _ = model.forward_with_diagnostics(batch)
+        model.set_motion_enabled(False)
+        motion_off, _ = model.forward_with_diagnostics(batch)
+    torch.testing.assert_close(motion_on[0], motion_off[0], rtol=0, atol=0)
+
+
+def test_unapproved_universal_checkpoint_is_rejected_before_loading(tmp_path):
+    checkpoint = tmp_path / "unapproved.pt"
+    checkpoint.write_bytes(b"not an approved Universal checkpoint")
+
+    with pytest.raises(ValueError, match="Universal checkpoint SHA-256"):
+        create_eight_class_obb_detector(checkpoint)
+
+
+def test_approved_but_incompatible_universal_checkpoint_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint = tmp_path / "incompatible.pt"
+    torch.save({"model": nn.Linear(2, 2)}, checkpoint)
+    monkeypatch.setattr(
+        mg_vtod_8class_module,
+        "APPROVED_UNIVERSAL_SHA256",
+        _checkpoint_sha256(checkpoint),
+    )
+
+    with pytest.raises(ValueError, match="exactly match the 8-class target"):
+        create_eight_class_obb_detector(checkpoint)
