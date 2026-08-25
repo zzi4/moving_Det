@@ -66,3 +66,56 @@ def test_render_truth_prediction_comparison_writes_two_panel_png(
         assert image.format == "PNG"
         assert image.width == 2 * rgb.shape[1] + 48
         assert image.height > rgb.shape[0]
+
+
+def test_render_universal_mg_motion_comparison_writes_four_panels(
+    tmp_path: Path,
+) -> None:
+    try:
+        from moving_det.ml.best_checkpoint_visualization import (
+            LabeledOBB,
+            render_universal_mg_motion_comparison,
+        )
+    except ImportError:
+        pytest.fail("Universal/MG/motion comparison renderer is missing")
+    rgb = np.full((96, 128, 3), 90, dtype=np.uint8)
+    truth = (LabeledOBB(OBB(40, 40, 24, 12, 0.2), 4),)
+    mg_prediction = (
+        LabeledOBB(OBB(40, 40, 24, 12, 0.2), 4, confidence=0.91),
+    )
+    motion = np.linspace(0.0, 1.0, rgb.shape[0] * rgb.shape[1], dtype=np.float32)
+    motion = motion.reshape(rgb.shape[:2])
+    destination = tmp_path / "four-panel.png"
+
+    summary = render_universal_mg_motion_comparison(
+        rgb,
+        truth,
+        (),
+        mg_prediction,
+        motion,
+        destination,
+        title="validation frame",
+        iou_threshold=0.25,
+    )
+
+    assert summary["truth"] == 1
+    assert summary["universal"] == {
+        "predictions": 0,
+        "tp": 0,
+        "class_error": 0,
+        "fp": 0,
+        "fn": 1,
+    }
+    assert summary["mg_vtod"] == {
+        "predictions": 1,
+        "tp": 1,
+        "class_error": 0,
+        "fp": 0,
+        "fn": 0,
+    }
+    assert summary["motion"]["min"] == pytest.approx(0.0)
+    assert summary["motion"]["max"] == pytest.approx(1.0)
+    with Image.open(destination) as image:
+        assert image.format == "PNG"
+        assert image.width == 2 * rgb.shape[1] + 48
+        assert image.height > 2 * rgb.shape[0]
