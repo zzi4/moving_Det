@@ -1,8 +1,25 @@
 .worktrees/
 .venv/
 runs/
+label_data/
+models/
 __pycache__/
 .pytest_cache/
 *.pyc
 *.egg-info/
 /yolo11m-obb.pt
+
+# Model artifacts and dataset packages stay outside the public source tree.
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.zip
+*.tar
+*.tar.gz
+
+# Training caches and local experiment telemetry are reproducible artifacts.
+alignment-cache/
+wandb/
+tensorboard/

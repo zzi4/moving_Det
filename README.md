@@ -1,5 +1,11 @@
 # Moving Det：VRUD 多帧小目标 OBB 检测
 
+> **当前主线：** 新数据训练请使用八类 `mg_vtod_8class` 流程。从环境、
+> 数据接入、ECC 配准缓存、单/双 GPU 训练、checkpoint 恢复到历史结果的
+> 完整交接说明见
+> [`docs/MGVTOD_TRAINING_HANDOFF.md`](docs/MGVTOD_TRAINING_HANDOFF.md)。
+> 下文四类 Baseline/MG-VTOD/LSTFE 流程保留为历史实验参考。
+
 本项目当前主线是在只读 VRUD 航拍序列上公平比较三个逐帧旋转框检测器：
 
 - `baseline`：带 stride-4 P2 检测层的单帧 YOLO11m-OBB。

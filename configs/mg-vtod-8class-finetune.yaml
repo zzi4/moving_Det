@@ -1,0 +1,32 @@
+# Copy this file for each new dataset/run and edit only the path fields first.
+image_root: /path/to/mg-vtod-dataset/human-overlay
+metadata_root: /path/to/mg-vtod-dataset/human-metadata
+output_root: /path/to/mg-vtod-dataset
+pretrained_weights: /path/to/best_vru_universal.pt
+
+seed: 20260806
+fps: 30
+tile_size: 1024
+tile_overlap: 256
+train_stride: 1
+eval_stride: 1
+max_centers_per_track: 582
+max_positive_clips_per_class: 10000
+negative_fraction: 0.25
+
+mg_offsets: [-4, -2, 0, 2, 4]
+# Keep this equal to mg_offsets while building an MG-only alignment cache.
+lstfe_offsets: [-4, -2, 0, 2, 4]
+ecc_min_correlation: 0.8
+ecc_max_translation: 20.0
+ecc_max_rotation_degrees: 2.0
+
+optimizer: AdamW
+learning_rate: 0.00002
+weight_decay: 0.01
+warmup_epochs: 1
+pilot_epochs: 10
+early_stopping_patience: 15
+effective_batch_size: 16
+nms_iou: 0.5
+max_false_detections_per_frame: 5.0
