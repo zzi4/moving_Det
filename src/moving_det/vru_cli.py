@@ -33,6 +33,7 @@ import zlib
 _DEFAULT_CONFIG = Path("configs/vrud-temporal-obb.yaml")
 _FORMAL_MINIMUM_FREE_BYTES = 100 * 1024**3
 _MODEL_NAMES = ("baseline", "mg_vtod", "lstfe")
+_TRAIN_MODEL_NAMES = (*_MODEL_NAMES, "mg_vtod_8class")
 _CLASS_SCHEMA = {
     "0": "pedestrian",
     "1": "bicycle",
@@ -686,7 +687,7 @@ def build_parser() -> argparse.ArgumentParser:
         "train",
         help="train one baseline or temporal OBB model",
     )
-    train.add_argument("--model", choices=_MODEL_NAMES, required=True)
+    train.add_argument("--model", choices=_TRAIN_MODEL_NAMES, required=True)
     train.add_argument("--config", type=_path_argument, default=_DEFAULT_CONFIG)
     train.add_argument("--manifest", type=_path_argument, required=True)
     train.add_argument("--output", type=_path_argument, required=True)
@@ -1646,21 +1647,32 @@ def _move_validator_temporal_inputs(
     if mover is not None and not callable(mover):
         raise WorkflowError("validation temporal input mover must be callable")
 
+    resolved_device = _resolved_validator_device(device)
     selected_mover = torch.Tensor.to if mover is None else mover
     moved = tuple(
-        selected_mover(tensor, device=device, non_blocking=True)
+        selected_mover(tensor, device=resolved_device, non_blocking=True)
         for tensor in inputs
     )
     if any(not isinstance(tensor, torch.Tensor) for tensor in moved):
         raise WorkflowError("validation temporal input mover returned a non-tensor")
     for source, destination in zip(inputs, moved, strict=True):
         if (
-            destination.device != device
+            destination.device != resolved_device
             or destination.shape != source.shape
             or destination.dtype != source.dtype
         ):
             raise WorkflowError("validation temporal input transfer changed its contract")
     return moved
+
+
+def _resolved_validator_device(device: object) -> object:
+    import torch
+
+    if not isinstance(device, torch.device):
+        raise WorkflowError("validation temporal input device must be a torch device")
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
 
 
 def _loader_task11_metrics(
@@ -1707,12 +1719,20 @@ def _loader_task11_metrics(
     selected_inferencer = infer_full_frame if inferencer is None else inferencer
     selected_evaluator = evaluate_temporal_obb if evaluator is None else evaluator
     selected_merger = merge_tile_detections if merger is None else merger
+    detector_names = getattr(getattr(model, "detector", None), "names", None)
+    class_count = (
+        len(detector_names)
+        if isinstance(detector_names, Mapping)
+        and set(detector_names) == set(range(len(detector_names)))
+        else 4
+    )
     inference_cfg = {
         "tile_size": int(getattr(cfg, "tile_size")),
         "tile_overlap": int(getattr(cfg, "tile_overlap")),
         "nms_iou": float(getattr(cfg, "nms_iou")),
         "confidence_threshold": 0.0,
         "inference_batch_size": 1,
+        "class_count": class_count,
     }
     module_states = tuple(
         (module, module.training)
@@ -1883,6 +1903,7 @@ def _loader_task11_metrics(
                             tile=source_tile,
                             site=site,
                             sequence=sequence,
+                            class_count=class_count,
                         )
                     )
 
@@ -1924,7 +1945,7 @@ def _loader_task11_metrics(
                     class_value = float(classes[target_index, 0])
                     if (
                         not class_value.is_integer()
-                        or not 0 <= int(class_value) <= 3
+                        or not 0 <= int(class_value) < class_count
                     ):
                         raise WorkflowError(
                             "validation target class is malformed"
@@ -1948,6 +1969,7 @@ def _loader_task11_metrics(
                             sequence=sequence,
                             speed_mps=0.0,
                             frame_speed_mps=0.0,
+                            class_count=class_count,
                         )
                     )
                 frame_keys.add(FrameKey(site, sequence, frame))
@@ -2013,6 +2035,7 @@ def _loader_task11_metrics(
                         getattr(cfg, "max_false_detections_per_frame")
                     ),
                     "seed": int(getattr(cfg, "seed")),
+                    "class_count": class_count,
                 },
             )
             try:
@@ -2201,6 +2224,18 @@ def run_train(
     if args.model == "baseline":
         if args.weights is not None:
             cfg = replace(cfg, pretrained_weights=str(args.weights))
+    elif args.model == "mg_vtod_8class":
+        if args.baseline_init is not None:
+            raise WorkflowError(
+                "8-class MG-VTOD requires public --weights, not "
+                "--baseline-init"
+            )
+        if args.weights is not None:
+            cfg = replace(cfg, pretrained_weights=str(args.weights))
+        if args.weights is None and resume_checkpoint is None:
+            raise WorkflowError(
+                "8-class MG-VTOD training requires --weights or --resume"
+            )
     else:
         selected_init = (
             args.baseline_init

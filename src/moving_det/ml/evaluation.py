@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import math
 import os
@@ -91,13 +91,23 @@ class GroundTruth:
     sequence: str
     speed_mps: float
     frame_speed_mps: float | None = None
+    class_count: int = field(
+        default=_CLASS_COUNT,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _strict_int(self.frame, "frame")
         _validate_obb(self.obb)
         class_id = _strict_int(self.class_id, "class_id")
-        if class_id >= _CLASS_COUNT:
-            raise ValueError(f"class_id must be in [0, {_CLASS_COUNT - 1}]")
+        class_count = _strict_int(
+            self.class_count,
+            "class_count",
+            minimum=1,
+        )
+        if class_id >= class_count:
+            raise ValueError(f"class_id must be in [0, {class_count - 1}]")
         if (
             isinstance(self.track_id, bool)
             or not isinstance(self.track_id, (int, str))
@@ -732,6 +742,22 @@ def evaluate_temporal_obb(
     Test evaluation always loads and enforces validation threshold evidence
     from ``cfg`` before any fixed-threshold metric is computed.
     """
+    raw_class_count = (
+        cfg.get("class_count", _CLASS_COUNT)
+        if isinstance(cfg, Mapping)
+        else getattr(cfg, "class_count", _CLASS_COUNT)
+    )
+    class_count = _strict_int(
+        raw_class_count,
+        "class_count",
+        minimum=1,
+    )
+    if any(
+        item.class_count != class_count
+        for item in (*predictions, *ground_truth)
+    ):
+        raise ValueError("evaluation class_count does not match its records")
+
     scope = _evaluation_scope(
         predictions,
         ground_truth,
@@ -783,14 +809,14 @@ def evaluate_temporal_obb(
             0.50,
             class_id,
         )
-        for class_id in range(_CLASS_COUNT)
+        for class_id in range(class_count)
     }
     present_ap50 = [value for value in ap50_by_class.values() if value is not None]
     map50 = float(np.mean(present_ap50)) if present_ap50 else 0.0
     coco_by_class: dict[int, list[float]] = defaultdict(list)
     coco_values = []
     for threshold in _COCO_THRESHOLDS:
-        for class_id in range(_CLASS_COUNT):
+        for class_id in range(class_count):
             value = _average_precision(
                 prediction_rows_full,
                 truth_rows,
@@ -812,7 +838,7 @@ def evaluate_temporal_obb(
     )
 
     per_class: dict[str, dict[str, float | int | None]] = {}
-    for class_id in range(_CLASS_COUNT):
+    for class_id in range(class_count):
         indices = [
             index
             for index, truth in enumerate(truth_rows)

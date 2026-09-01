@@ -161,6 +161,39 @@ def test_ground_truth_rejects_control_characters_in_track_identity():
         _gt(1, track="unsafe\ntrack")
 
 
+def test_evaluation_supports_explicit_eight_class_taxonomy():
+    prediction = Detection(
+        frame=1,
+        obb=OBB(10.0, 10.0, 20.0, 10.0, 0.0),
+        class_id=7,
+        confidence=0.9,
+        tile=TILE,
+        site="site19",
+        sequence="sequence_a",
+        class_count=8,
+    )
+    truth = GroundTruth(
+        frame=1,
+        obb=prediction.obb,
+        class_id=7,
+        track_id=1,
+        site="site19",
+        sequence="sequence_a",
+        speed_mps=2.0,
+        class_count=8,
+    )
+
+    metrics = evaluate_temporal_obb(
+        (prediction,),
+        (truth,),
+        _cfg(frames=(1,), class_count=8),
+    )
+
+    assert metrics["map50"] == pytest.approx(1.0)
+    assert set(metrics["per_class"]) == {str(value) for value in range(8)}
+    assert metrics["per_class"]["7"]["gt_count"] == 1
+
+
 def test_hand_computable_ap_recall_fp_and_duplicate_prediction():
     ground_truth = (_gt(1), _gt(2))
     predictions = (

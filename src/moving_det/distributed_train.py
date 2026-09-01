@@ -13,7 +13,7 @@ import torch.distributed as dist
 from moving_det.ml.distributed import DistributedContext
 
 
-_MODEL_NAMES = ("baseline", "mg_vtod", "lstfe")
+_MODEL_NAMES = ("baseline", "mg_vtod", "mg_vtod_8class", "lstfe")
 
 
 def _positive_integer(value: str) -> int:

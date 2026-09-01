@@ -2235,6 +2235,13 @@ def test_build_manifest_handler_calls_strict_builder_and_prints_resolved_path(
             None,
         ),
         (
+            "mg_vtod_8class",
+            ["--weights", "public.pt"],
+            "public.pt",
+            None,
+            None,
+        ),
+        (
             "baseline",
             ["--resume", "last.pt"],
             "yolo11m-obb.pt",
@@ -2857,6 +2864,17 @@ def test_validator_temporal_inputs_use_one_nonblocking_device_transfer():
     assert [call[0] for call in calls] == [frames, valid, transforms]
     assert [call[1] for call in calls] == [device, device, device]
     assert [call[2] for call in calls] == [True, True, True]
+
+
+@REQUIRES_TORCH
+def test_validator_resolves_implicit_cuda_device_index(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+
+    assert vru_cli_module._resolved_validator_device(
+        torch.device("cuda")
+    ) == torch.device("cuda:1")
 
 
 @REQUIRES_TORCH

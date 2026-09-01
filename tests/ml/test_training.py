@@ -21,6 +21,7 @@ from torch import Tensor, nn
 import moving_det.ml.training as training_module
 from moving_det.ml import pretrained_transfer as transfer_module
 from moving_det.ml.factory import create_model
+from moving_det.ml.dataset import ClipSpec
 from moving_det.ml.training import (
     TrainingHooks,
     build_optimizer,
@@ -1713,6 +1714,39 @@ def test_factory_builds_baseline_without_network(monkeypatch, temporal_config):
     assert built == (None, 4, sentinel)
     with pytest.raises(ValueError, match="unknown model"):
         create_model("unsupported", None, temporal_config)
+
+
+def test_factory_builds_eight_class_mg_vtod_from_public_weights(
+    monkeypatch,
+    temporal_config,
+):
+    sentinel = TinyTemporalOBB()
+    captured = {}
+
+    def constructor(*, weights, offsets):
+        captured.update(weights=weights, offsets=offsets)
+        return sentinel
+
+    monkeypatch.setattr(
+        "moving_det.ml.models.mg_vtod_8class.MGVTODEightClassOBB",
+        constructor,
+    )
+
+    built = create_model(
+        "mg_vtod_8class",
+        Path("universal.pt"),
+        temporal_config,
+    )
+
+    assert built is sentinel
+    assert captured == {
+        "weights": Path("universal.pt"),
+        "offsets": temporal_config.mg_offsets,
+    }
+    assert training_module._clip_spec(
+        "mg_vtod_8class",
+        temporal_config,
+    ) == ClipSpec("mg_vtod_8class", temporal_config.mg_offsets)
 
 
 def test_training_accumulates_to_effective_batch_and_uses_warmup_cosine(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any, Callable
 
@@ -88,13 +88,23 @@ class Detection:
     tile: Tile
     site: str
     sequence: str
+    class_count: int = field(
+        default=_CLASS_COUNT,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         _strict_int(self.frame, "frame")
         _validate_obb(self.obb)
         class_id = _strict_int(self.class_id, "class_id")
-        if class_id >= _CLASS_COUNT:
-            raise ValueError(f"class_id must be in [0, {_CLASS_COUNT - 1}]")
+        class_count = _strict_int(
+            self.class_count,
+            "class_count",
+            minimum=1,
+        )
+        if class_id >= class_count:
+            raise ValueError(f"class_id must be in [0, {class_count - 1}]")
         confidence = _finite_real(self.confidence, "confidence")
         if not 0.0 <= confidence <= 1.0:
             raise ValueError("confidence must be within [0, 1]")
@@ -128,6 +138,33 @@ def _detection_sort_key(
     )
 
 
+def _obb_axis_aligned_bounds(
+    obb: OBB,
+) -> tuple[float, float, float, float]:
+    cosine = abs(math.cos(obb.theta))
+    sine = abs(math.sin(obb.theta))
+    extent_x = (cosine * obb.width + sine * obb.height) / 2.0
+    extent_y = (sine * obb.width + cosine * obb.height) / 2.0
+    return (
+        obb.cx - extent_x,
+        obb.cy - extent_y,
+        obb.cx + extent_x,
+        obb.cy + extent_y,
+    )
+
+
+def _bounds_have_positive_overlap(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> bool:
+    return (
+        first[0] < second[2]
+        and second[0] < first[2]
+        and first[1] < second[3]
+        and second[1] < first[3]
+    )
+
+
 def merge_tile_detections(
     detections: Sequence[Detection],
     iou_threshold: float,
@@ -143,16 +180,21 @@ def merge_tile_detections(
         raise ValueError("detections must contain only Detection records")
 
     kept: list[Detection] = []
-    winners_by_group: dict[tuple[FrameKey, int], list[Detection]] = {}
+    winners_by_group: dict[
+        tuple[FrameKey, int],
+        list[tuple[Detection, tuple[float, float, float, float]]],
+    ] = {}
     for candidate in sorted(validated, key=_detection_sort_key):
         group_key = (candidate.frame_key, candidate.class_id)
         group_winners = winners_by_group.setdefault(group_key, [])
+        candidate_bounds = _obb_axis_aligned_bounds(candidate.obb)
         if any(
-            rotated_iou(winner.obb, candidate.obb) > threshold
-            for winner in group_winners
+            _bounds_have_positive_overlap(winner_bounds, candidate_bounds)
+            and rotated_iou(winner.obb, candidate.obb) > threshold
+            for winner, winner_bounds in group_winners
         ):
             continue
-        group_winners.append(candidate)
+        group_winners.append((candidate, candidate_bounds))
         kept.append(candidate)
     return tuple(sorted(kept, key=_detection_sort_key))
 
@@ -319,6 +361,7 @@ def _validate_raw_prediction(
     output: object,
     *,
     expected_batch: int,
+    class_count: int,
 ) -> Tensor | tuple[Any, ...]:
     selected = output[0] if isinstance(output, (tuple, list)) else output
     if not isinstance(selected, Tensor):
@@ -326,10 +369,11 @@ def _validate_raw_prediction(
     if (
         selected.ndim != 3
         or selected.shape[0] != expected_batch
-        or selected.shape[1] != 4 + _CLASS_COUNT + 1
+        or selected.shape[1] != 4 + class_count + 1
     ):
         raise ValueError(
-            "pinned Ultralytics OBB output must have shape [B,9,N]"
+            "pinned Ultralytics OBB output must have shape "
+            f"[B,{4 + class_count + 1},N]"
         )
     if not bool(torch.isfinite(selected).all()):
         raise ValueError("model OBB output must be finite")
@@ -367,6 +411,11 @@ def infer_full_frame(
     inference_batch_size = _strict_int(
         _optional_cfg_value(cfg, "inference_batch_size", 1),
         "inference_batch_size",
+        minimum=1,
+    )
+    class_count = _strict_int(
+        _optional_cfg_value(cfg, "class_count", _CLASS_COUNT),
+        "class_count",
         minimum=1,
     )
     if not 0.0 <= nms_iou <= 1.0:
@@ -416,6 +465,7 @@ def infer_full_frame(
                 checked = _validate_raw_prediction(
                     raw,
                     expected_batch=len(chunk),
+                    class_count=class_count,
                 )
                 if diagnostic_consumer is not None:
                     diagnostic_consumer(tuple(chunk), diagnostic)
@@ -423,7 +473,7 @@ def infer_full_frame(
                     checked,
                     conf_thres=confidence,
                     iou_thres=nms_iou,
-                    nc=_CLASS_COUNT,
+                    nc=class_count,
                     rotated=True,
                 )
                 if len(rows_by_tile) != len(chunk):
@@ -466,6 +516,7 @@ def infer_full_frame(
                     tile=tile,
                     site=validated.site,
                     sequence=validated.sequence,
+                    class_count=class_count,
                 )
             )
     if len(tiles) == 1:
