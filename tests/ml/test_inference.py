@@ -460,6 +460,29 @@ def test_rotated_nms_does_not_scan_winners_from_other_frame_groups(monkeypatch):
     assert identity_reads <= 12 * len(rows)
 
 
+def test_rotated_nms_skips_exact_iou_for_disjoint_axis_aligned_bounds(
+    monkeypatch,
+):
+    rows = tuple(
+        _detection(
+            cx=20.0 + 50.0 * index,
+            confidence=1.0 - index / 100.0,
+        )
+        for index in range(32)
+    )
+
+    def unexpected_exact_iou(_first, _second):
+        raise AssertionError("disjoint bounds cannot have positive rotated IoU")
+
+    monkeypatch.setattr(
+        inference_module,
+        "rotated_iou",
+        unexpected_exact_iou,
+    )
+
+    assert merge_tile_detections(rows, 0.5) == rows
+
+
 @pytest.mark.parametrize(
     ("overlap", "expected_count"),
     ((0.499999, 2), (0.5, 2), (0.500001, 1)),

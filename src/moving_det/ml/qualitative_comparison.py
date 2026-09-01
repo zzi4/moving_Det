@@ -33,8 +33,8 @@ class OverlayBox:
     def __post_init__(self) -> None:
         if not isinstance(self.obb, OBB):
             raise ValueError("overlay obb must be an OBB")
-        if type(self.class_id) is not int or not 0 <= self.class_id < 4:
-            raise ValueError("overlay class_id must be in [0, 3]")
+        if type(self.class_id) is not int or not 0 <= self.class_id < 8:
+            raise ValueError("overlay class_id must be in [0, 7]")
         if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
             raise ValueError("overlay confidence must be in [0, 1]")
 
@@ -50,6 +50,11 @@ class ComparisonSample:
     subtitle: str
     baseline_total: int | None = None
     mg_vtod_total: int | None = None
+    class_names: tuple[str, ...] = _CLASS_NAMES
+    class_colors: tuple[tuple[int, int, int], ...] = _CLASS_COLORS
+    baseline_label: str = "Universal-P2 single frame"
+    model_label: str = "MG-VTOD epoch 6"
+    display_threshold: float = 0.01
 
     def __post_init__(self) -> None:
         if (
@@ -71,6 +76,36 @@ class ComparisonSample:
                 isinstance(row, OverlayBox) for row in field
             ):
                 raise ValueError("comparison overlays must be tuples of OverlayBox")
+        if (
+            not isinstance(self.class_names, tuple)
+            or not self.class_names
+            or any(not isinstance(name, str) or not name for name in self.class_names)
+            or not isinstance(self.class_colors, tuple)
+            or len(self.class_colors) != len(self.class_names)
+            or any(
+                not isinstance(color, tuple)
+                or len(color) != 3
+                or any(type(channel) is not int or not 0 <= channel <= 255 for channel in color)
+                for color in self.class_colors
+            )
+        ):
+            raise ValueError("class names and colors must define one valid RGB palette")
+        if any(
+            row.class_id >= len(self.class_names)
+            for field in (self.truth, self.baseline, self.mg_vtod)
+            for row in field
+        ):
+            raise ValueError("overlay class_id exceeds the configured taxonomy")
+        if not isinstance(self.baseline_label, str) or not self.baseline_label:
+            raise ValueError("baseline label must be a non-empty string")
+        if not isinstance(self.model_label, str) or not self.model_label:
+            raise ValueError("model label must be a non-empty string")
+        if (
+            isinstance(self.display_threshold, bool)
+            or not np.isfinite(self.display_threshold)
+            or not 0.0 <= self.display_threshold <= 1.0
+        ):
+            raise ValueError("display threshold must be within [0, 1]")
         for name, total, rows in (
             ("baseline_total", self.baseline_total, self.baseline),
             ("mg_vtod_total", self.mg_vtod_total, self.mg_vtod),
@@ -129,6 +164,8 @@ def _draw_boxes(
     boxes: Sequence[OverlayBox],
     *,
     source_shape: tuple[int, int],
+    class_names: Sequence[str],
+    class_colors: Sequence[tuple[int, int, int]],
     solid_threshold: float = 0.25,
 ) -> None:
     draw = ImageDraw.Draw(image)
@@ -145,14 +182,14 @@ def _draw_boxes(
             for x, y in obb_to_points(row.obb)
         ]
         closed = [*points, points[0]]
-        color = _CLASS_COLORS[row.class_id]
+        color = class_colors[row.class_id]
         dashed = row.confidence is not None and row.confidence < solid_threshold
         for start, end in zip(closed[:-1], closed[1:], strict=True):
             if dashed:
                 _dashed_line(draw, start, end, fill=color, width=4)
             else:
                 draw.line((start, end), fill=color, width=4)
-        label = _CLASS_NAMES[row.class_id]
+        label = class_names[row.class_id]
         if row.confidence is not None:
             label = f"{label} {row.confidence:.2f}"
         elif row.identity:
@@ -194,13 +231,20 @@ def _prediction_caption(
     name: str,
     boxes: Sequence[OverlayBox],
     total: int | None,
+    *,
+    confidence_threshold: float = 0.01,
 ) -> str:
+    if not boxes and total is None:
+        return name
     high = sum(
         row.confidence is not None and row.confidence >= 0.25 for row in boxes
     )
     all_count = len(boxes) if total is None else total
     shown = "" if all_count == len(boxes) else f", showing top {len(boxes)}"
-    return f"{name} | >=0.01: {all_count}{shown}, shown >=0.25: {high}"
+    return (
+        f"{name} | >={confidence_threshold:.2f}: {all_count}{shown}, "
+        f"solid >=0.25: {high}"
+    )
 
 
 def render_comparison_panel(
@@ -220,7 +264,9 @@ def render_comparison_panel(
     draw.text((55, 70), sample.subtitle, fill=(190, 205, 220), font=_font(23))
     draw.text(
         (55, 104),
-        "Class color: pedestrian / bicycle / tricycle / motorcycle | dashed = confidence < 0.25",
+        "Class color: "
+        + " / ".join(sample.class_names)
+        + " | dashed = confidence < 0.25",
         fill=(170, 185, 200),
         font=_font(20),
     )
@@ -237,13 +283,21 @@ def render_comparison_panel(
         ("Human ground truth | boxes: " + str(len(sample.truth)), base.copy(), sample.truth),
         (
             _prediction_caption(
-                "Universal-P2 single frame", sample.baseline, sample.baseline_total
+                sample.baseline_label,
+                sample.baseline,
+                sample.baseline_total,
+                confidence_threshold=sample.display_threshold,
             ),
             base.copy(),
             sample.baseline,
         ),
         (
-            _prediction_caption("MG-VTOD epoch 6", sample.mg_vtod, sample.mg_vtod_total),
+            _prediction_caption(
+                sample.model_label,
+                sample.mg_vtod,
+                sample.mg_vtod_total,
+                confidence_threshold=sample.display_threshold,
+            ),
             base.copy(),
             sample.mg_vtod,
         ),
@@ -254,7 +308,13 @@ def render_comparison_panel(
     for (caption, panel, boxes), (x, y), header_color in zip(
         panels, positions, header_colors, strict=True
     ):
-        _draw_boxes(panel, boxes, source_shape=sample.rgb.shape[:2])
+        _draw_boxes(
+            panel,
+            boxes,
+            source_shape=sample.rgb.shape[:2],
+            class_names=sample.class_names,
+            class_colors=sample.class_colors,
+        )
         draw.rectangle((x, y - 42, x + _PANEL_SIZE, y), fill=header_color)
         draw.text((x + 12, y - 34), caption, fill=(250, 250, 250), font=_font(20))
         canvas.paste(panel, (x, y))
